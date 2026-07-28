@@ -29,7 +29,9 @@ Env (put in .env, see .env.example):
 from __future__ import annotations
 
 import asyncio
+import csv
 import datetime as dt
+import io
 import os
 
 from nicegui import app, ui
@@ -99,6 +101,18 @@ def _efficiency_table(ranked: list[dict], label_field: str) -> None:
     ui.table(columns=cols, rows=rows, row_key="label").classes("w-full").props("dense")
 
 
+def _download_call_types_csv(data: dict) -> None:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["project", "call_type", "calls", "cost_usd", "cost_per_call",
+                      "prompt_tokens", "completion_tokens"])
+    for r in ledger.with_cost_per_call(data["by_call_type"]):
+        writer.writerow([r["project"], r["call_type"], r["calls"], r["cost_usd"],
+                          r["cost_per_call"], r["prompt_tokens"], r["completion_tokens"]])
+    ui.download(buf.getvalue().encode(), filename=f"llm_usage_{data['range_days']}d.csv",
+                media_type="text/csv")
+
+
 @ui.refreshable
 def alert_banner() -> None:
     alert = STATE.get("alert")
@@ -119,10 +133,10 @@ def services_row() -> None:
         for svc in services.SERVICES:
             status = services.get_status(svc["name"])
             up = status["up"] if status else None
-            dot_color = "grey-400" if up is None else ("green-600" if up else "red-600")
+            icon_color = "grey-400" if up is None else ("green-600" if up else "red-600")
             with ui.card().classes("min-w-[200px] grow"):
                 with ui.row().classes("items-center gap-2"):
-                    ui.icon("circle", color=dot_color).classes("text-xs")
+                    ui.icon(svc["icon"], color=icon_color).classes("text-2xl")
                     ui.label(svc["name"]).classes("font-bold")
                 ui.label(svc["desc"]).classes("text-xs text-grey-6")
                 with ui.row().classes("gap-2 mt-1"):
@@ -155,6 +169,7 @@ def dashboard_body() -> None:
     avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
     monthly_budget = alerts.ALERT_DAILY_COST_USD * 30
     projected_monthly = avg_daily * 30
+    attribution = ledger.attribution_quality(data)
 
     with ui.row().classes("w-full flex-wrap gap-3 mt-2"):
         _kpi("Total calls", f"{data['total_calls']:,}")
@@ -163,6 +178,8 @@ def dashboard_body() -> None:
         _kpi("Completion tokens", f"{data['total_completion_tokens']:,}")
         _kpi("Projected monthly cost", f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget",
              warn=projected_monthly > monthly_budget)
+        _kpi("Cost attribution quality", f"{attribution['cost_tagged_pct']:.0f}% tagged by provider",
+             warn=attribution["cost_tagged_pct"] < 50)
 
     dbp = data["daily_by_project"]
     if dbp["dates"]:
@@ -210,16 +227,35 @@ def dashboard_body() -> None:
             ui.label("Provider efficiency ($/1K tokens, cheapest first)").classes("text-sm font-bold")
             _efficiency_table(ledger.efficiency_ranking(data["by_provider"]), "provider")
 
-    ui.label("Call types by project").classes("text-sm font-bold mt-4")
+    ui.label("Slowest call types (avg latency)").classes("text-sm font-bold mt-4")
+    latency_ranked = ledger.latency_ranking(data["by_call_type"])
+    if latency_ranked:
+        lat_cols = [
+            {"name": "project", "label": "Project", "field": "project", "sortable": True},
+            {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
+            {"name": "avg_latency_ms", "label": "Avg latency (ms)", "field": "avg_latency_ms", "sortable": True},
+            {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+        ]
+        ui.table(columns=lat_cols, rows=latency_ranked[:10], row_key="call_type").classes("w-full").props("dense")
+    else:
+        ui.label("(no latency data in this range)").classes("text-sm text-grey")
+
+    with ui.row().classes("w-full items-center justify-between mt-4"):
+        ui.label("Call types by project").classes("text-sm font-bold")
+        ui.button("Download CSV", icon="download", on_click=lambda: _download_call_types_csv(data)) \
+            .props("flat dense")
     cols = [
         {"name": "project", "label": "Project", "field": "project", "sortable": True},
         {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
         {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
         {"name": "cost_usd", "label": "Cost (USD)", "field": "cost_usd", "sortable": True},
+        {"name": "cost_per_call", "label": "$/call", "field": "cost_per_call", "sortable": True},
         {"name": "prompt_tokens", "label": "Prompt tok", "field": "prompt_tokens", "sortable": True},
         {"name": "completion_tokens", "label": "Completion tok", "field": "completion_tokens", "sortable": True},
     ]
-    rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}"} for r in data["by_call_type"]]
+    call_types_with_avg = ledger.with_cost_per_call(data["by_call_type"])
+    rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}", "cost_per_call": f"{r['cost_per_call']:.6f}"}
+            for r in call_types_with_avg]
     ui.table(columns=cols, rows=rows, row_key="call_type").classes("w-full").props("dense")
 
     history = alerts.get_history()
@@ -288,6 +324,18 @@ def main_page() -> None:
             ui.label("Range:").classes("text-sm")
             ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
                       on_change=_set_range).props("dense")
+
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Alert threshold ($/day):").classes("text-sm")
+            threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
+                                        format="%.2f").props("dense outlined").classes("w-24")
+
+            def _save_threshold() -> None:
+                alerts.set_daily_threshold(threshold_input.value)
+                ui.notify(f"Alert threshold set to ${threshold_input.value:.2f}", type="positive")
+                refresh_all()
+
+            ui.button("Save", on_click=_save_threshold).props("dense flat")
 
         alert_banner()
         services_row()

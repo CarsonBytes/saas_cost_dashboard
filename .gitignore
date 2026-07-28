@@ -5,3 +5,4 @@ __pycache__/
 venv/
 .nicegui/
 alert_state.json
+alert_settings.json

@@ -30,6 +30,8 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 _SELECT = "project,call_type,provider,environment,model,purpose,prompt_tokens,completion_tokens,cost_usd,latency_ms,created_at"
 
+_UNTAGGED = "(untagged)"
+
 
 def _project_of(purpose: str) -> str:
     if purpose.startswith("quant:"):
@@ -78,7 +80,7 @@ def fetch_rows(days: int) -> list[dict]:
 
 def _bucket_key(row: dict, field: str) -> str:
     v = row.get(field)
-    return "(untagged)" if v is None or v == "" else str(v)
+    return _UNTAGGED if v is None or v == "" else str(v)
 
 
 def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
@@ -86,11 +88,12 @@ def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
     for row in rows:
         key = tuple(_bucket_key(row, f) for f in fields)
         b = buckets.setdefault(key, {f: k for f, k in zip(fields, key)} |
-            {"calls": 0, "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0})
+            {"calls": 0, "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "latency_ms": 0})
         b["calls"] += 1
         b["cost_usd"] += row.get("cost_usd") or 0
         b["prompt_tokens"] += row.get("prompt_tokens") or 0
         b["completion_tokens"] += row.get("completion_tokens") or 0
+        b["latency_ms"] += row.get("latency_ms") or 0
     out = list(buckets.values())
     for b in out:
         b["cost_usd"] = round(b["cost_usd"], 6)
@@ -159,6 +162,37 @@ def efficiency_ranking(buckets: list[dict]) -> list[dict]:
               if b["cost_usd"] > 0 and (b["prompt_tokens"] + b["completion_tokens"]) > 0]
     ranked.sort(key=lambda b: b["per_1k_usd"])
     return ranked
+
+
+def latency_ranking(buckets: list[dict]) -> list[dict]:
+    """Buckets (e.g. stats["by_call_type"]) ranked slowest-first by average
+    latency -- the raw per-call latency_ms was already being fetched but
+    never surfaced anywhere."""
+    ranked = [b | {"avg_latency_ms": round(b["latency_ms"] / b["calls"])} for b in buckets
+              if b["calls"] > 0]
+    ranked.sort(key=lambda b: b["avg_latency_ms"], reverse=True)
+    return ranked
+
+
+def with_cost_per_call(buckets: list[dict]) -> list[dict]:
+    return [b | {"cost_per_call": round(b["cost_usd"] / b["calls"], 6) if b["calls"] else 0}
+            for b in buckets]
+
+
+def attribution_quality(stats: dict) -> dict:
+    """What share of calls/cost actually carry a real provider tag, vs falling
+    into the "(untagged)" bucket -- quant and event_radar's rows do today
+    (see module docstring), so this is a direct, visible measure of that gap,
+    and of any future fix to it."""
+    total_calls = stats["total_calls"]
+    total_cost = stats["total_cost_usd"]
+    untagged = next((b for b in stats["by_provider"] if b["provider"] == _UNTAGGED), None)
+    untagged_calls = untagged["calls"] if untagged else 0
+    untagged_cost = untagged["cost_usd"] if untagged else 0.0
+    return {
+        "calls_tagged_pct": round((1 - untagged_calls / total_calls) * 100, 1) if total_calls else 100.0,
+        "cost_tagged_pct": round((1 - untagged_cost / total_cost) * 100, 1) if total_cost else 100.0,
+    }
 
 
 def top_spender_insight(stats: dict) -> str | None:

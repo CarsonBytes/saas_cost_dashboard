@@ -17,21 +17,25 @@ SERVICES = [
     {
         "name": "Quant Trading",
         "desc": "Weekly-TSMOM dashboard, live paper + live 17-ETF trading",
+        "icon": "show_chart",
         "links": [("Paper", "https://quant.carsonng.com"), ("Live", "https://quant-live.carsonng.com")],
     },
     {
         "name": "Event Radar",
         "desc": "AI event-discovery portfolio app, real HK events",
+        "icon": "event",
         "links": [("Open", "https://events.carsonng.com")],
     },
     {
         "name": "Study Platform",
         "desc": "Supabase + pgvector RAG exam-prep",
+        "icon": "school",
         "links": [("Open", "https://study.carsonng.com")],
     },
     {
         "name": "Portfolio",
         "desc": "carsonng.com -- AI governance leadership positioning",
+        "icon": "badge",
         "links": [("Open", "https://carsonng.com")],
     },
 ]

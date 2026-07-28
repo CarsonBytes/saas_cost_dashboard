@@ -25,12 +25,32 @@ load_dotenv(Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
 
-ALERT_DAILY_COST_USD = float(os.environ.get("ALERT_DAILY_COST_USD", "0.50"))
+_SETTINGS_FILE = Path(__file__).parent / "alert_settings.json"
+
+
+def _load_threshold() -> float:
+    """A dashboard-set threshold (persisted so it survives a restart of the
+    always-on process) overrides the .env default -- editing .env would
+    otherwise require touching the server and restarting it for something
+    that's meant to be adjustable from the UI."""
+    try:
+        return float(json.loads(_SETTINGS_FILE.read_text())["alert_daily_cost_usd"])
+    except (FileNotFoundError, ValueError, KeyError):
+        return float(os.environ.get("ALERT_DAILY_COST_USD", "0.50"))
+
+
+ALERT_DAILY_COST_USD = _load_threshold()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 _STATE_FILE = Path(__file__).parent / "alert_state.json"
 _HISTORY_LIMIT = 50
+
+
+def set_daily_threshold(value: float) -> None:
+    global ALERT_DAILY_COST_USD
+    ALERT_DAILY_COST_USD = value
+    _SETTINGS_FILE.write_text(json.dumps({"alert_daily_cost_usd": value}))
 
 
 def _today() -> str:
