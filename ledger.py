@@ -98,6 +98,20 @@ def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
     return out
 
 
+def daily_by_project(rows: list[dict]) -> dict:
+    """Per-project daily cost, for a stacked trend chart -- a single total
+    line can't tell you which project caused a given day's spike."""
+    dates = sorted({r["created_at"][:10] for r in rows})
+    projects = sorted({_bucket_key(r, "project") for r in rows})
+    matrix = {p: {d: 0.0 for d in dates} for p in projects}
+    for r in rows:
+        matrix[_bucket_key(r, "project")][r["created_at"][:10]] += r.get("cost_usd") or 0
+    return {
+        "dates": dates,
+        "series": [{"project": p, "data": [round(matrix[p][d], 6) for d in dates]} for p in projects],
+    }
+
+
 def build_stats(rows: list[dict], days: int) -> dict:
     daily: dict[str, dict] = defaultdict(lambda: {"calls": 0, "cost_usd": 0.0})
     for row in rows:
@@ -120,6 +134,7 @@ def build_stats(rows: list[dict], days: int) -> dict:
         "by_environment": aggregate_by(rows, ["project", "environment"]),
         "by_provider": aggregate_by(rows, ["provider"]),
         "daily_series": daily_series,
+        "daily_by_project": daily_by_project(rows),
     }
 
 
@@ -132,6 +147,20 @@ def today_cost(rows: list[dict]) -> float:
     return round(sum(r.get("cost_usd") or 0 for r in rows if r["created_at"][:10] == today), 6)
 
 
+def per_1k_usd(bucket: dict) -> float:
+    tok = bucket["prompt_tokens"] + bucket["completion_tokens"]
+    return (bucket["cost_usd"] / tok * 1000) if tok else float("inf")
+
+
+def efficiency_ranking(buckets: list[dict]) -> list[dict]:
+    """Buckets (e.g. stats["by_model"]) ranked cheapest-first by $/1K tokens.
+    Excludes zero-cost/zero-token buckets -- there's nothing to rank there."""
+    ranked = [b | {"per_1k_usd": per_1k_usd(b)} for b in buckets
+              if b["cost_usd"] > 0 and (b["prompt_tokens"] + b["completion_tokens"]) > 0]
+    ranked.sort(key=lambda b: b["per_1k_usd"])
+    return ranked
+
+
 def top_spender_insight(stats: dict) -> str | None:
     """One-sentence auto-generated highlight: which project drove the biggest
     share of spend in the current window. None if there's no cost yet."""
@@ -142,14 +171,9 @@ def top_spender_insight(stats: dict) -> str | None:
     if top["cost_usd"] <= 0:
         return None
     share = top["cost_usd"] / total * 100
-    providers = [b for b in stats["by_provider"] if b["cost_usd"] > 0]
-    cheapest = None
-    if providers:
-        def per_1k(b: dict) -> float:
-            tok = b["prompt_tokens"] + b["completion_tokens"]
-            return (b["cost_usd"] / tok * 1000) if tok else float("inf")
-        cheapest = min(providers, key=per_1k)
+    cheapest_providers = efficiency_ranking(stats["by_provider"])
     msg = f"{top['project']} drove {share:.0f}% of spend (${top['cost_usd']:.4f}) over the last {stats['range_days']}d"
-    if cheapest:
-        msg += f"; cheapest provider was {cheapest['provider']} (${per_1k(cheapest):.6f}/1K tok)"
+    if cheapest_providers:
+        cheapest = cheapest_providers[0]
+        msg += f"; cheapest provider was {cheapest['provider']} (${cheapest['per_1k_usd']:.6f}/1K tok)"
     return msg

@@ -44,6 +44,8 @@ STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch
 _ALERT_CHECK_INTERVAL_SEC = int(os.environ.get("ALERT_CHECK_INTERVAL_SEC", "900"))
 _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC", "120"))
 
+_PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "(untagged)": "#6b7280"}
+
 
 def fetch_stats(days: int) -> None:
     try:
@@ -80,6 +82,21 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
                     "itemStyle": {"color": "#2563eb"}}],
         "grid": {"left": 50, "right": 20, "top": 20, "bottom": 60},
     }).classes("w-full h-56")
+
+
+def _efficiency_table(ranked: list[dict], label_field: str) -> None:
+    if not ranked:
+        ui.label("(no priced calls in this range)").classes("text-sm text-grey")
+        return
+    cols = [
+        {"name": "label", "label": label_field.title(), "field": "label"},
+        {"name": "per_1k_usd", "label": "$/1K tok", "field": "per_1k_usd", "sortable": True},
+        {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+        {"name": "cost_usd", "label": "Cost (USD)", "field": "cost_usd", "sortable": True},
+    ]
+    rows = [{"label": b[label_field], "per_1k_usd": f"{b['per_1k_usd']:.6f}",
+             "calls": b["calls"], "cost_usd": f"{b['cost_usd']:.4f}"} for b in ranked]
+    ui.table(columns=cols, rows=rows, row_key="label").classes("w-full").props("dense")
 
 
 @ui.refreshable
@@ -147,21 +164,27 @@ def dashboard_body() -> None:
         _kpi("Projected monthly cost", f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget",
              warn=projected_monthly > monthly_budget)
 
-    if data["daily_series"]:
-        ui.label("Cost per day").classes("text-sm font-bold mt-4")
+    dbp = data["daily_by_project"]
+    if dbp["dates"]:
+        ui.label("Cost per day, by project").classes("text-sm font-bold mt-4")
+        project_series = [
+            {"type": "line", "name": s["project"], "data": s["data"], "stack": "total",
+             "smooth": True, "areaStyle": {}, "lineStyle": {"width": 1},
+             "itemStyle": {"color": _PROJECT_COLORS.get(s["project"], "#6b7280")}}
+            for s in dbp["series"]
+        ]
         ui.echart({
             "tooltip": {"trigger": "axis"},
-            "xAxis": {"type": "category", "data": [d["date"] for d in data["daily_series"]]},
+            "legend": {"top": 0, "textStyle": {"fontSize": 10}},
+            "xAxis": {"type": "category", "data": dbp["dates"]},
             "yAxis": {"type": "value", "name": "cost (USD)"},
-            "series": [
-                {"type": "line", "data": [d["cost_usd"] for d in data["daily_series"]],
-                 "smooth": True, "areaStyle": {}, "lineStyle": {"width": 2}},
+            "series": project_series + [
                 {"type": "line", "name": "alert threshold",
-                 "data": [alerts.ALERT_DAILY_COST_USD] * len(data["daily_series"]),
+                 "data": [alerts.ALERT_DAILY_COST_USD] * len(dbp["dates"]),
                  "lineStyle": {"type": "dashed", "color": "#dc2626", "width": 1}, "symbol": "none"},
             ],
-            "grid": {"left": 50, "right": 20, "top": 20, "bottom": 30},
-        }).classes("w-full h-56")
+            "grid": {"left": 50, "right": 20, "top": 40, "bottom": 30},
+        }).classes("w-full h-64")
 
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
@@ -179,6 +202,14 @@ def dashboard_body() -> None:
             ui.label("By environment (quant paper/live)").classes("text-sm font-bold")
             _bar_chart(data["by_environment"], "project", ["environment"])
 
+    with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Model efficiency ($/1K tokens, cheapest first)").classes("text-sm font-bold")
+            _efficiency_table(ledger.efficiency_ranking(data["by_model"]), "model")
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Provider efficiency ($/1K tokens, cheapest first)").classes("text-sm font-bold")
+            _efficiency_table(ledger.efficiency_ranking(data["by_provider"]), "provider")
+
     ui.label("Call types by project").classes("text-sm font-bold mt-4")
     cols = [
         {"name": "project", "label": "Project", "field": "project", "sortable": True},
@@ -190,6 +221,19 @@ def dashboard_body() -> None:
     ]
     rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}"} for r in data["by_call_type"]]
     ui.table(columns=cols, rows=rows, row_key="call_type").classes("w-full").props("dense")
+
+    history = alerts.get_history()
+    if history:
+        ui.label("Alert history").classes("text-sm font-bold mt-4")
+        hist_cols = [
+            {"name": "fired_at", "label": "Fired at (UTC)", "field": "fired_at", "sortable": True},
+            {"name": "cost_today", "label": "Cost that day", "field": "cost_today", "sortable": True},
+            {"name": "threshold", "label": "Threshold", "field": "threshold"},
+        ]
+        hist_rows = [{"fired_at": h["fired_at"][:19].replace("T", " "),
+                      "cost_today": f"${h['cost_today']:.4f}", "threshold": f"${h['threshold']:.2f}"}
+                     for h in history]
+        ui.table(columns=hist_cols, rows=hist_rows, row_key="fired_at").classes("w-full").props("dense")
 
 
 def refresh_all() -> None:
@@ -218,12 +262,20 @@ async def _services_check_loop() -> None:
 
 @ui.page("/")
 def main_page() -> None:
+    dark_mode = ui.dark_mode()
+
+    def _toggle_dark() -> None:
+        dark_mode.value = not dark_mode.value
+        dark_toggle.props(f"icon={'light_mode' if dark_mode.value else 'dark_mode'}")
+
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4"):
-        with ui.row().classes("items-center justify-between w-full"):
+        with ui.row().classes("items-center justify-between w-full flex-wrap gap-2"):
             ui.label("LLM Usage Dashboard").classes("text-2xl font-bold")
-            ui.button("Refresh", icon="refresh",
-                      on_click=lambda: (fetch_stats(STATE["days"]), refresh_all())) \
-                .props("color=primary")
+            with ui.row().classes("items-center gap-2"):
+                dark_toggle = ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round")
+                ui.button("Refresh", icon="refresh",
+                          on_click=lambda: (fetch_stats(STATE["days"]), refresh_all())) \
+                    .props("color=primary")
         ui.label("Cross-project usage: quant (paper + live) + study + event-radar, "
                  "reading directly from the shared Supabase llm_calls ledger.").classes("text-sm text-grey-6")
 

@@ -30,6 +30,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 _STATE_FILE = Path(__file__).parent / "alert_state.json"
+_HISTORY_LIMIT = 50
 
 
 def _today() -> str:
@@ -45,6 +46,14 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     _STATE_FILE.write_text(json.dumps(state))
+
+
+def get_history(limit: int = 20) -> list[dict]:
+    """Most recent fired alerts first -- for the dashboard's alert-history
+    table. Separate from the dedup state itself so a restart never loses
+    the record of what already fired."""
+    history = _load_state().get("history", [])
+    return list(reversed(history))[:limit]
 
 
 def is_telegram_configured() -> bool:
@@ -92,7 +101,12 @@ def check_daily_threshold(cost_today: float) -> dict:
     last_alerted_cost = state.get("last_alerted_cost", 0.0) if state.get("date") == today else 0.0
     if cost_today > last_alerted_cost * 1.5 or last_alerted_cost == 0.0:
         result["should_notify"] = True
-        _save_state({"date": today, "last_alerted_cost": cost_today})
+        history = state.get("history", [])
+        history.append({"date": today, "cost_today": cost_today, "threshold": ALERT_DAILY_COST_USD,
+                         "fired_at": dt.datetime.now(dt.timezone.utc).isoformat()})
+        state.update({"date": today, "last_alerted_cost": cost_today,
+                      "history": history[-_HISTORY_LIMIT:]})
+        _save_state(state)
     return result
 
 
