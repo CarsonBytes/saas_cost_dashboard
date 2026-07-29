@@ -306,7 +306,7 @@ def main_page() -> None:
 
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4"):
         with ui.row().classes("items-center justify-between w-full flex-wrap gap-2"):
-            ui.label("LLM Usage Dashboard").classes("text-2xl font-bold")
+            ui.label("Personal SaaS Cost Dashboard").classes("text-2xl font-bold")
             with ui.row().classes("items-center gap-2"):
                 dark_toggle = ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round")
                 ui.button("Refresh", icon="refresh",
@@ -350,4 +350,4 @@ def main_page() -> None:
 app.on_startup(lambda: asyncio.create_task(_alert_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_services_check_loop()))
 
-ui.run(title="LLM Usage Dashboard", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)
+ui.run(title="Personal SaaS Cost Dashboard", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)
