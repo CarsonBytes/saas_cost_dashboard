@@ -42,7 +42,7 @@ SERVICES = [
         "name": "AI Regulation Radar",
         "desc": "RegTech compliance tracker -- EU AI Act / NIST / HK PCPD",
         "icon": "gavel",
-        "links": [("Open", "https://regtech.carsonng.com")],
+        "links": [("Open", "https://regtech-private.carsonng.com")],
     },
     {
         "name": "Change Impact Assessor",
