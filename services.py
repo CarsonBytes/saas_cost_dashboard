@@ -38,6 +38,12 @@ SERVICES = [
         "icon": "badge",
         "links": [("Open", "https://carsonng.com")],
     },
+    {
+        "name": "AI Regulation Radar",
+        "desc": "RegTech compliance tracker -- EU AI Act / NIST / HK PCPD",
+        "icon": "gavel",
+        "links": [("Open", "https://regtech.carsonng.com")],
+    },
 ]
 
 _STATUS_CACHE: dict = {}

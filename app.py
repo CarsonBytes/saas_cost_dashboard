@@ -350,4 +350,4 @@ def main_page() -> None:
 app.on_startup(lambda: asyncio.create_task(_alert_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_services_check_loop()))
 
-ui.run(title="LLM Usage Dashboard", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)
+ui.run(title="LLM Usage Dashboard", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)
