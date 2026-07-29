@@ -44,6 +44,26 @@ SERVICES = [
         "icon": "gavel",
         "links": [("Open", "https://regtech.carsonng.com")],
     },
+    {
+        "name": "Change Impact Assessor",
+        "desc": "Human-in-the-loop AI risk gate for code/infra changes",
+        "icon": "fact_check",
+        "links": [("Demo", "https://carsonng.short.gy/change-impact-assessor"),
+                  ("GitHub", "https://carsonng.short.gy/change-impact-assessor-github")],
+    },
+    {
+        "name": "Sprint Analyzer",
+        "desc": "AI sprint retrospective generator",
+        "icon": "assessment",
+        "links": [("Demo", "https://carsonng.short.gy/sprint-analyzer"),
+                  ("GitHub", "https://carsonng.short.gy/sprint-analyzer-carsonng")],
+    },
+    {
+        "name": "AWS AI Code Review",
+        "desc": "Automated PR gate: Amazon Q + Inspector security scanning",
+        "icon": "security",
+        "links": [("GitHub", "https://carsonng.short.gy/aws-code-review-github")],
+    },
 ]
 
 _STATUS_CACHE: dict = {}
