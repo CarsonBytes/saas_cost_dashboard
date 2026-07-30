@@ -128,7 +128,7 @@ def alert_banner() -> None:
 
 @ui.refreshable
 def services_row() -> None:
-    ui.label("My Services").classes("text-sm font-bold")
+    ui.label("My Agents").classes("text-sm font-bold")
     with ui.row().classes("w-full flex-wrap gap-3"):
         for svc in services.SERVICES:
             status = services.get_status(svc["name"])

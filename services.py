@@ -70,7 +70,8 @@ SERVICES = [
         "name": "AWS AI Code Review",
         "desc": "Automated PR gate: Amazon Q + Inspector security scanning",
         "icon": "security",
-        "links": [("GitHub", "https://carsonng.short.gy/aws-code-review-github")],
+        "links": [("Demo", "https://github.com/CarsonBytes/aws_code_review/pull/5"),
+                  ("GitHub", "https://carsonng.short.gy/aws-code-review-github")],
     },
 ]
 
