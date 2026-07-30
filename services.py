@@ -19,30 +19,37 @@ SERVICES = [
         "name": "Quant Trading",
         "desc": "Weekly-TSMOM dashboard, live paper + live 17-ETF trading",
         "icon": "show_chart",
-        "links": [("Paper", "https://quant.carsonng.com"), ("Live", "https://quant-live.carsonng.com")],
+        "links": [("Paper", "https://quant.carsonng.com"), ("Live", "https://quant-live.carsonng.com"),
+                  ("GitHub", "https://carsonng.short.gy/quant-trade-analysis-github")],
     },
     {
         "name": "Event Radar",
         "desc": "AI event-discovery portfolio app, real HK events",
         "icon": "event",
-        "links": [("Open", "https://events.carsonng.com")],
+        "links": [("Open", "https://events.carsonng.com"),
+                  ("GitHub", "https://carsonng.short.gy/event-radar-github")],
     },
     {
         "name": "Study Platform",
         "desc": "Supabase + pgvector RAG exam-prep",
         "icon": "school",
-        "links": [("Open", "https://study.carsonng.com")],
+        "links": [("Open", "https://study.carsonng.com"),
+                  ("GitHub", "https://carsonng.short.gy/study-platform-github")],
     },
     {
         "name": "Portfolio",
         "desc": "carsonng.com -- AI governance leadership positioning",
         "icon": "badge",
+        # No GitHub link -- repo is private (confirmed: unauthenticated request 404s),
+        # kept that way deliberately, not showing a link that 404s for anyone else.
         "links": [("Open", "https://carsonng.com")],
     },
     {
         "name": "AI Regulation Radar",
         "desc": "RegTech compliance tracker -- EU AI Act / NIST / HK PCPD",
         "icon": "gavel",
+        # No GitHub link -- this repo has no remote configured at all (local-only git),
+        # unlike every other service here. Not fabricating one.
         "links": [("Open", "https://regtech.carsonng.com"), ("Private", "https://regtech-private.carsonng.com")],
     },
     {
