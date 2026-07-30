@@ -343,7 +343,6 @@ def main_page() -> None:
         dashboard_body()
 
     fetch_stats(STATE["days"])
-    services.refresh_statuses()
     refresh_all()
 
 

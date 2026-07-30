@@ -10,6 +10,7 @@ not a 200. A connection error/timeout is the only thing that means "down".
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
@@ -78,9 +79,17 @@ def _probe(url: str) -> bool:
 
 
 def refresh_statuses() -> None:
-    """Blocking -- call via asyncio.to_thread from async code."""
+    """Blocking -- call via asyncio.to_thread from async code, never from a
+    page-render path directly. Probes run concurrently (up to 12 external
+    HTTP calls across all services today, each with a 5s timeout) -- run
+    sequentially this was a confirmed real bug: a handful of slow/unreachable
+    services could block for their full timeout each, stalling the entire
+    call for up to a minute."""
+    all_urls = [url for svc in SERVICES for _, url in svc["links"]]
+    with ThreadPoolExecutor(max_workers=max(len(all_urls), 1)) as pool:
+        results = dict(zip(all_urls, pool.map(_probe, all_urls)))
     for svc in SERVICES:
-        up = all(_probe(url) for _, url in svc["links"])
+        up = all(results[url] for _, url in svc["links"])
         _STATUS_CACHE[svc["name"]] = {"up": up, "checked_at": time.time()}
 
 
