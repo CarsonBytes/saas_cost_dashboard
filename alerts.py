@@ -21,6 +21,8 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 
+import ledger  # for the shared HKT-day helper -- same "today" as the dashboard's own charts
+
 load_dotenv(Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
@@ -54,7 +56,12 @@ def set_daily_threshold(value: float) -> None:
 
 
 def _today() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    """HKT calendar date, not UTC -- the shared chatanywhere.tech key's own
+    daily quota resets on HKT's day boundary (see quant/event_radar's own
+    fetch_shared_usage_today() fixes), and this dashboard's alert threshold
+    is a "today's cost" check, so it needs to agree with the same "today"
+    everything else in this ecosystem already uses."""
+    return dt.datetime.now(ledger._HKT).strftime("%Y-%m-%d")
 
 
 def _load_state() -> dict:

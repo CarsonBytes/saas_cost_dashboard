@@ -30,6 +30,27 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 _SELECT = "project,call_type,provider,environment,model,purpose,prompt_tokens,completion_tokens,cost_usd,latency_ms,created_at"
 
+# HKT has no DST, always UTC+8, so no zoneinfo/tzdata dependency needed. Mirrors
+# quant's analyst/usage_log.py::_hkt_today_start_utc() and event_radar's
+# app/llm_logging.py::hkt_today_start_utc() -- ported rather than reinvented,
+# since the whole point is every reader of this shared ledger agreeing on the
+# same "today" (this project previously used UTC everywhere -- a real bug: a
+# call made at 3am HKT falls on the *previous* UTC calendar date).
+_HKT = dt.timezone(dt.timedelta(hours=8))
+
+
+def _hkt_today_start_utc() -> dt.datetime:
+    hkt_midnight = dt.datetime.now(_HKT).replace(hour=0, minute=0, second=0, microsecond=0)
+    return hkt_midnight.astimezone(dt.timezone.utc)
+
+
+def _hkt_date_str(created_at: str) -> str:
+    """The HKT calendar date (YYYY-MM-DD) a `created_at` UTC timestamp falls on."""
+    instant = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(_HKT).strftime("%Y-%m-%d")
+
 _UNTAGGED = "(untagged)"
 
 
@@ -55,11 +76,10 @@ def _fill_fallback(row: dict) -> dict:
 
 
 def fetch_rows(days: int) -> list[dict]:
-    """Raw rows for the trailing `days` days (UTC day boundary), most recent first."""
+    """Raw rows for the trailing `days` days (HKT day boundary), most recent first."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set -- see .env.example")
-    since = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) \
-        - dt.timedelta(days=days - 1)
+    since = _hkt_today_start_utc() - dt.timedelta(days=days - 1)
     resp = httpx.get(
         f"{SUPABASE_URL}/rest/v1/llm_calls",
         params={
@@ -102,13 +122,14 @@ def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
 
 
 def daily_by_project(rows: list[dict]) -> dict:
-    """Per-project daily cost, for a stacked trend chart -- a single total
-    line can't tell you which project caused a given day's spike."""
-    dates = sorted({r["created_at"][:10] for r in rows})
+    """Per-project daily (HKT calendar day) cost, for a stacked trend chart --
+    a single total line can't tell you which project caused a given day's
+    spike."""
+    dates = sorted({_hkt_date_str(r["created_at"]) for r in rows})
     projects = sorted({_bucket_key(r, "project") for r in rows})
     matrix = {p: {d: 0.0 for d in dates} for p in projects}
     for r in rows:
-        matrix[_bucket_key(r, "project")][r["created_at"][:10]] += r.get("cost_usd") or 0
+        matrix[_bucket_key(r, "project")][_hkt_date_str(r["created_at"])] += r.get("cost_usd") or 0
     return {
         "dates": dates,
         "series": [{"project": p, "data": [round(matrix[p][d], 6) for d in dates]} for p in projects],
@@ -118,7 +139,7 @@ def daily_by_project(rows: list[dict]) -> dict:
 def build_stats(rows: list[dict], days: int) -> dict:
     daily: dict[str, dict] = defaultdict(lambda: {"calls": 0, "cost_usd": 0.0})
     for row in rows:
-        day = row["created_at"][:10]
+        day = _hkt_date_str(row["created_at"])
         d = daily[day]
         d["calls"] += 1
         d["cost_usd"] += row.get("cost_usd") or 0
@@ -146,8 +167,8 @@ def fetch_stats(days: int) -> dict:
 
 
 def today_cost(rows: list[dict]) -> float:
-    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
-    return round(sum(r.get("cost_usd") or 0 for r in rows if r["created_at"][:10] == today), 6)
+    today = dt.datetime.now(_HKT).strftime("%Y-%m-%d")
+    return round(sum(r.get("cost_usd") or 0 for r in rows if _hkt_date_str(r["created_at"]) == today), 6)
 
 
 def per_1k_usd(bucket: dict) -> float:
