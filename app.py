@@ -219,6 +219,27 @@ def dashboard_body() -> None:
             ui.label("By environment (quant paper/live)").classes("text-sm font-bold")
             _bar_chart(data["by_environment"], "project", ["environment"])
 
+    legacy_usage = ledger.legacy_model_usage(data)
+    if legacy_usage:
+        with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-2 mt-4"):
+            ui.icon("update", color="amber-700")
+            pairs = ", ".join(f"{b['project']}:{b['call_type']}" for b in legacy_usage)
+            ui.label(f"Still calling {ledger.LEGACY_MODEL} instead of {ledger.CURRENT_MODEL}: {pairs}") \
+                .classes("text-sm text-amber-900")
+
+    ui.label("Model usage by project & call type").classes("text-sm font-bold mt-4")
+    model_cols = [
+        {"name": "project", "label": "Project", "field": "project", "sortable": True},
+        {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
+        {"name": "model", "label": "Model", "field": "model", "sortable": True},
+        {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+        {"name": "cost_usd", "label": "Cost (USD)", "field": "cost_usd", "sortable": True},
+    ]
+    model_rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}",
+                   "_key": f"{r['project']}|{r['call_type']}|{r['model']}"}
+                  for r in data["by_project_call_type_model"]]
+    ui.table(columns=model_cols, rows=model_rows, row_key="_key").classes("w-full").props("dense")
+
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("Model efficiency ($/1K tokens, cheapest first)").classes("text-sm font-bold")

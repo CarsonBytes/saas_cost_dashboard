@@ -157,6 +157,7 @@ def build_stats(rows: list[dict], days: int) -> dict:
         "by_model": aggregate_by(rows, ["model"]),
         "by_environment": aggregate_by(rows, ["project", "environment"]),
         "by_provider": aggregate_by(rows, ["provider"]),
+        "by_project_call_type_model": aggregate_by(rows, ["project", "call_type", "model"]),
         "daily_series": daily_series,
         "daily_by_project": daily_by_project(rows),
     }
@@ -198,6 +199,19 @@ def latency_ranking(buckets: list[dict]) -> list[dict]:
 def with_cost_per_call(buckets: list[dict]) -> list[dict]:
     return [b | {"cost_per_call": round(b["cost_usd"] / b["calls"], 6) if b["calls"] else 0}
             for b in buckets]
+
+
+# The specific migration question this table exists to answer: which
+# project/call_type combinations are still calling the older model instead
+# of the current one. Not a general "flag anything that isn't CURRENT_MODEL"
+# rule -- embeddings/deepseek calls are legitimately different models for a
+# different purpose, not stragglers.
+LEGACY_MODEL = "gpt-4o-mini"
+CURRENT_MODEL = "gpt-5-mini"
+
+
+def legacy_model_usage(stats: dict) -> list[dict]:
+    return [b for b in stats["by_project_call_type_model"] if b["model"] == LEGACY_MODEL]
 
 
 def attribution_quality(stats: dict) -> dict:
