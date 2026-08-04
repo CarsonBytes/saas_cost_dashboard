@@ -82,6 +82,10 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-04 — HKT day boundaries, model-usage migration tracking
+- **Every day-boundary calculation switched from UTC to HKT** — the "Today" range filter, the daily cost trend's per-day bucketing, and the alert's same-day dedup all used UTC midnight, the same bug already found and fixed twice elsewhere in this ecosystem (quant's and event-radar's shared-quota counters). A call made at 2am HKT was being attributed to the previous UTC calendar day everywhere. Fixed with the same fixed-UTC+8-offset helper convention already established in those other projects, ported rather than reinvented a third time.
+- **New model-usage breakdown, with a specific migration callout.** A `project × call_type × model` table answers "which model does each call site actually use," and a filtered view surfaces exactly which call types still call `gpt-4o-mini` instead of `gpt-5-mini` — verified live, found 4 real stragglers.
+
 ### 2026-07-30 (later) — public GitHub links, "My Agents", AWS demo link
 - **"My Services" renamed to "My Agents"** throughout the UI and this README — a naming/branding decision, applied consistently rather than left half-updated.
 - **Public GitHub links added for every agent that has one.** Quant, Event Radar, and Study Platform now link to their real (public) repos, reusing the same canonical short-link redirects the portfolio site already uses for consistency. Two deliberate omissions: AI Regulation Radar has no git remote configured at all, and Portfolio's repo is kept private by choice — neither gets a link that would 404 for anyone else visiting.
