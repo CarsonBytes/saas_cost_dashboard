@@ -1,0 +1,26 @@
+#!/bin/bash
+# Triggers the WSL2/Docker redeploy on every push to main. Mirrors
+# D:\quant\.githooks\pre-push exactly.
+#
+# TRACKED in git (unlike .git/hooks/, which is per-clone and never version-
+# controlled) -- after cloning, run once: git config core.hooksPath .githooks
+#
+# NON-BLOCKING ON PURPOSE: git push must never wait on a Docker rebuild (can
+# take 10s-3min). `Start-Process ...` (no -Wait) hands the deploy to a
+# genuinely independent OS process -- not a backgrounded bash job, which on
+# Git-Bash's MSYS process model isn't reliably safe from being torn down when
+# this short-lived hook script exits a moment later -- then this hook exits
+# immediately. Check ~/llm-usage-dashboard-deploy.log (inside WSL2) for the
+# result; a failed deploy does NOT fail the push -- these are deliberately
+# independent concerns (can I save my code vs did the redeploy go cleanly).
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$remote_ref" = "refs/heads/main" ]; then
+        powershell.exe -NoProfile -WindowStyle Hidden -Command \
+            "Start-Process -FilePath wsl.exe -ArgumentList '-d','Ubuntu','--','bash','/mnt/d/llm-usage-dashboard/scripts/wsl2-docker-deploy.sh','push' -WindowStyle Hidden" \
+            >/dev/null 2>&1
+        break
+    fi
+done
+
+exit 0

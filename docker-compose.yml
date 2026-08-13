@@ -1,0 +1,36 @@
+services:
+  dashboard:
+    build: .
+    container_name: saas-cost-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PORT=8095
+    ports:
+      # Cut over 2026-08-13: was 18095:8095 during parallel testing (native
+      # Windows launcher still serving 8095). Native launcher decommissioned,
+      # so this is now the sole deployment -- plain 8095:8095.
+      - "8095:8095"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
+networks:
+  default:
+    # Same fix quant/study-platform's docker-compose.yml already document and
+    # needed: Docker's bridge defaults to MTU 1500, but larger packets (a TLS
+    # ClientHello -- exactly what a Supabase HTTPS call sends) get silently
+    # blackholed somewhere in the real WSL2->host->internet path even when
+    # eth0 itself reports 1500, since that's the WSL VM's own logical
+    # interface, not the effective path MTU. Confirmed live: without this,
+    # every Supabase call failed with "_ssl.c:993: handshake operation timed
+    # out" -- a real, reproduced instance of the same failure class those
+    # other Dockerfiles' comments describe, not a theoretical worry.
+    # Distinct subnet from quant (172.29.0.0/16), study-platform
+    # (172.28.0.0/16), and event-radar (172.30.0.0/16) on this same host.
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16
+    driver_opts:
+      com.docker.network.driver.mtu: "1380"
