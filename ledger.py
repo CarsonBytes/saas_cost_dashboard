@@ -103,17 +103,31 @@ def _bucket_key(row: dict, field: str) -> str:
     return _UNTAGGED if v is None or v == "" else str(v)
 
 
+def _is_untracked(row: dict) -> bool:
+    """A real LLM call essentially never has literally zero tokens on both
+    sides -- so prompt_tokens == completion_tokens == 0 is a reliable signal
+    that this call's cost was never captured (e.g. quant's board_scan before
+    2026-08-14), not that it genuinely cost nothing. Treating this the same
+    as a confirmed $0 is misleading -- it isn't "verified free," it's
+    "unknown," and the difference matters for a total that's used to decide
+    whether spend is under control."""
+    return not (row.get("prompt_tokens") or 0) and not (row.get("completion_tokens") or 0)
+
+
 def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
     buckets: dict[tuple, dict] = {}
     for row in rows:
         key = tuple(_bucket_key(row, f) for f in fields)
         b = buckets.setdefault(key, {f: k for f, k in zip(fields, key)} |
-            {"calls": 0, "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "latency_ms": 0})
+            {"calls": 0, "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
+             "latency_ms": 0, "untracked_calls": 0})
         b["calls"] += 1
         b["cost_usd"] += row.get("cost_usd") or 0
         b["prompt_tokens"] += row.get("prompt_tokens") or 0
         b["completion_tokens"] += row.get("completion_tokens") or 0
         b["latency_ms"] += row.get("latency_ms") or 0
+        if _is_untracked(row):
+            b["untracked_calls"] += 1
     out = list(buckets.values())
     for b in out:
         b["cost_usd"] = round(b["cost_usd"], 6)
@@ -146,12 +160,16 @@ def build_stats(rows: list[dict], days: int) -> dict:
     daily_series = [{"date": d, "calls": v["calls"], "cost_usd": round(v["cost_usd"], 6)}
                      for d, v in sorted(daily.items())]
 
+    untracked_rows = [r for r in rows if _is_untracked(r)]
+
     return {
         "range_days": days,
         "total_calls": len(rows),
         "total_cost_usd": round(sum(r.get("cost_usd") or 0 for r in rows), 6),
         "total_prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in rows),
         "total_completion_tokens": sum(r.get("completion_tokens") or 0 for r in rows),
+        "untracked_calls": len(untracked_rows),
+        "untracked_projects": sorted({_bucket_key(r, "project") for r in untracked_rows}),
         "by_project": aggregate_by(rows, ["project"]),
         "by_call_type": aggregate_by(rows, ["project", "call_type"]),
         "by_model": aggregate_by(rows, ["model"]),

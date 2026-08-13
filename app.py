@@ -86,6 +86,18 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
     }).classes("w-full h-56")
 
 
+def _cost_display(bucket: dict) -> str:
+    """"$0.0000" reads as a confirmed, verified-zero cost -- misleading for a
+    bucket where the tokens (and therefore the cost formula's inputs) were
+    never captured at all. Flag those explicitly instead of showing a
+    precise-looking number that isn't one."""
+    cost = f"${bucket['cost_usd']:.4f}"
+    untracked = bucket.get("untracked_calls", 0)
+    if untracked:
+        cost += f" ({untracked} untracked)"
+    return cost
+
+
 def _efficiency_table(ranked: list[dict], label_field: str) -> None:
     if not ranked:
         ui.label("(no priced calls in this range)").classes("text-sm text-grey")
@@ -105,10 +117,11 @@ def _download_call_types_csv(data: dict) -> None:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["project", "call_type", "calls", "cost_usd", "cost_per_call",
-                      "prompt_tokens", "completion_tokens"])
+                      "prompt_tokens", "completion_tokens", "untracked_calls"])
     for r in ledger.with_cost_per_call(data["by_call_type"]):
         writer.writerow([r["project"], r["call_type"], r["calls"], r["cost_usd"],
-                          r["cost_per_call"], r["prompt_tokens"], r["completion_tokens"]])
+                          r["cost_per_call"], r["prompt_tokens"], r["completion_tokens"],
+                          r.get("untracked_calls", 0)])
     ui.download(buf.getvalue().encode(), filename=f"llm_usage_{data['range_days']}d.csv",
                 media_type="text/csv")
 
@@ -165,6 +178,16 @@ def dashboard_body() -> None:
         with ui.row().classes("w-full items-center gap-2 bg-blue-50 border border-blue-200 rounded p-2 mt-2"):
             ui.icon("lightbulb", color="blue-600")
             ui.label(insight).classes("text-sm text-blue-900")
+
+    if data["untracked_calls"]:
+        with ui.row().classes("w-full items-center gap-2 bg-red-50 border border-red-300 rounded p-2 mt-2"):
+            ui.icon("help_outline", color="red-700")
+            projects = ", ".join(data["untracked_projects"])
+            ui.label(
+                f"{data['untracked_calls']:,} calls ({projects}) show $0.0000 with zero tokens "
+                f"recorded -- that means cost wasn't captured, NOT that the call was free. "
+                f"Total cost below is understated by an unknown amount for these."
+            ).classes("text-sm text-red-900")
 
     avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
     monthly_budget = alerts.ALERT_DAILY_COST_USD * 30
@@ -235,7 +258,7 @@ def dashboard_body() -> None:
         {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
         {"name": "cost_usd", "label": "Cost (USD)", "field": "cost_usd", "sortable": True},
     ]
-    model_rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}",
+    model_rows = [{**r, "cost_usd": _cost_display(r),
                    "_key": f"{r['project']}|{r['call_type']}|{r['model']}"}
                   for r in data["by_project_call_type_model"]]
     ui.table(columns=model_cols, rows=model_rows, row_key="_key").classes("w-full").props("dense")
@@ -275,7 +298,7 @@ def dashboard_body() -> None:
         {"name": "completion_tokens", "label": "Completion tok", "field": "completion_tokens", "sortable": True},
     ]
     call_types_with_avg = ledger.with_cost_per_call(data["by_call_type"])
-    rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}", "cost_per_call": f"{r['cost_per_call']:.6f}"}
+    rows = [{**r, "cost_usd": _cost_display(r), "cost_per_call": f"{r['cost_per_call']:.6f}"}
             for r in call_types_with_avg]
     ui.table(columns=cols, rows=rows, row_key="call_type").classes("w-full").props("dense")
 
