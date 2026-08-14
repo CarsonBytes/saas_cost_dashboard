@@ -163,15 +163,44 @@ def _liveness(svc: dict) -> bool:
     return all(_probe(url) for _, url in svc["links"])
 
 
-def _dependencies_down() -> list[str]:
-    """Independent confirmation of the shared upstream dependencies, from this
-    dashboard's own vantage point (not from the agent under test)."""
-    down = []
-    if not _probe(f"{ledger.SUPABASE_URL.rstrip('/')}/rest/v1/"):
-        down.append("Supabase")
-    if not _probe(_LLM_API_BASE_URL):
-        down.append("LLM API")
-    return down
+def _dependency_probe_results() -> dict[str, bool]:
+    """Raw per-dependency probe result for THIS cycle (True = healthy), from
+    this dashboard's own vantage point (not from the agent under test)."""
+    return {
+        "Supabase": _probe(f"{ledger.SUPABASE_URL.rstrip('/')}/rest/v1/"),
+        "LLM API": _probe(_LLM_API_BASE_URL),
+    }
+
+
+# Consecutive-cycle probe history per dependency, signed: positive = N
+# consecutive healthy cycles, negative = N consecutive failing cycles.
+# A single point-in-time probe is not a reliable enough signal to gate a
+# restart decision (FIXED 2026-08-15: chatanywhere flapping between healthy
+# and unhealthy across single cycles let three staleness-triggered restarts
+# slip through inside one rolling hour and locked Quant Paper -- each restart
+# fired during a cycle where the probe happened to read "up", even though the
+# dependency was down more often than not that whole stretch).
+_DEPS_STREAK: dict[str, int] = {}
+
+
+def _update_dep_streak(dep: str, healthy: bool) -> int:
+    """Advance the consecutive-run counter for one probe result. Returns the
+    new streak."""
+    cur = _DEPS_STREAK.get(dep, 0)
+    _DEPS_STREAK[dep] = cur + 1 if healthy else (cur - 1 if cur <= 0 else -1)
+    return _DEPS_STREAK[dep]
+
+
+def _dep_confirmed_down(streak: int) -> bool:
+    """Blocked-by (and restart suppression) requires the dependency to be down
+    for >=2 consecutive cycles -- a single flaky probe read no longer flips
+    the badge on and off."""
+    return streak <= -2
+
+
+def _dep_confirmed_healthy(streak: int) -> bool:
+    """A dependency is 'stable' only after >=2 consecutive healthy cycles."""
+    return streak >= 2
 
 
 def _latest_write(tag: str) -> str | None:
@@ -241,13 +270,34 @@ def _restart_container(name: str) -> bool:
         return False
 
 
-def _restart_warranted(svc: dict, up: bool, readiness: str) -> bool:
+def _restart_warranted(svc: dict, up: bool, readiness: str,
+                       deps_stable: bool = True) -> bool:
     """Whether the agent's CURRENT check results justify attempting a restart.
-    A liveness failure always does; a staleness signal only does for agents
-    with an enforced write cadence (restart_on_staleness). Pure -- testable."""
+    A liveness failure always does. A staleness signal only does for agents
+    with an enforced write cadence (restart_on_staleness) AND when the shared
+    dependencies are confirmed healthy across consecutive cycles -- a flapping
+    dependency masquerading as agent staleness must not restart the agent
+    (FIXED 2026-08-15: that exact pattern fired three restarts in one hour
+    and locked Quant Paper). Pure -- testable."""
     if not up:
         return True
-    return readiness == "stale" and bool(svc.get("restart_on_staleness"))
+    if readiness != "stale":
+        return False
+    if not svc.get("restart_on_staleness"):
+        return False
+    return deps_stable
+
+
+def _check_healthy(svc: dict, up: bool, readiness: str) -> bool:
+    """Whether this cycle counts as healthy for the 7-day uptime figure.
+    Idle (stale but not restart_on_staleness -- e.g. Study Platform simply
+    having no users) counts healthy, the same way a skipped check (grace
+    period, market closed) already does: the agent itself is fine either way."""
+    if not up:
+        return False
+    if readiness in ("ok", "skipped", "n/a"):
+        return True
+    return readiness == "stale" and not svc.get("restart_on_staleness")
 
 
 def _restart_count(state: dict, name: str, now: dt.datetime) -> int:
@@ -273,12 +323,64 @@ def _restart_eligible(svc: dict, now: dt.datetime, state: dict) -> bool:
 def _lock_agent(state: dict, name: str, now: dt.datetime) -> None:
     state.setdefault("locks", {})[name] = now.isoformat()
     _add_incident(state, name, "locked", outcome="auto-heal disabled")
-    ok = alerts.send_telegram(
-        f"{name} locked: {_RESTART_LOCK_COUNT} restarts within the last hour "
-        f"-- clear the lock from the dashboard",
-        tag="NOC", emoji="\U0001f6a8")
-    _add_incident(state, name, "alert sent",
-                  outcome="telegram" if ok else "telegram failed", detail="lock alert")
+    if _send_lock_alert(name):
+        _add_incident(state, name, "alert sent", outcome="telegram", detail="lock alert")
+    else:
+        # The one notification that exists to say "auto-heal just disabled
+        # itself on a live agent" must not vanish silently (FIXED 2026-08-15:
+        # the Quant Paper lock alert recorded "telegram failed" and nothing
+        # surfaced that anywhere except a log field). Queue it for automatic
+        # retry each health cycle, and surface it as a dashboard banner until
+        # it lands or is dismissed.
+        state.setdefault("pending_alerts", {})[name] = {"kind": "lock alert",
+                                                        "ts": now.isoformat()}
+        _add_incident(state, name, "alert sent", outcome="telegram failed",
+                      detail="lock alert queued for retry -- see dashboard banner")
+
+
+def _send_lock_alert(name: str) -> bool:
+    """Send the lock Telegram alert, retrying once after a short pause -- the
+    2026-08-14 failure was a transient network blip (the next alert eight
+    seconds later landed), so one immediate retry would have caught it."""
+    msg = (f"{name} locked: {_RESTART_LOCK_COUNT} restarts within the last hour "
+           f"-- clear the lock from the dashboard")
+    if alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8"):
+        return True
+    time.sleep(5)
+    return alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8")
+
+
+def _retry_pending_alerts(state: dict) -> None:
+    """Best-effort resend of failed lock alerts, once per health cycle; clears
+    the pending entry on success."""
+    for name in list(state.get("pending_alerts", {})):
+        if alerts.send_telegram(
+                f"{name} locked: {_RESTART_LOCK_COUNT} restarts within the last hour "
+                f"-- clear the lock from the dashboard",
+                tag="NOC", emoji="\U0001f6a8"):
+            del state["pending_alerts"][name]
+            _add_incident(state, name, "alert sent", outcome="telegram (retry)",
+                          detail="lock alert")
+        else:
+            break  # still failing -- try again next cycle
+
+
+def get_pending_alerts() -> dict:
+    """Failed lock alerts still awaiting delivery -- drives the dashboard
+    banner so a failed push is never the user's only warning."""
+    return dict(_load_state().get("pending_alerts", {}))
+
+
+def dismiss_pending() -> None:
+    """UI action: acknowledge the delivery-failure banner. Logged to the
+    incident log so the dismissal is attributable."""
+    with _STATE_LOCK:
+        state = _load_state()
+        pending = state.pop("pending_alerts", {})
+        for name in pending:
+            _add_incident(state, name, "alert sent", outcome="dismissed by user",
+                          detail="lock alert banner")
+        _save_state(state)
 
 
 def clear_lock(name: str) -> None:
@@ -290,6 +392,7 @@ def clear_lock(name: str) -> None:
             del state["locks"][name]
             state.get("restarts", {}).pop(name, None)
             _add_incident(state, name, "unlocked", outcome="restart window reset")
+        state.get("pending_alerts", {}).pop(name, None)  # stale once unlocked
         _save_state(state)
     if name in _STATUS_CACHE:
         _STATUS_CACHE[name]["locked"] = False
@@ -373,7 +476,13 @@ def _refresh_health() -> None:
         with ThreadPoolExecutor(max_workers=max(len(monitored), 1)) as pool:
             up_map = dict(zip([s["name"] for s in monitored], pool.map(_liveness, monitored)))
 
-        deps_down = _dependencies_down()
+        dep_results = _dependency_probe_results()
+        dep_streaks = {dep: _update_dep_streak(dep, ok) for dep, ok in dep_results.items()}
+        # confirmed down = 2+ consecutive failing cycles (flapping-proof badge);
+        # stable = every dependency confirmed healthy for 2+ consecutive cycles
+        # (required before a staleness-triggered restart may proceed).
+        confirmed_down = [dep for dep, s in dep_streaks.items() if _dep_confirmed_down(s)]
+        deps_stable = all(_dep_confirmed_healthy(s) for s in dep_streaks.values())
 
         writers = [s for s in monitored if s.get("project_tag")]
         with ThreadPoolExecutor(max_workers=max(len(writers), 1)) as pool:
@@ -396,16 +505,17 @@ def _refresh_health() -> None:
                                                last_write_map.get(name))
 
             unhealthy = (not up) or (readiness == "stale")
-            blocked_by = list(deps_down) if (unhealthy and deps_down) else []
+            blocked_by = list(confirmed_down) if (unhealthy and confirmed_down) else []
             was_blocked = bool(prev.get(name, {}).get("blocked_by"))
             if blocked_by and not was_blocked:
                 _add_incident(state, name, "blocked-by-dependency",
                               outcome=", ".join(blocked_by),
                               detail="restart suppressed while dependency is down")
 
-            if _restart_warranted(svc, up, readiness) and svc["restart"] == "auto_heal":
+            if _restart_warranted(svc, up, readiness, deps_stable) \
+                    and svc["restart"] == "auto_heal":
                 if blocked_by:
-                    pass  # circuit breaker: dependency down, restarting can't help
+                    pass  # circuit breaker: dependency confirmed down
                 elif locked:
                     pass
                 elif _restart_eligible(svc, now, state):
@@ -427,9 +537,11 @@ def _refresh_health() -> None:
                               outcome="telegram" if ok else "telegram failed",
                               detail="down alert")
 
-            # uptime: "healthy" = liveness ok AND readiness not stale (skipped
-            # during grace / outside market hours counts as healthy)
-            healthy = up and (readiness in ("ok", "skipped", "n/a"))
+            # uptime: "healthy" = liveness ok AND readiness not a real fault.
+            # Idle (stale but not restart_on_staleness, e.g. Study Platform
+            # simply having no users) counts healthy, the same way a skipped
+            # check (grace / market closed) already does.
+            healthy = _check_healthy(svc, up, readiness)
             _record_check(state, name, healthy, now)
 
             _STATUS_CACHE[name] = {
@@ -445,6 +557,7 @@ def _refresh_health() -> None:
                                        or unhealthy) if svc["restart"] == "alert_only" else False,
             }
 
+        _retry_pending_alerts(state)
         _save_state(state)
 
 
@@ -529,6 +642,67 @@ def _selftest() -> None:
             self.assertFalse(_restart_warranted(enforced, up=True, readiness="ok"))
             self.assertFalse(_restart_warranted(enforced, up=True, readiness="skipped"))
             self.assertFalse(_restart_warranted(enforced, up=True, readiness="n/a"))
+            # staleness with an unstable dependency never warrants a restart
+            self.assertFalse(_restart_warranted(enforced, up=True, readiness="stale",
+                                                deps_stable=False))
+            # liveness still warrants a restart even while deps flap
+            self.assertTrue(_restart_warranted(enforced, up=False, readiness="stale",
+                                               deps_stable=False))
+
+        def test_flapping_dependency_replay(self):
+            """Replay of the 2026-08-14 15:14-17:41 UTC window: chatanywhere
+            flapped down/up/down/up (single healthy cycles between down
+            episodes). With consecutive-cycle confirmation, neither
+            confirmed_down nor confirmed_healthy ever becomes true -- so the
+            three staleness-triggered restarts that locked Quant Paper that
+            evening are all suppressed."""
+            _DEPS_STREAK.clear()
+            # the documented probe pattern: down, then a single up, repeated
+            pattern = [False, True, False, True, False, True, False, True]
+            suppressed = 0
+            for ok in pattern:
+                streak = _update_dep_streak("LLM API", ok)
+                self.assertFalse(_dep_confirmed_healthy(streak),
+                                 "single-cycle up must never confirm the dep stable")
+                self.assertFalse(_dep_confirmed_down(streak),
+                                 "single-cycle down must never confirm the dep down")
+                deps_stable = all(_dep_confirmed_healthy(s)
+                                  for s in _DEPS_STREAK.values())
+                if not _restart_warranted({"restart_on_staleness": True},
+                                          up=True, readiness="stale",
+                                          deps_stable=deps_stable):
+                    suppressed += 1
+            self.assertEqual(suppressed, len(pattern),
+                             "every staleness-restart opportunity in the flap window "
+                             "must be suppressed")
+            _DEPS_STREAK.clear()
+            # two consecutive failures DO confirm the dependency down (blocked)
+            _update_dep_streak("LLM API", False)
+            self.assertTrue(_dep_confirmed_down(_update_dep_streak("LLM API", False)))
+            # recovery is asymmetric on purpose: after a confirmed outage the
+            # dependency must hold healthy across consecutive cycles again
+            # (climbing back through zero) before staleness restarts resume --
+            # one or two good readings off the back of a flap prove nothing.
+            self.assertFalse(_dep_confirmed_healthy(_update_dep_streak("LLM API", True)))
+            self.assertFalse(_dep_confirmed_healthy(_update_dep_streak("LLM API", True)))
+            self.assertFalse(_dep_confirmed_healthy(_update_dep_streak("LLM API", True)))
+            self.assertTrue(_dep_confirmed_healthy(_update_dep_streak("LLM API", True)))
+            self.assertTrue(_restart_warranted({"restart_on_staleness": True},
+                                               up=True, readiness="stale",
+                                               deps_stable=True))
+            _DEPS_STREAK.clear()
+
+        def test_idle_counts_healthy_for_uptime(self):
+            # usage-driven agent (Study Platform) stale = idle: the agent is
+            # fine, just unused -- counts healthy, never restart-warranted.
+            usage = {"restart_on_staleness": False}
+            enforced = {"restart_on_staleness": True}
+            self.assertTrue(_check_healthy(usage, up=True, readiness="stale"))
+            self.assertFalse(_check_healthy(enforced, up=True, readiness="stale"))
+            self.assertFalse(_check_healthy(usage, up=False, readiness="stale"))
+            self.assertTrue(_check_healthy(usage, up=True, readiness="ok"))
+            self.assertTrue(_check_healthy(usage, up=True, readiness="skipped"))
+            self.assertTrue(_check_healthy(usage, up=True, readiness="n/a"))
 
         def test_uptime(self):
             state = {}

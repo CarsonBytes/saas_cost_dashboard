@@ -134,6 +134,27 @@ def alert_banner() -> None:
 
 
 @ui.refreshable
+def noc_banner() -> None:
+    """Persistent surface for a lock-alert Telegram delivery failure -- a
+    failed push must never be the user's only warning (FIXED 2026-08-15:
+    the Quant Paper lock alert recorded 'telegram failed' and nothing
+    surfaced that anywhere except the incident log)."""
+    pending = noc.get_pending_alerts()
+    if not pending:
+        return
+    names = ", ".join(pending)
+    with ui.row().classes("w-full items-center gap-2 bg-red-100 border border-red-300 rounded p-3"):
+        ui.icon("report_problem", color="red-600")
+        ui.label(
+            f"NOC alert delivery failed for: {names}. Auto-heal has disabled itself on "
+            f"these agents and the Telegram notification did not get through -- "
+            f"retrying automatically; dismiss when acknowledged."
+        ).classes("text-red-800 font-medium")
+        ui.button("Dismiss", on_click=lambda: (noc.dismiss_pending(), refresh_all())) \
+            .props("dense flat color=red")
+
+
+@ui.refreshable
 def services_row() -> None:
     # No "My Agents" heading: the cards render directly, nothing above them.
     with ui.row().classes("w-full flex-wrap gap-3"):
@@ -148,7 +169,13 @@ def services_row() -> None:
                         elif not up:
                             icon_color = "red-600"           # down
                         elif status and status["readiness"] == "stale":
-                            icon_color = "amber-500"         # degraded
+                            # stale means different things depending on the
+                            # agent class: enforced-cadence -> a real fault
+                            # (amber); usage-driven (Study Platform) -> just
+                            # idle, neutral tone, nothing wrong (FIXED
+                            # 2026-08-15: both rendered identically).
+                            icon_color = "amber-500" if svc.get("restart_on_staleness") \
+                                else "grey-500"
                         else:
                             icon_color = "green-600"         # healthy
                     else:
@@ -168,8 +195,12 @@ def services_row() -> None:
                     if status["up"] is False:
                         ui.label("down").classes("text-xs text-red-600")
                     elif status["readiness"] == "stale":
-                        ui.label(f"degraded -- {status['readiness_detail'] or 'stale data'}")\
-                            .classes("text-xs text-amber-600")
+                        if svc.get("restart_on_staleness"):
+                            ui.label(f"degraded -- {status['readiness_detail'] or 'stale data'}")\
+                                .classes("text-xs text-amber-600")
+                        else:
+                            ui.label(f"idle -- {status['readiness_detail'] or 'no recent usage'}")\
+                                .classes("text-xs text-grey-6")
                     if status.get("blocked_by"):
                         ui.label("blocked by: " + ", ".join(status["blocked_by"])).classes(
                             "text-xs text-amber-700 bg-amber-50 rounded px-1 mt-1")
@@ -373,6 +404,7 @@ def _reliability_tab(data: dict) -> None:
 
 def refresh_all() -> None:
     alert_banner.refresh()
+    noc_banner.refresh()
     services_row.refresh()
     incident_log.refresh()
     dashboard_body.refresh()
@@ -392,6 +424,7 @@ async def _alert_check_loop() -> None:
 async def _services_check_loop() -> None:
     while True:
         await asyncio.to_thread(noc.refresh_health)
+        noc_banner.refresh()
         services_row.refresh()
         incident_log.refresh()
         await asyncio.sleep(_SERVICES_CHECK_INTERVAL_SEC)
@@ -439,6 +472,7 @@ def main_page() -> None:
             ui.button("Save", on_click=_save_threshold).props("dense flat")
 
         alert_banner()
+        noc_banner()
         services_row()
         ui.separator().classes("my-2")
         dashboard_body()
