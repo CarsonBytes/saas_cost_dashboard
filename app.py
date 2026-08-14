@@ -157,10 +157,18 @@ def noc_banner() -> None:
 @ui.refreshable
 def services_row() -> None:
     # No "My Agents" heading: the cards render directly, nothing above them.
-    with ui.row().classes("w-full flex-wrap gap-3"):
+    # Equal-width / equal-height grid (FIXED 2026-08-15): the old flex row
+    # let content-driven sizing compound with `grow`, so a card with more
+    # links or more status lines rendered visibly wider and taller than its
+    # siblings. CSS grid with auto-fill tracks makes every card in a row the
+    # same width; grid items stretch to the row height by default; and a
+    # reserved status slot (below) keeps quiet and busy cards the same size
+    # instead of letting optional lines change the footprint. Uses a plain
+    # div rather than ui.row so its own `display:flex` can't fight the grid.
+    with ui.element("div").classes("w-full grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3"):
         for svc in services.SERVICES:
             status = noc.get_status(svc["name"])
-            with ui.card().classes("min-w-[200px] grow"):
+            with ui.card().classes("w-full h-full min-h-[120px]"):
                 with ui.row().classes("items-center gap-2"):
                     if svc["monitor"]:
                         up = status["up"] if status else None
@@ -191,26 +199,32 @@ def services_row() -> None:
                         if label == "Private":               # generic, off the label
                             ui.icon("lock", size="12px").classes("text-grey-6")
                         ui.link(label, url, new_tab=True).classes("text-sm")
-                if svc["monitor"] and status:
-                    if status["up"] is False:
-                        ui.label("down").classes("text-xs text-red-600")
-                    elif status["readiness"] == "stale":
-                        if svc.get("restart_on_staleness"):
-                            ui.label(f"degraded -- {status['readiness_detail'] or 'stale data'}")\
-                                .classes("text-xs text-amber-600")
-                        else:
-                            ui.label(f"idle -- {status['readiness_detail'] or 'no recent usage'}")\
-                                .classes("text-xs text-grey-6")
-                    if status.get("blocked_by"):
-                        ui.label("blocked by: " + ", ".join(status["blocked_by"])).classes(
-                            "text-xs text-amber-700 bg-amber-50 rounded px-1 mt-1")
-                    if status.get("uptime_7d") is not None:
-                        ui.label(f"7d uptime: {status['uptime_7d']:.1f}%").classes(
-                            "text-xs text-grey-6 mt-1")
-                    if svc["restart"] == "auto_heal" and status.get("locked"):
-                        ui.button("Clear lock", on_click=lambda s=svc: (
-                            noc.clear_lock(s["name"]), services_row.refresh())) \
-                            .props("dense flat color=red")
+                # Reserved status slot: ALWAYS present, on every card, rendered
+                # empty when there's nothing to say -- a busy card (down,
+                # blocked by, uptime, clear-lock button) and a quiet one (or a
+                # no-monitor demo card) keep the same footprint, so the grid
+                # stays visually even without hiding any information.
+                with ui.column().classes("w-full mt-1 min-h-[40px] justify-start"):
+                    if svc["monitor"] and status:
+                        if status["up"] is False:
+                            ui.label("down").classes("text-xs text-red-600")
+                        elif status["readiness"] == "stale":
+                            if svc.get("restart_on_staleness"):
+                                ui.label(f"degraded -- {status['readiness_detail'] or 'stale data'}")\
+                                    .classes("text-xs text-amber-600")
+                            else:
+                                ui.label(f"idle -- {status['readiness_detail'] or 'no recent usage'}")\
+                                    .classes("text-xs text-grey-6")
+                        if status.get("blocked_by"):
+                            ui.label("blocked by: " + ", ".join(status["blocked_by"])).classes(
+                                "text-xs text-amber-700 bg-amber-50 rounded px-1 mt-1")
+                        if status.get("uptime_7d") is not None:
+                            ui.label(f"7d uptime: {status['uptime_7d']:.1f}%").classes(
+                                "text-xs text-grey-6 mt-1")
+                        if svc["restart"] == "auto_heal" and status.get("locked"):
+                            ui.button("Clear lock", on_click=lambda s=svc: (
+                                noc.clear_lock(s["name"]), services_row.refresh())) \
+                                .props("dense flat color=red")
 
 
 @ui.refreshable
