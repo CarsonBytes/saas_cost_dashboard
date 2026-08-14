@@ -1,40 +1,90 @@
-"""Static registry + live health-check for the other carsonng.com properties,
-shown as a "My Services" strip above the cost dashboard. Turns this app into
-a personal ops hub, not just a cost viewer.
+"""Static registry for the other carsonng.com properties, rendered as the
+agent-cards strip above the cost dashboard -- this app is a personal ops hub,
+not just a cost viewer.
 
-Health check is a plain reachability probe (did we get *any* HTTP response,
-not a specific status code) -- quant/quant-live sit behind Cloudflare Access,
-so a healthy instance still answers with a redirect to the Access login page,
-not a 200. A connection error/timeout is the only thing that means "down".
+DELIBERATELY A PURE REGISTRY: no probing, no runtime state, no health logic.
+All monitoring lives in noc.py (liveness probes, Supabase-ledger readiness,
+blocked-by dependency checks, restart authority, cooldown/lock, incident log,
+7-day uptime), which reads this registry. Keeping the card definitions a
+one-glance data table and the health logic in one testable module is the
+point of the split.
+
+Per-entry fields:
+  name / desc / icon / links  -- as rendered on the card.
+  monitor                     -- False = pure link card (no status dot, never
+                                 probed at all). True = monitored (noc.py).
+  restart                     -- "auto_heal": noc.py restarts this agent's own
+                                 Docker container on failure (a 3-per-hour
+                                 cooldown locks it until cleared from the UI).
+                                 "alert_only": Telegram alert on failure, no
+                                 restart ever. "none": nothing beyond the
+                                 status dot.
+  project_tag / freshness_sec -- readiness (freshness) config: which project
+                                 tag in the shared Supabase llm_calls ledger to
+                                 watch, and how old that tag's latest write may
+                                 be before the agent reads as "degraded"
+                                 (reachable but stale). None = liveness only.
+  container                   -- Docker container name to restart (auto_heal).
+
+Health semantics (details in noc.py): liveness is a plain reachability probe
+(did we get *any* HTTP response, not a specific status code) -- these apps sit
+behind Cloudflare Access, so a healthy instance still answers with a redirect
+to the Access login page, not a 200. A connection error/timeout is the only
+thing that means "down".
 """
 from __future__ import annotations
 
-import time
-from concurrent.futures import ThreadPoolExecutor
-
-import httpx
-
 SERVICES = [
     {
-        "name": "Quant Trading",
-        "desc": "Weekly-TSMOM dashboard, live paper + live 17-ETF trading",
+        "name": "Quant Trading (Paper)",
+        "desc": "Weekly-TSMOM dashboard, paper trading",
         "icon": "show_chart",
-        "links": [("Paper", "https://quant.carsonng.com"), ("Live", "https://quant-live.carsonng.com"),
+        "links": [("Paper", "https://quant.carsonng.com"),
                   ("GitHub", "https://carsonng.short.gy/quant-trade-analysis-github")],
+        "monitor": True,
+        "restart": "auto_heal",
+        "project_tag": "quant",
+        "freshness_sec": 900,          # writes every ~1min during market hours
+        "container": "quant-dashboard-docker",
+    },
+    {
+        # Splitting the old combined Quant Trading card: Live runs as a native
+        # Windows deployment with its own separately-tuned watchdog, and this
+        # dashboard must not monitor, probe, or restart it -- that's deliberate
+        # (see the round's scope notes), not an oversight.
+        "name": "Quant Trading (Live)",
+        "desc": "Live 17-ETF trading, native deployment with own watchdog",
+        "icon": "show_chart",
+        "links": [("Live", "https://quant-live.carsonng.com")],
+        "monitor": False,
+        "restart": "none",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
     },
     {
         "name": "Event Radar",
         "desc": "AI event-discovery portfolio app, real HK events",
         "icon": "event",
-        "links": [("Open", "https://events.carsonng.com"),
+        "links": [("Demo", "https://events-demo.carsonng.com"),
+                  ("Private", "https://events.carsonng.com"),
                   ("GitHub", "https://carsonng.short.gy/event-radar-github")],
+        "monitor": True,
+        "restart": "auto_heal",
+        "project_tag": "events",
+        "freshness_sec": 86400,        # ingest runs every 24h
+        "container": "event-radar",
     },
     {
         "name": "Study Platform",
         "desc": "Supabase + pgvector RAG exam-prep",
         "icon": "school",
-        "links": [("Open", "https://study.carsonng.com"),
-                  ("GitHub", "https://carsonng.short.gy/study-platform-github")],
+        "links": [("Private", "https://study.carsonng.com")],
+        "monitor": True,
+        "restart": "auto_heal",
+        "project_tag": "study",
+        "freshness_sec": 43200,        # user-driven usage, ~daily
+        "container": "study-app",
     },
     {
         "name": "Portfolio",
@@ -43,6 +93,11 @@ SERVICES = [
         # No GitHub link -- repo is private (confirmed: unauthenticated request 404s),
         # kept that way deliberately, not showing a link that 404s for anyone else.
         "links": [("Open", "https://carsonng.com")],
+        "monitor": True,
+        "restart": "alert_only",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
     },
     {
         "name": "AI Regulation Radar",
@@ -51,6 +106,11 @@ SERVICES = [
         # No GitHub link -- this repo has no remote configured at all (local-only git),
         # unlike every other service here. Not fabricating one.
         "links": [("Open", "https://regtech.carsonng.com"), ("Private", "https://regtech-private.carsonng.com")],
+        "monitor": True,
+        "restart": "alert_only",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
     },
     {
         "name": "Change Impact Assessor",
@@ -58,6 +118,14 @@ SERVICES = [
         "icon": "fact_check",
         "links": [("Demo", "https://carsonng.short.gy/change-impact-assessor"),
                   ("GitHub", "https://carsonng.short.gy/change-impact-assessor-github")],
+        # No monitor: a GitHub PR page / Streamlit sleep-gate / HF Space aren't
+        # reliable enough to be worth probing, and dropping them from the probe
+        # loop also means fewer HTTP calls per refresh cycle.
+        "monitor": False,
+        "restart": "none",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
     },
     {
         "name": "Sprint Analyzer",
@@ -65,6 +133,11 @@ SERVICES = [
         "icon": "assessment",
         "links": [("Demo", "https://carsonng.short.gy/sprint-analyzer"),
                   ("GitHub", "https://carsonng.short.gy/sprint-analyzer-carsonng")],
+        "monitor": False,
+        "restart": "none",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
     },
     {
         "name": "AWS AI Code Review",
@@ -72,34 +145,10 @@ SERVICES = [
         "icon": "security",
         "links": [("Demo", "https://github.com/CarsonBytes/aws_code_review/pull/5"),
                   ("GitHub", "https://carsonng.short.gy/aws-code-review-github")],
+        "monitor": False,
+        "restart": "none",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
     },
 ]
-
-_STATUS_CACHE: dict = {}
-
-
-def _probe(url: str) -> bool:
-    try:
-        resp = httpx.head(url, timeout=5, follow_redirects=True)
-        return resp.status_code < 500
-    except Exception:
-        return False
-
-
-def refresh_statuses() -> None:
-    """Blocking -- call via asyncio.to_thread from async code, never from a
-    page-render path directly. Probes run concurrently (up to 12 external
-    HTTP calls across all services today, each with a 5s timeout) -- run
-    sequentially this was a confirmed real bug: a handful of slow/unreachable
-    services could block for their full timeout each, stalling the entire
-    call for up to a minute."""
-    all_urls = [url for svc in SERVICES for _, url in svc["links"]]
-    with ThreadPoolExecutor(max_workers=max(len(all_urls), 1)) as pool:
-        results = dict(zip(all_urls, pool.map(_probe, all_urls)))
-    for svc in SERVICES:
-        up = all(results[url] for _, url in svc["links"])
-        _STATUS_CACHE[svc["name"]] = {"up": up, "checked_at": time.time()}
-
-
-def get_status(name: str) -> dict | None:
-    return _STATUS_CACHE.get(name)

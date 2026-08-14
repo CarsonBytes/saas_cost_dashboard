@@ -87,14 +87,18 @@ def is_telegram_configured() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str, tag: str = "LLM-COST", emoji: str = "\U0001f4b8") -> bool:
+    """Push `message` to the configured Telegram chat. Defaults preserve the
+    original cost-alert shape (💸 [LLM-COST] ...); the NOC layer (noc.py)
+    passes tag="NOC" and a different emoji so its alerts read distinctly in
+    the same chat."""
     if not is_telegram_configured():
         log.debug("alerts: TELEGRAM_BOT_TOKEN/CHAT_ID not set, skipping: %s", message)
         return False
     try:
         resp = httpx.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"\U0001f4b8 [LLM-COST] {message}"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{emoji} [{tag}] {message}"},
             timeout=10,
         )
         if resp.status_code != 200:

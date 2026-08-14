@@ -7,4 +7,8 @@ dependencies = [
     "nicegui==3.14.0",
     "httpx==0.28.1",
     "python-dotenv==1.2.2",
+    # NYSE calendar for the Quant Paper market-hours readiness exception --
+    # same package quant's dashboard/core/market_calendar.py uses, pinned to
+    # the same version.
+    "pandas-market-calendars==5.4.0",
 ]

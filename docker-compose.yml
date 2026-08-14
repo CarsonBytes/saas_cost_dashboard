@@ -12,6 +12,13 @@ services:
       # Windows launcher still serving 8095). Native launcher decommissioned,
       # so this is now the sole deployment -- plain 8095:8095.
       - "8095:8095"
+    volumes:
+      # NOC restart authority (noc.py): the dashboard restarts the other
+      # agents' containers via the Docker Engine API over this socket -- the
+      # same WSL2 daemon all these compose projects share. Read-write mount,
+      # because the API client writes to the socket. Personal single-user
+      # host, accepted risk.
+      - /var/run/docker.sock:/var/run/docker.sock
     dns:
       - 8.8.8.8
       - 1.1.1.1

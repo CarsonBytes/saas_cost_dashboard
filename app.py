@@ -18,6 +18,12 @@ reuses D:\\quant\\analyst\\.env's TELEGRAM_BOT_TOKEN/CHAT_ID), an
 auto-generated "biggest spender" insight line, and a projected-monthly-cost
 KPI -- the actual FinOps/insight layer the original version never had.
 
+ADDED 2026-08-14: the agent-cards strip became the start of a personal NOC --
+two-layer health (liveness + Supabase-ledger readiness), blocked-by badges,
+per-agent auto-restart with cooldown/lock, an incident log, and 7-day uptime,
+all driven by `noc.py` (see its docstring). The health/restart loop runs as a
+background task via asyncio.to_thread so it never blocks page rendering.
+
 Run:  uv run python app.py      (then open http://localhost:8095)
 
 Env (put in .env, see .env.example):
@@ -38,6 +44,7 @@ from nicegui import app, ui
 
 import alerts
 import ledger  # both load .env themselves on import
+import noc
 import services
 
 STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch": None,
@@ -128,20 +135,71 @@ def alert_banner() -> None:
 
 @ui.refreshable
 def services_row() -> None:
-    ui.label("My Agents").classes("text-sm font-bold")
+    # No "My Agents" heading: the cards render directly, nothing above them.
     with ui.row().classes("w-full flex-wrap gap-3"):
         for svc in services.SERVICES:
-            status = services.get_status(svc["name"])
-            up = status["up"] if status else None
-            icon_color = "grey-400" if up is None else ("green-600" if up else "red-600")
+            status = noc.get_status(svc["name"])
             with ui.card().classes("min-w-[200px] grow"):
                 with ui.row().classes("items-center gap-2"):
+                    if svc["monitor"]:
+                        up = status["up"] if status else None
+                        if up is None:
+                            icon_color = "grey-400"          # not checked yet
+                        elif not up:
+                            icon_color = "red-600"           # down
+                        elif status and status["readiness"] == "stale":
+                            icon_color = "amber-500"         # degraded
+                        else:
+                            icon_color = "green-600"         # healthy
+                    else:
+                        icon_color = "grey-500"              # no monitor, no dot
                     ui.icon(svc["icon"], color=icon_color).classes("text-2xl")
                     ui.label(svc["name"]).classes("font-bold")
+                    if status and status.get("locked"):
+                        ui.label("Locked").classes(
+                            "text-xs bg-red-100 text-red-700 rounded px-1")
                 ui.label(svc["desc"]).classes("text-xs text-grey-6")
-                with ui.row().classes("gap-2 mt-1"):
+                with ui.row().classes("items-center gap-1 mt-1 flex-wrap"):
                     for label, url in svc["links"]:
+                        if label == "Private":               # generic, off the label
+                            ui.icon("lock", size="12px").classes("text-grey-6")
                         ui.link(label, url, new_tab=True).classes("text-sm")
+                if svc["monitor"] and status:
+                    if status["up"] is False:
+                        ui.label("down").classes("text-xs text-red-600")
+                    elif status["readiness"] == "stale":
+                        ui.label(f"degraded -- {status['readiness_detail'] or 'stale data'}")\
+                            .classes("text-xs text-amber-600")
+                    if status.get("blocked_by"):
+                        ui.label("blocked by: " + ", ".join(status["blocked_by"])).classes(
+                            "text-xs text-amber-700 bg-amber-50 rounded px-1 mt-1")
+                    if status.get("uptime_7d") is not None:
+                        ui.label(f"7d uptime: {status['uptime_7d']:.1f}%").classes(
+                            "text-xs text-grey-6 mt-1")
+                    if svc["restart"] == "auto_heal" and status.get("locked"):
+                        ui.button("Clear lock", on_click=lambda s=svc: (
+                            noc.clear_lock(s["name"]), services_row.refresh())) \
+                            .props("dense flat color=red")
+
+
+@ui.refreshable
+def incident_log() -> None:
+    incidents = noc.get_incidents()
+    if not incidents:
+        return
+    ui.label("Incident log").classes("text-sm font-bold mt-4")
+    cols = [
+        {"name": "ts", "label": "Time (UTC)", "field": "ts", "sortable": True},
+        {"name": "agent", "label": "Agent", "field": "agent", "sortable": True},
+        {"name": "event", "label": "Event", "field": "event", "sortable": True},
+        {"name": "outcome", "label": "Outcome", "field": "outcome"},
+        {"name": "detail", "label": "Detail", "field": "detail"},
+    ]
+    rows = [{"ts": i["ts"][:19].replace("T", " "), "agent": i["agent"],
+             "event": i["event"], "outcome": i.get("outcome", ""),
+             "detail": i.get("detail", "")} for i in incidents]
+    ui.table(columns=cols, rows=rows, row_key="ts").classes("w-full").props(
+        "dense max-height=240px")
 
 
 @ui.refreshable
@@ -296,6 +354,7 @@ def dashboard_body() -> None:
 def refresh_all() -> None:
     alert_banner.refresh()
     services_row.refresh()
+    incident_log.refresh()
     dashboard_body.refresh()
 
 
@@ -312,8 +371,9 @@ async def _alert_check_loop() -> None:
 
 async def _services_check_loop() -> None:
     while True:
-        await asyncio.to_thread(services.refresh_statuses)
+        await asyncio.to_thread(noc.refresh_health)
         services_row.refresh()
+        incident_log.refresh()
         await asyncio.sleep(_SERVICES_CHECK_INTERVAL_SEC)
 
 
@@ -360,6 +420,7 @@ def main_page() -> None:
 
         alert_banner()
         services_row()
+        incident_log()
         ui.separator().classes("my-2")
         dashboard_body()
 

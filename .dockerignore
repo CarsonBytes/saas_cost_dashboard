@@ -7,3 +7,4 @@ __pycache__/
 .nicegui/
 alert_state.json
 alert_settings.json
+noc_state.json

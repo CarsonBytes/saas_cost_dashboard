@@ -30,6 +30,7 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
         --exclude='.venv' --exclude='.git' --exclude='__pycache__' \
         --exclude='*.pyc' --exclude='.env' --exclude='.nicegui' \
         --exclude='alert_state.json' --exclude='alert_settings.json' \
+        --exclude='noc_state.json' \
         /mnt/d/llm-usage-dashboard/ /home/cap/llm-usage-dashboard/
     rsync_rc=$?
     if [ $rsync_rc -ne 0 ]; then
