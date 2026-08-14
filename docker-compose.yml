@@ -12,12 +12,30 @@ services:
       # Windows launcher still serving 8095). Native launcher decommissioned,
       # so this is now the sole deployment -- plain 8095:8095.
       - "8095:8095"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    depends_on:
+      - restart-proxy
+
+  # Restart-only Docker proxy (see restart_proxy.py): the ONLY component that
+  # holds the host Docker socket. The dashboard no longer mounts it (FIXED
+  # 2026-08-15: a public-facing dashboard holding raw socket access was
+  # effectively root over every container on the host, reachable from the open
+  # internet). The proxy accepts exactly one action -- POST /restart for a
+  # container name on its allow-list -- so a compromised dashboard can only
+  # restart the three auto-heal agents, nothing else on the daemon. No host
+  # port is published; the dashboard reaches it over the compose-internal
+  # network only.
+  restart-proxy:
+    build: .
+    container_name: saas-cost-restart-proxy
+    restart: unless-stopped
+    command: ["python", "restart_proxy.py"]
+    environment:
+      - RESTART_PROXY_PORT=8096
+      - ALLOWED_CONTAINERS=quant-dashboard-docker,event-radar,study-app
     volumes:
-      # NOC restart authority (noc.py): the dashboard restarts the other
-      # agents' containers via the Docker Engine API over this socket -- the
-      # same WSL2 daemon all these compose projects share. Read-write mount,
-      # because the API client writes to the socket. Personal single-user
-      # host, accepted risk.
       - /var/run/docker.sock:/var/run/docker.sock
     dns:
       - 8.8.8.8

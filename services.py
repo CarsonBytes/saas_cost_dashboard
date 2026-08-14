@@ -24,6 +24,16 @@ Per-entry fields:
                                  watch, and how old that tag's latest write may
                                  be before the agent reads as "degraded"
                                  (reachable but stale). None = liveness only.
+  restart_on_staleness        -- whether a STALE readiness result may itself
+                                 trigger an auto-restart. Only agents with a
+                                 real, enforced write cadence (Quant Paper's
+                                 scan loop, Event Radar's ingest schedule) get
+                                 True: restarting can genuinely fix a broken
+                                 loop there. Usage-driven agents (Study
+                                 Platform) stay False -- staleness there just
+                                 means "nobody has used it", which a container
+                                 restart cannot fix, so it degrades the card
+                                 but never restarts on its own. Default False.
   container                   -- Docker container name to restart (auto_heal).
 
 Health semantics (details in noc.py): liveness is a plain reachability probe
@@ -45,6 +55,7 @@ SERVICES = [
         "restart": "auto_heal",
         "project_tag": "quant",
         "freshness_sec": 900,          # writes every ~1min during market hours
+        "restart_on_staleness": True,  # enforced scan loop -- a stalled loop is a real fault
         "container": "quant-dashboard-docker",
     },
     {
@@ -73,6 +84,7 @@ SERVICES = [
         "restart": "auto_heal",
         "project_tag": "events",
         "freshness_sec": 86400,        # ingest runs every 24h
+        "restart_on_staleness": True,  # enforced ingest schedule -- a missed run is a real fault
         "container": "event-radar",
     },
     {
@@ -84,6 +96,11 @@ SERVICES = [
         "restart": "auto_heal",
         "project_tag": "study",
         "freshness_sec": 43200,        # user-driven usage, ~daily
+        # Staleness here is "nobody studied recently", not a malfunction --
+        # restarting the container cannot produce usage. Degrade the card, but
+        # only a genuine liveness failure may restart this agent (FIXED 2026-08-15:
+        # was auto-restarting every ~6min while idle and lock/re-lock cycling).
+        "restart_on_staleness": False,
         "container": "study-app",
     },
     {

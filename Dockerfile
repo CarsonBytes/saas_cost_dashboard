@@ -31,7 +31,7 @@ COPY pyproject.toml uv.lock ./
 ENV UV_HTTP_TIMEOUT=120
 RUN uv sync --frozen --no-install-project
 
-COPY app.py ledger.py alerts.py services.py noc.py ./
+COPY app.py ledger.py alerts.py services.py noc.py restart_proxy.py ./
 
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8095

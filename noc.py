@@ -21,6 +21,14 @@ container, alert_only pushes a deduped Telegram alert, none does nothing); a
 from the UI; a general incident log; and a 7-day uptime percentage from the
 check history this loop already produces.
 
+Restart triggers (auto_heal only): a liveness failure always justifies a
+restart; a STALE readiness result only justifies one for agents with a real,
+enforced write cadence (services.py restart_on_staleness=True -- Quant
+Paper's scan loop, Event Radar's ingest schedule). Usage-driven agents like
+Study Platform degrade visibly on staleness but never restart from it --
+restarting a container cannot produce usage (FIXED 2026-08-15: Study was
+auto-restarting every ~6min while merely idle, locking and re-locking).
+
 Threading: everything here is blocking (HTTP probes, Supabase reads, Docker
 Engine API calls, file writes). Call refresh_health() via asyncio.to_thread
 from async code, never from a page-render path -- restarts fire only from the
@@ -78,6 +86,15 @@ _STATUS_CACHE: dict[str, dict] = {}
 
 _LLM_API_BASE_URL = os.environ.get(
     "LLM_API_BASE_URL", "https://api.chatanywhere.tech/v1"
+).rstrip("/")
+
+# The restart-proxy sidecar (same compose project) is the ONLY component that
+# holds the Docker socket; it validates the container name against an
+# allow-list. This dashboard no longer mounts the socket at all (FIXED
+# 2026-08-15: a public-facing dashboard holding raw Docker-socket access was
+# host-level root reachable from the open internet).
+_RESTART_PROXY_URL = os.environ.get(
+    "RESTART_PROXY_URL", "http://restart-proxy:8096"
 ).rstrip("/")
 
 
@@ -210,17 +227,27 @@ def _readiness(svc: dict, now: dt.datetime, last_restart: float | None,
 # ---- restart authority, cooldown, lock ------------------------------------
 
 def _restart_container(name: str) -> bool:
-    """Restart the agent's own Docker container via the Engine API over the
-    mounted /var/run/docker.sock (same WSL2 daemon all projects share) --
-    httpx's UDS transport avoids needing the docker CLI or the docker SDK."""
+    """Restart the agent's own container through the restart-proxy sidecar --
+    the only component that holds the Docker socket (it validates the name
+    against its allow-list before touching the Engine API). The dashboard
+    itself has no socket access, so a compromised dashboard can only trigger a
+    restart of an allow-listed container, nothing else."""
     try:
-        transport = httpx.HTTPTransport(uds="/var/run/docker.sock")
-        with httpx.Client(transport=transport, timeout=60) as client:
-            resp = client.post(f"http://localhost/containers/{name}/restart")
-        return resp.status_code < 300
+        resp = httpx.post(f"{_RESTART_PROXY_URL}/restart",
+                          json={"container": name}, timeout=60)
+        return resp.status_code < 300 and bool(resp.json().get("ok"))
     except Exception as e:                        # noqa: BLE001
-        log.warning("noc: docker restart of %s failed: %s", name, e)
+        log.warning("noc: restart of %s via proxy failed: %s", name, e)
         return False
+
+
+def _restart_warranted(svc: dict, up: bool, readiness: str) -> bool:
+    """Whether the agent's CURRENT check results justify attempting a restart.
+    A liveness failure always does; a staleness signal only does for agents
+    with an enforced write cadence (restart_on_staleness). Pure -- testable."""
+    if not up:
+        return True
+    return readiness == "stale" and bool(svc.get("restart_on_staleness"))
 
 
 def _restart_count(state: dict, name: str, now: dt.datetime) -> int:
@@ -376,7 +403,7 @@ def _refresh_health() -> None:
                               outcome=", ".join(blocked_by),
                               detail="restart suppressed while dependency is down")
 
-            if unhealthy and svc["restart"] == "auto_heal":
+            if _restart_warranted(svc, up, readiness) and svc["restart"] == "auto_heal":
                 if blocked_by:
                     pass  # circuit breaker: dependency down, restarting can't help
                 elif locked:
@@ -487,6 +514,21 @@ def _selftest() -> None:
             del state["locks"]["X"]
             state["restarts"]["X"] = []
             self.assertTrue(_restart_eligible(svc, now, state))
+
+        def test_staleness_restart_gating(self):
+            # enforced-cadence agent: stale readiness warrants a restart
+            enforced = {"restart_on_staleness": True}
+            # usage-driven agent (Study Platform): staleness never warrants one
+            usage = {"restart_on_staleness": False}
+            self.assertTrue(_restart_warranted(enforced, up=True, readiness="stale"))
+            self.assertFalse(_restart_warranted(usage, up=True, readiness="stale"))
+            # a liveness failure always warrants a restart, even for usage-driven
+            self.assertTrue(_restart_warranted(usage, up=False, readiness="stale"))
+            self.assertTrue(_restart_warranted(enforced, up=False, readiness="ok"))
+            # healthy/skipped results never warrant a restart
+            self.assertFalse(_restart_warranted(enforced, up=True, readiness="ok"))
+            self.assertFalse(_restart_warranted(enforced, up=True, readiness="skipped"))
+            self.assertFalse(_restart_warranted(enforced, up=True, readiness="n/a"))
 
         def test_uptime(self):
             state = {}

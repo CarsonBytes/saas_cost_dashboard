@@ -51,6 +51,20 @@ def _hkt_date_str(created_at: str) -> str:
         instant = instant.replace(tzinfo=dt.timezone.utc)
     return instant.astimezone(_HKT).strftime("%Y-%m-%d")
 
+
+def to_hkt(instant: str | dt.datetime) -> dt.datetime:
+    """Convert a UTC timestamp -- ISO-8601 string (as stored in the ledger /
+    alert/incident state files) or a naive-UTC datetime -- to HKT. Reused for
+    every user-facing timestamp display (FIXED 2026-08-15: the incident log,
+    alert history, and last-refreshed stamp had regressed to raw UTC)."""
+    if isinstance(instant, str):
+        instant = dt.datetime.fromisoformat(instant.replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=dt.timezone.utc)
+    elif instant.tzinfo is None:
+        instant = instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(_HKT)
+
 _UNTAGGED = "(untagged)"
 
 
@@ -76,26 +90,42 @@ def _fill_fallback(row: dict) -> dict:
 
 
 def fetch_rows(days: int) -> list[dict]:
-    """Raw rows for the trailing `days` days (HKT day boundary), most recent first."""
+    """Raw rows for the trailing `days` days (HKT day boundary), most recent first.
+
+    PAGINATES (FIXED 2026-08-15): PostgREST caps any single response at 1,000
+    rows regardless of the requested limit, so an unpaginated fetch silently
+    dropped everything older than the most recent ~1,000 rows -- a 90-day view
+    was really showing ~2 weeks. Now loops on an offset parameter, 1,000 rows
+    at a time, until a batch comes back shorter than the page size."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set -- see .env.example")
     since = _hkt_today_start_utc() - dt.timedelta(days=days - 1)
-    resp = httpx.get(
-        f"{SUPABASE_URL}/rest/v1/llm_calls",
-        params={
-            "select": _SELECT,
-            "created_at": f"gte.{since.isoformat()}",
-            "order": "created_at.desc",
-            "limit": "20000",
-        },
-        headers={
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return [_fill_fallback(r) for r in resp.json()]
+    page_size = 1000
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        resp = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/llm_calls",
+            params={
+                "select": _SELECT,
+                "created_at": f"gte.{since.isoformat()}",
+                "order": "created_at.desc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += len(batch)
+    return [_fill_fallback(r) for r in rows]
 
 
 def _bucket_key(row: dict, field: str) -> str:

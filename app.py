@@ -62,7 +62,7 @@ def fetch_stats(days: int) -> None:
         STATE["data"] = ledger.build_stats(rows, days)
         STATE["rows"] = rows
         STATE["error"] = None
-        STATE["last_fetch"] = dt.datetime.now()
+        STATE["last_fetch"] = dt.datetime.now(dt.timezone.utc)  # aware UTC; displayed in HKT
         STATE["alert"] = alerts.run_check(ledger.today_cost(rows))
     except Exception as e:                          # noqa: BLE001
         STATE["error"] = str(e)
@@ -189,13 +189,13 @@ def incident_log() -> None:
         return
     ui.label("Incident log").classes("text-sm font-bold mt-4")
     cols = [
-        {"name": "ts", "label": "Time (UTC)", "field": "ts", "sortable": True},
+        {"name": "ts", "label": "Time (HKT)", "field": "ts", "sortable": True},
         {"name": "agent", "label": "Agent", "field": "agent", "sortable": True},
         {"name": "event", "label": "Event", "field": "event", "sortable": True},
         {"name": "outcome", "label": "Outcome", "field": "outcome"},
         {"name": "detail", "label": "Detail", "field": "detail"},
     ]
-    rows = [{"ts": i["ts"][:19].replace("T", " "), "agent": i["agent"],
+    rows = [{"ts": ledger.to_hkt(i["ts"]).strftime("%Y-%m-%d %H:%M:%S"), "agent": i["agent"],
              "event": i["event"], "outcome": i.get("outcome", ""),
              "detail": i.get("detail", "")} for i in incidents]
     ui.table(columns=cols, rows=rows, row_key="ts").classes("w-full").props(
@@ -215,15 +215,23 @@ def dashboard_body() -> None:
         return
 
     with ui.row().classes("items-center gap-2"):
-        ui.label(f"Last refreshed: {STATE['last_fetch']:%H:%M:%S}" if STATE["last_fetch"] else "") \
-            .classes("text-xs text-grey-6")
+        ui.label(f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT)"
+                 if STATE["last_fetch"] else "").classes("text-xs text-grey-6")
 
-    insight = ledger.top_spender_insight(data)
-    if insight:
-        with ui.row().classes("w-full items-center gap-2 bg-blue-50 border border-blue-200 rounded p-2 mt-2"):
-            ui.icon("lightbulb", color="blue-600")
-            ui.label(insight).classes("text-sm text-blue-900")
+    with ui.tabs().classes("w-full") as tabs:
+        overview_tab = ui.tab("Overview")
+        cost_tab = ui.tab("Cost breakdown")
+        reliability_tab = ui.tab("Reliability")
+    with ui.tab_panels(tabs, value=overview_tab).classes("w-full"):
+        with ui.tab_panel(overview_tab):
+            _overview_tab(data)
+        with ui.tab_panel(cost_tab):
+            _cost_tab(data)
+        with ui.tab_panel(reliability_tab):
+            _reliability_tab(data)
 
+
+def _overview_tab(data: dict) -> None:
     avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
     monthly_budget = alerts.ALERT_DAILY_COST_USD * 30
     projected_monthly = avg_daily * 30
@@ -238,6 +246,12 @@ def dashboard_body() -> None:
              warn=projected_monthly > monthly_budget)
         _kpi("Cost attribution quality", f"{attribution['cost_tagged_pct']:.0f}% tagged by provider",
              warn=attribution["cost_tagged_pct"] < 50)
+
+    insight = ledger.top_spender_insight(data)
+    if insight:
+        with ui.row().classes("w-full items-center gap-2 bg-blue-50 border border-blue-200 rounded p-2 mt-2"):
+            ui.icon("lightbulb", color="blue-600")
+            ui.label(insight).classes("text-sm text-blue-900")
 
     dbp = data["daily_by_project"]
     if dbp["dates"]:
@@ -269,6 +283,8 @@ def dashboard_body() -> None:
             ui.label("By provider (chatanywhere vs deepseek fallback in action)").classes("text-sm font-bold")
             _bar_chart(data["by_provider"], "provider")
 
+
+def _cost_tab(data: dict) -> None:
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("By model").classes("text-sm font-bold")
@@ -276,14 +292,6 @@ def dashboard_body() -> None:
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("By environment (quant paper/live)").classes("text-sm font-bold")
             _bar_chart(data["by_environment"], "project", ["environment"])
-
-    legacy_usage = ledger.legacy_model_usage(data)
-    if legacy_usage:
-        with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-2 mt-4"):
-            ui.icon("update", color="amber-700")
-            pairs = ", ".join(f"{b['project']}:{b['call_type']}" for b in legacy_usage)
-            ui.label(f"Still calling {ledger.LEGACY_MODEL} instead of {ledger.CURRENT_MODEL}: {pairs}") \
-                .classes("text-sm text-amber-900")
 
     ui.label("Model usage by project & call type").classes("text-sm font-bold mt-4")
     model_cols = [
@@ -306,18 +314,13 @@ def dashboard_body() -> None:
             ui.label("Provider efficiency ($/1K tokens, cheapest first)").classes("text-sm font-bold")
             _efficiency_table(ledger.efficiency_ranking(data["by_provider"]), "provider")
 
-    ui.label("Slowest call types (avg latency)").classes("text-sm font-bold mt-4")
-    latency_ranked = ledger.latency_ranking(data["by_call_type"])
-    if latency_ranked:
-        lat_cols = [
-            {"name": "project", "label": "Project", "field": "project", "sortable": True},
-            {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
-            {"name": "avg_latency_ms", "label": "Avg latency (ms)", "field": "avg_latency_ms", "sortable": True},
-            {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
-        ]
-        ui.table(columns=lat_cols, rows=latency_ranked[:10], row_key="call_type").classes("w-full").props("dense")
-    else:
-        ui.label("(no latency data in this range)").classes("text-sm text-grey")
+    legacy_usage = ledger.legacy_model_usage(data)
+    if legacy_usage:
+        with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-2 mt-4"):
+            ui.icon("update", color="amber-700")
+            pairs = ", ".join(f"{b['project']}:{b['call_type']}" for b in legacy_usage)
+            ui.label(f"Still calling {ledger.LEGACY_MODEL} instead of {ledger.CURRENT_MODEL}: {pairs}") \
+                .classes("text-sm text-amber-900")
 
     with ui.row().classes("w-full items-center justify-between mt-4"):
         ui.label("Call types by project").classes("text-sm font-bold")
@@ -337,15 +340,32 @@ def dashboard_body() -> None:
             for r in call_types_with_avg]
     ui.table(columns=cols, rows=rows, row_key="call_type").classes("w-full").props("dense")
 
+
+def _reliability_tab(data: dict) -> None:
+    ui.label("Slowest call types (avg latency)").classes("text-sm font-bold")
+    latency_ranked = ledger.latency_ranking(data["by_call_type"])
+    if latency_ranked:
+        lat_cols = [
+            {"name": "project", "label": "Project", "field": "project", "sortable": True},
+            {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
+            {"name": "avg_latency_ms", "label": "Avg latency (ms)", "field": "avg_latency_ms", "sortable": True},
+            {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+        ]
+        ui.table(columns=lat_cols, rows=latency_ranked[:10], row_key="call_type").classes("w-full").props("dense")
+    else:
+        ui.label("(no latency data in this range)").classes("text-sm text-grey")
+
+    incident_log()
+
     history = alerts.get_history()
     if history:
         ui.label("Alert history").classes("text-sm font-bold mt-4")
         hist_cols = [
-            {"name": "fired_at", "label": "Fired at (UTC)", "field": "fired_at", "sortable": True},
+            {"name": "fired_at", "label": "Fired at (HKT)", "field": "fired_at", "sortable": True},
             {"name": "cost_today", "label": "Cost that day", "field": "cost_today", "sortable": True},
             {"name": "threshold", "label": "Threshold", "field": "threshold"},
         ]
-        hist_rows = [{"fired_at": h["fired_at"][:19].replace("T", " "),
+        hist_rows = [{"fired_at": ledger.to_hkt(h["fired_at"]).strftime("%Y-%m-%d %H:%M:%S"),
                       "cost_today": f"${h['cost_today']:.4f}", "threshold": f"${h['threshold']:.2f}"}
                      for h in history]
         ui.table(columns=hist_cols, rows=hist_rows, row_key="fired_at").classes("w-full").props("dense")
@@ -387,7 +407,7 @@ def main_page() -> None:
 
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4"):
         with ui.row().classes("items-center justify-between w-full flex-wrap gap-2"):
-            ui.label("Personal SaaS Cost Dashboard").classes("text-2xl font-bold")
+            ui.label("Command Deck").classes("text-2xl font-bold")
             with ui.row().classes("items-center gap-2"):
                 dark_toggle = ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round")
                 ui.button("Refresh", icon="refresh",
@@ -420,7 +440,6 @@ def main_page() -> None:
 
         alert_banner()
         services_row()
-        incident_log()
         ui.separator().classes("my-2")
         dashboard_body()
 
@@ -431,4 +450,4 @@ def main_page() -> None:
 app.on_startup(lambda: asyncio.create_task(_alert_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_services_check_loop()))
 
-ui.run(title="Personal SaaS Cost Dashboard", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)
+ui.run(title="Command Deck", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)

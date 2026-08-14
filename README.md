@@ -1,6 +1,6 @@
-# Personal SaaS Cost Dashboard
+# Command Deck
 
-A personal FinOps + ops hub for a small portfolio of live AI products (a trading system, an event-discovery app, an exam-prep RAG platform, and a RegTech compliance tracker) that share a single quota-limited LLM key, plus at-a-glance links to a handful of other shipped AI-engineering projects. Turns a Supabase table nobody was looking at into cost visibility, alerting, and a status page for the whole personal stack.
+A personal FinOps + ops hub for a small portfolio of live AI products (a trading system, an event-discovery app, an exam-prep RAG platform, and a RegTech compliance tracker) that share a single quota-limited LLM key, plus at-a-glance links to a handful of other shipped AI-engineering projects. Turns a Supabase table nobody was looking at into cost visibility, alerting, and a status page for the whole personal stack. Renamed from "Personal SaaS Cost Dashboard" (2026-08-15) once it started tracking uptime and restarting containers, not just totalling API bills.
 
 **Live:** [dashboard.carsonng.com](https://dashboard.carsonng.com)
 
@@ -82,6 +82,15 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-15 — Phase 1 fixes, three tabs, rename to "Command Deck"
+- **Study Platform stopped auto-restarting for having no recent users.** Its 12h staleness threshold fits a service with an enforced write cadence, not an on-demand app — the live incident log showed 7 restarts in ~30 minutes, two full lock→alert→unlock cycles, and re-locking on loop while the app was merely idle. Readiness-triggered restart is now scoped to agents with a real, enforced cadence (Quant Paper's scan loop, Event Radar's ingest schedule) via a per-agent `restart_on_staleness` flag; Study still shows "degraded" when stale, and a genuine liveness failure still restarts it.
+- **The Docker socket left the dashboard container.** Auto-heal restarts were raw socket access from a public-facing site — effectively root over every container on the host, reachable from the open internet. Replaced with a restart-only proxy sidecar (`restart_proxy.py`) that alone holds the socket and accepts exactly one action: `POST /restart` for a container on an explicit allow-list. A compromised dashboard can now only restart the three auto-heal agents, nothing else.
+- **`fetch_rows()` now paginates.** PostgREST caps any single response at 1,000 rows regardless of the requested limit, so ranges over ~1,000 calls were silently truncated — a 90-day view was really showing ~2 weeks. The fetch loops on an offset, 1,000 rows at a time, until a batch comes back short.
+- **All displayed timestamps are Hong Kong time.** The incident log, alert history, and last-refreshed stamp had regressed to raw UTC (the last one also depended on the container clock via a naive `now()`); all three now reuse the ledger's HKT conversion and are labelled as such.
+- **The page became three tabs** — Overview (KPIs, insight, cost-per-day, by-project/by-provider), Cost breakdown (by-model/by-environment, model-usage, efficiency, legacy-model banner, call-types + CSV), Reliability (latency, incident log, alert history). The agent-cards strip stays above the tabs.
+- **Renamed to "Command Deck"** in both the page heading and browser tab — the old name undersold an app that now tracks uptime and restarts containers, not just totals API bills.
+- **Phase 2 spec written** to `docs/PHASE2_SPEC.md`, updated with what Phase 1's live behavior showed (badge-first topology, a chaos button that needs a real monitored target, labelled estimates, and a new "restarting isn't healing" tripwire).
+
 ### 2026-08-04 — HKT day boundaries, model-usage migration tracking
 - **Every day-boundary calculation switched from UTC to HKT** — the "Today" range filter, the daily cost trend's per-day bucketing, and the alert's same-day dedup all used UTC midnight, the same bug already found and fixed twice elsewhere in this ecosystem (quant's and event-radar's shared-quota counters). A call made at 2am HKT was being attributed to the previous UTC calendar day everywhere. Fixed with the same fixed-UTC+8-offset helper convention already established in those other projects, ported rather than reinvented a third time.
 - **New model-usage breakdown, with a specific migration callout.** A `project × call_type × model` table answers "which model does each call site actually use," and a filtered view surfaces exactly which call types still call `gpt-4o-mini` instead of `gpt-5-mini` — verified live, found 4 real stragglers.
@@ -129,5 +138,6 @@ Newest first. Each entry is what shipped plus the reasoning behind it — not ju
 
 ## Roadmap
 
+- **Phase 2 (spec'd): see [`docs/PHASE2_SPEC.md`](docs/PHASE2_SPEC.md)** — dependency topology (badge-first), a "simulate crash" chaos button with a real monitored target, a labelled quota-wastage estimate, and a "restarting isn't healing" tripwire that would have caught the Study Platform thrash automatically.
 - Two of the projects writing to the shared ledger still don't populate the real `project`/`provider` columns (only the study platform does) — their spend shows as `(untagged)` in the by-provider breakdown and ranks worst on the efficiency leaderboard by construction. The fix belongs in their own write paths, not in this reader; flagged as a follow-up rather than worked around here.
 - Configurable monthly budget (today's projection derives an implied monthly budget from the daily alert threshold × 30, a reasonable proxy but not an independently-set figure).
