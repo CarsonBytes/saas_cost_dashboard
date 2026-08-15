@@ -11,6 +11,13 @@ point of the split.
 
 Per-entry fields:
   name / desc / icon / links  -- as rendered on the card.
+  business_impact            -- manually-assigned string, "high" | "medium" |
+                                 "low". Drives the Governance tab's
+                                 High-Impact Watchlist and the risk ledger's
+                                 scan scope: "low" agents are never scanned
+                                 (counted only), "medium"/"high" are. Not
+                                 editable from the UI -- keep it a registry
+                                 field (ADDED 2026-08-15).
   monitor                     -- False = pure link card (no status dot, never
                                  probed at all). True = monitored (noc.py).
   restart                     -- "auto_heal": noc.py restarts this agent's own
@@ -56,6 +63,7 @@ from __future__ import annotations
 SERVICES = [
     {
         "name": "Quant Trading (Paper)",
+        "business_impact": "high",   # trading system -- a fault is money
         "desc": "Weekly-TSMOM dashboard, paper trading",
         "icon": "show_chart",
         "links": [("Paper", "https://quant.carsonng.com"),
@@ -73,6 +81,7 @@ SERVICES = [
         # dashboard must not monitor, probe, or restart it -- that's deliberate
         # (see the round's scope notes), not an oversight.
         "name": "Quant Trading (Live)",
+        "business_impact": "high",   # live 17-ETF trading
         "desc": "Live 17-ETF trading, native deployment with own watchdog",
         "icon": "show_chart",
         # Access-gated like the other Private links, so the card labels it
@@ -86,6 +95,7 @@ SERVICES = [
     },
     {
         "name": "Event Radar",
+        "business_impact": "medium", # public-facing app
         "desc": "AI event-discovery portfolio app, real HK events",
         "icon": "event",
         "links": [("Demo", "https://events-demo.carsonng.com"),
@@ -100,6 +110,7 @@ SERVICES = [
     },
     {
         "name": "Study Platform",
+        "business_impact": "low",    # internal tool
         "desc": "Supabase + pgvector RAG exam-prep",
         "icon": "school",
         "links": [("Private", "https://study.carsonng.com")],
@@ -121,6 +132,7 @@ SERVICES = [
     },
     {
         "name": "Portfolio",
+        "business_impact": "medium", # public-facing site
         "desc": "carsonng.com -- AI governance leadership positioning",
         "icon": "badge",
         # No GitHub link -- repo is private (confirmed: unauthenticated request 404s),
@@ -134,6 +146,7 @@ SERVICES = [
     },
     {
         "name": "AI Regulation Radar",
+        "business_impact": "medium", # public-facing compliance tracker
         "desc": "RegTech compliance tracker -- EU AI Act / NIST / HK PCPD",
         "icon": "gavel",
         # No GitHub link -- this repo has no remote configured at all (local-only git),
@@ -147,6 +160,7 @@ SERVICES = [
     },
     {
         "name": "Change Impact Assessor",
+        "business_impact": "low",    # demo
         "desc": "Human-in-the-loop AI risk gate for code/infra changes",
         "icon": "fact_check",
         "links": [("Demo", "https://carsonng.short.gy/change-impact-assessor"),
@@ -162,6 +176,7 @@ SERVICES = [
     },
     {
         "name": "Sprint Analyzer",
+        "business_impact": "low",    # demo
         "desc": "AI sprint retrospective generator",
         "icon": "assessment",
         "links": [("Demo", "https://carsonng.short.gy/sprint-analyzer"),
@@ -174,6 +189,7 @@ SERVICES = [
     },
     {
         "name": "AWS AI Code Review",
+        "business_impact": "low",    # demo
         "desc": "Automated PR gate: Amazon Q + Inspector security scanning",
         "icon": "security",
         "links": [("Demo", "https://github.com/CarsonBytes/aws_code_review/pull/5"),

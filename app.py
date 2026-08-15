@@ -43,6 +43,7 @@ import os
 from nicegui import app, ui
 
 import alerts
+import governance  # compliance radar engine (governance/engine.py)
 import ledger  # both load .env themselves on import
 import noc
 import services
@@ -52,6 +53,8 @@ STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch
 
 _ALERT_CHECK_INTERVAL_SEC = int(os.environ.get("ALERT_CHECK_INTERVAL_SEC", "900"))
 _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC", "120"))
+_RISK_LEDGER_INTERVAL_SEC = int(os.environ.get("RISK_LEDGER_INTERVAL_SEC", "300"))
+_COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
 
 _PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "(untagged)": "#6b7280"}
 
@@ -154,6 +157,109 @@ def noc_banner() -> None:
             .props("dense flat color=red")
 
 
+def _impact_badge(impact: str | None) -> None:
+    """Small colored chip for an agent's manually-assigned business_impact
+    (services.py): red High / amber Med / green Low. No chip when unset."""
+    styles = {"high": ("bg-red-100 text-red-700", "High"),
+              "medium": ("bg-amber-100 text-amber-700", "Med"),
+              "low": ("bg-green-100 text-green-700", "Low")}
+    cls, text = styles.get(impact or "", (None, None))
+    if cls:
+        ui.label(text).classes(f"text-xs {cls} rounded px-1")
+
+
+@ui.refreshable
+def governance_view() -> None:
+    """Governance tab: Compliance Calendar, High-Impact Watchlist, Audit Trail.
+    Renders a clear 'run the SQL' banner until the two governance tables exist
+    (they cannot be created from this app -- PostgREST does no DDL)."""
+    if not governance.tables_ready():
+        with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-3"):
+            ui.icon("construction", color="amber-700")
+            ui.label(
+                "Governance tables not created yet. Run the Phase 0 SQL in the Supabase "
+                "SQL editor to enable this tab: CREATE TABLE governance_rules (...); "
+                "CREATE TABLE governance_audit_log (...)."
+            ).classes("text-sm text-amber-900")
+        return
+
+    # --- Section A: Compliance Calendar -------------------------------------
+    ui.label("Compliance calendar").classes("text-sm font-bold")
+    rules = governance.fetch_rules()
+    if not rules:
+        ui.label("(no pending or overdue rules)").classes("text-sm text-grey")
+    else:
+        now = dt.datetime.now(dt.timezone.utc)
+        cols = [
+            {"name": "rule", "label": "Rule", "field": "rule", "sortable": True},
+            {"name": "deadline", "label": "Deadline (HKT)", "field": "deadline", "sortable": True},
+            {"name": "status", "label": "Status", "field": "status", "sortable": True},
+        ]
+        rows = []
+        for r in rules:
+            deadline = governance._parse_ts(r.get("enforcement_deadline"))
+            if deadline:
+                days = (deadline - now).total_seconds() / 86400
+                deadline_txt = f"{ledger.to_hkt(deadline):%Y-%m-%d %H:%M} ({int(days)}d left)" \
+                    if days >= 0 else f"{ledger.to_hkt(deadline):%Y-%m-%d %H:%M} (overdue {int(-days)}d)"
+            else:
+                deadline_txt = "—"
+            rows.append({"rule": r["rule_name"], "deadline": deadline_txt,
+                         "status": r["status"], "_status": r["status"]})
+        table = ui.table(columns=cols, rows=rows, row_key="rule").classes("w-full").props("dense")
+        # Status rendered as a colored badge: OVERDUE red, PENDING amber.
+        table.add_slot("body-cell-status", """
+            <q-td :props="props">
+                <q-badge :color="props.row._status === 'OVERDUE' ? 'red' : 'amber'">{{ props.value }}</q-badge>
+            </q-td>
+        """)
+        # Mark-as-complied buttons live under the table (one per active rule)
+        # rather than inside table cells -- simpler and they refresh cleanly.
+        with ui.row().classes("gap-2 mt-1 flex-wrap"):
+            for r in rules:
+                ui.button(f"Mark '{r['rule_name']}' complied",
+                          on_click=lambda rid=r["id"]: (
+                              governance.mark_complied(rid),
+                              governance_view.refresh(),
+                              ui.notify("Rule marked complied + audited", type="positive")))\
+                    .props("dense flat color=positive")
+
+    # --- Section B: High-Impact Watchlist -----------------------------------
+    ui.label("High-impact watchlist").classes("text-sm font-bold mt-4")
+    high = [s for s in services.SERVICES if s.get("business_impact") == "high"]
+    anomalies = ledger.anomaly_counts()
+    wcols = [
+        {"name": "agent", "label": "Agent", "field": "agent", "sortable": True},
+        {"name": "impact", "label": "Impact", "field": "impact"},
+        {"name": "last_audit", "label": "Last audit check (HKT)", "field": "last_audit", "sortable": True},
+        {"name": "anomalies", "label": "Anomalies (24h)", "field": "anomalies", "sortable": True},
+    ]
+    last = ledger.last_scan_at
+    wrows = [{"agent": s["name"], "impact": s.get("business_impact", ""),
+              "last_audit": ledger.to_hkt(last).strftime("%Y-%m-%d %H:%M:%S") if last else "—",
+              "anomalies": anomalies.get(s["name"], 0)}
+             for s in high]
+    ui.table(columns=wcols, rows=wrows, row_key="agent").classes("w-full").props("dense")
+
+    # --- Section C: Audit Trail ----------------------------------------------
+    ui.label("Audit trail").classes("text-sm font-bold mt-4")
+    audit = governance.get_audit_log()
+    if not audit:
+        ui.label("(no audit entries yet)").classes("text-sm text-grey")
+    else:
+        acols = [
+            {"name": "ts", "label": "Time (HKT)", "field": "ts", "sortable": True},
+            {"name": "rule", "label": "Rule", "field": "rule", "sortable": True},
+            {"name": "action", "label": "Action", "field": "action", "sortable": True},
+            {"name": "actor", "label": "Actor", "field": "actor", "sortable": True},
+        ]
+        arows = [{"ts": ledger.to_hkt(a["created_at"]).strftime("%Y-%m-%d %H:%M:%S"),
+                  "rule": a.get("rule_name", "—"), "action": a["action_taken"],
+                  "actor": a.get("actor", "system")} for a in audit]
+        ui.table(columns=acols, rows=arows, row_key="ts").classes("w-full").props(
+            "dense max-height=240px")
+
+
 @ui.refreshable
 def services_row() -> None:
     # No "My Agents" heading: the cards render directly, nothing above them.
@@ -192,6 +298,7 @@ def services_row() -> None:
                         ui.element("div").classes(
                             f"w-2.5 h-2.5 rounded-full {dot_color} shrink-0")
                     ui.label(svc["name"]).classes("font-bold")
+                    _impact_badge(svc.get("business_impact"))
                     if status and status.get("locked"):
                         ui.label("Locked").classes(
                             "text-xs bg-red-100 text-red-700 rounded px-1")
@@ -276,6 +383,7 @@ def dashboard_body() -> None:
         overview_tab = ui.tab("Overview")
         cost_tab = ui.tab("Cost breakdown")
         reliability_tab = ui.tab("Reliability")
+        governance_tab = ui.tab("Governance")
     with ui.tab_panels(tabs, value=overview_tab).classes("w-full"):
         with ui.tab_panel(overview_tab):
             _overview_tab(data)
@@ -283,6 +391,8 @@ def dashboard_body() -> None:
             _cost_tab(data)
         with ui.tab_panel(reliability_tab):
             _reliability_tab(data)
+        with ui.tab_panel(governance_tab):
+            governance_view()
 
 
 def _overview_tab(data: dict) -> None:
@@ -453,6 +563,24 @@ async def _services_check_loop() -> None:
         await asyncio.sleep(_SERVICES_CHECK_INTERVAL_SEC)
 
 
+async def _risk_ledger_loop() -> None:
+    """Risk-ledger scan (Phase 3): runs off the event loop so a slow Supabase
+    call never blocks rendering; separate task so it can't stall the other
+    loops (same resilience pattern as the existing per-loop tasks)."""
+    while True:
+        await asyncio.sleep(_RISK_LEDGER_INTERVAL_SEC)
+        await asyncio.to_thread(ledger.scan_high_impact_calls)
+
+
+async def _compliance_loop() -> None:
+    """Compliance radar (Phase 2): deadline enforcement + rule matching.
+    Same isolation as _risk_ledger_loop -- each loop hangs independently at
+    worst, never together."""
+    while True:
+        await asyncio.sleep(_COMPLIANCE_INTERVAL_SEC)
+        await asyncio.to_thread(governance.check_pending_rules)
+
+
 @ui.page("/")
 def main_page() -> None:
     dark_mode = ui.dark_mode()
@@ -506,5 +634,7 @@ def main_page() -> None:
 
 app.on_startup(lambda: asyncio.create_task(_alert_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_services_check_loop()))
+app.on_startup(lambda: asyncio.create_task(_risk_ledger_loop()))
+app.on_startup(lambda: asyncio.create_task(_compliance_loop()))
 
 ui.run(title="Command Deck", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)

@@ -82,6 +82,14 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-16 — Governance: compliance radar + risk ledger (lean)
+- **New `governance/` module + a 4th "Governance" tab** (Compliance Calendar with deadline countdown + "Mark as complied", High-Impact Watchlist, read-only Audit Trail). The two tables (`governance_rules`, `governance_audit_log`) must be created via the Supabase SQL editor — until they exist the tab shows a "run the SQL" banner instead of crashing.
+- **Deterministic rule matching only**: LLM is never used to decide whether to alert. The compliance snapshot source is pluggable and currently returns `{}` (RegTech Radar exposes no parsed-JSON endpoint), so matching is dormant — the deadline/PENDING→OVERDUE path is fully live and audited.
+- **Risk-ledger scan is dormant by design**: `llm_calls` has no `input_text` column (agents never log prompts; schema changes out of scope), so the injection-pattern scanner feature-detects the column and is a unit-tested no-op until it exists. `business_impact` scoping (LOW agents never scanned) and the 24h anomaly counters for the watchlist are live.
+- **Two background loops** (300s risk ledger, 600s compliance), each its own `asyncio` task off the event loop — one hanging never blocks the others.
+- **`business_impact` badges** on the agent cards (red/amber/green chip), assigned manually in `services.py`.
+- Dockerfile now explicitly `COPY`s `governance/` (the earlier assumption that it copies the whole context was wrong — it copies specific files).
+
 ### 2026-08-15 (late 2) — link polish, "(Docker)" environment label, Quant Live marked Private
 - **Lock icons now live inside their link** — the icon sits glued to the label (and is clickable with it) instead of a detached, misaligned 12px icon, and links got proper breathing room (`gap-3`) between them.
 - **Quant Trading (Live)'s link is now labeled "Private"** — it's Access-gated like the other Private links, so it gets the lock icon automatically via the generic label rule.
