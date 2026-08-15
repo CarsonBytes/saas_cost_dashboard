@@ -363,7 +363,7 @@ def governance_view() -> None:
                 ("OVERDUE", "Overdue", "bg-red-100 text-red-700", active),
                 ("COMPLIED", "Complied", "bg-green-100 text-green-700", complied)):
             col_rules = [r for r in rules_list if r["status"] == status]
-            with ui.column().classes("grow bg-grey-100 rounded p-2 min-h-[80px]"):
+            with ui.column().classes("grow bg-grey-2 rounded p-2 min-h-[80px]"):
                 ui.label(f"{label} ({len(col_rules)})").classes(
                     f"text-xs font-bold {badge} rounded px-1")
                 if not col_rules:
@@ -446,7 +446,7 @@ def services_row() -> None:
                             # health: "operationally fine, compliance dead".
                             dot_color = "bg-red-500"
                         elif up is None:
-                            dot_color = "bg-grey-400"       # not checked yet
+                            dot_color = "bg-grey-5"        # not checked yet
                         elif not up:
                             dot_color = "bg-red-500"        # down
                         elif status and status["readiness"] == "stale":
@@ -455,7 +455,7 @@ def services_row() -> None:
                             # (amber); usage-driven (Study Platform) -> just
                             # idle, neutral tone, nothing wrong.
                             dot_color = "bg-amber-500" if svc.get("restart_on_staleness") \
-                                else "bg-grey-500"
+                                else "bg-grey-6"
                         else:
                             dot_color = "bg-green-500"      # healthy
                         ui.element("div").classes(
