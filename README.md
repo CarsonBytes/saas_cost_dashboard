@@ -82,6 +82,11 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-15 (late 2) — link polish, "(Docker)" environment label, Quant Live marked Private
+- **Lock icons now live inside their link** — the icon sits glued to the label (and is clickable with it) instead of a detached, misaligned 12px icon, and links got proper breathing room (`gap-3`) between them.
+- **Quant Trading (Live)'s link is now labeled "Private"** — it's Access-gated like the other Private links, so it gets the lock icon automatically via the generic label rule.
+- **Environment chart: missing-environment buckets now read "(Docker)"** instead of "(no environment)". Only quant carries a paper/live environment; every other service's environment is simply its Docker container, so "(no environment)" made a legitimate state look like missing data. (A strikethrough was the other option discussed; "(Docker)" states the truth instead of marking a real-traffic bar as ignorable.)
+
 ### 2026-08-15 (late) — status dots, wider cards, clearer environment chart
 - **Each monitored card now has a round status dot** next to the name (green/amber/red/grey) — the service icon stays neutral as identity, so health is read from a classic indicator at a glance instead of a colored icon. Unmonitored demo cards get no dot.
 - **Cards widened** (`minmax(250px,1fr)` grid tracks) so longer names like "Change Impact Assessor" fit on one line instead of wrapping.

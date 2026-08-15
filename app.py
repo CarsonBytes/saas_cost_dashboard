@@ -196,11 +196,18 @@ def services_row() -> None:
                         ui.label("Locked").classes(
                             "text-xs bg-red-100 text-red-700 rounded px-1")
                 ui.label(svc["desc"]).classes("text-xs text-grey-6")
-                with ui.row().classes("items-center gap-1 mt-1 flex-wrap"):
+                with ui.row().classes("items-center gap-3 mt-1 flex-wrap"):
                     for label, url in svc["links"]:
-                        if label == "Private":               # generic, off the label
-                            ui.icon("lock", size="12px").classes("text-grey-6")
-                        ui.link(label, url, new_tab=True).classes("text-sm")
+                        # Each link is one unit: the lock icon lives INSIDE the
+                        # link element so it stays glued to its label (and is
+                        # clickable with it) -- previously a separate 12px icon
+                        # sat misaligned next to the text. gap-3 gives proper
+                        # breathing room between links.
+                        with ui.link(target=url, new_tab=True).classes(
+                                "inline-flex items-center gap-0.5"):
+                            if label == "Private":           # generic, off the label
+                                ui.icon("lock", size="14px").classes("text-grey-6")
+                            ui.label(label).classes("text-sm")
                 # Reserved status slot: ALWAYS present, on every card, rendered
                 # empty when there's nothing to say -- a busy card (down,
                 # blocked by, uptime, clear-lock button) and a quiet one (or a

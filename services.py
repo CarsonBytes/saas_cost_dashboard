@@ -75,7 +75,9 @@ SERVICES = [
         "name": "Quant Trading (Live)",
         "desc": "Live 17-ETF trading, native deployment with own watchdog",
         "icon": "show_chart",
-        "links": [("Live", "https://quant-live.carsonng.com")],
+        # Access-gated like the other Private links, so the card labels it
+        # Private (the generic renderer adds the lock icon off the label).
+        "links": [("Private", "https://quant-live.carsonng.com")],
         "monitor": False,
         "restart": "none",
         "project_tag": None,

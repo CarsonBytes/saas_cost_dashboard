@@ -129,10 +129,12 @@ def fetch_rows(days: int) -> list[dict]:
 
 
 # Missing-value label per field: most fields fall back to the generic
-# "(untagged)", but an unset `environment` (study/events/regtech never set it,
-# and older quant rows predate it) reads more honestly as "(no environment)"
-# -- "(untagged)" made users wonder what was meant (FIXED 2026-08-15).
-_FIELD_FALLBACKS = {"environment": "(no environment)"}
+# "(untagged)", but an unset `environment` is not a data gap -- only quant
+# carries a paper/live environment; every other service's environment is
+# simply its Docker container, so those rows read "(Docker)" (FIXED
+# 2026-08-15: "(no environment)" made a legitimate state look like missing
+# data).
+_FIELD_FALLBACKS = {"environment": "(Docker)"}
 
 
 def _bucket_key(row: dict, field: str) -> str:
