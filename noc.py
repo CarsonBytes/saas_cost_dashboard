@@ -203,15 +203,25 @@ def _dep_confirmed_healthy(streak: int) -> bool:
     return streak >= 2
 
 
-def _latest_write(tag: str) -> str | None:
-    """Most recent created_at (ISO 8601, UTC) for a project tag in the shared
-    llm_calls ledger, or None if the tag has no rows. Raises on Supabase
-    failure -- callers treat that as stale + let the dependency probe decide
-    whether it's a blocked-by situation."""
+def _latest_write(svc: dict) -> str | None:
+    """Most recent created_at (ISO 8601, UTC) for an agent's freshness signal,
+    or None if the source has no rows. Default: the newest llm_calls row for
+    the agent's project tag (LLM activity -- right for enforced-cadence agents
+    like Quant Paper's scans and Event Radar's ingest). An agent with a
+    `freshness_table` override reads that table instead -- Study Platform
+    watches `answer_log`, because practice-mode correct answers never touch
+    the LLM ledger (FIXED 2026-08-15: the card read "idle" right after the
+    user answered several questions). Raises on Supabase failure -- callers
+    treat that as stale + let the dependency probe decide whether it's a
+    blocked-by situation."""
+    table = svc.get("freshness_table", "llm_calls")
+    params = {"select": "created_at", "order": "created_at.desc", "limit": "1"}
+    tag = svc.get("project_tag")
+    if table == "llm_calls" and tag:
+        params["project"] = f"eq.{tag}"
     resp = httpx.get(
-        f"{ledger.SUPABASE_URL}/rest/v1/llm_calls",
-        params={"select": "created_at", "project": f"eq.{tag}",
-                "order": "created_at.desc", "limit": "1"},
+        f"{ledger.SUPABASE_URL}/rest/v1/{table}",
+        params=params,
         headers={"apikey": ledger.SUPABASE_SERVICE_ROLE_KEY,
                  "Authorization": f"Bearer {ledger.SUPABASE_SERVICE_ROLE_KEY}"},
         timeout=10,
@@ -221,9 +231,9 @@ def _latest_write(tag: str) -> str | None:
     return rows[0]["created_at"] if rows else None
 
 
-def _latest_write_safe(tag: str) -> str | None:
+def _latest_write_safe(svc: dict) -> str | None:
     try:
-        return _latest_write(tag)
+        return _latest_write(svc)
     except Exception:                             # noqa: BLE001
         return None
 
@@ -235,7 +245,7 @@ def _readiness(svc: dict, now: dt.datetime, last_restart: float | None,
     """Readiness state for a monitored agent. Returns (state, detail) where
     state is "ok" | "stale" | "skipped" | "n/a". Pure -- testable without
     network; refresh_health() fetches last_write_ts first."""
-    if not svc.get("project_tag"):
+    if not (svc.get("project_tag") or svc.get("freshness_table")):
         return "n/a", ""
     if last_restart and (now - dt.datetime.fromtimestamp(last_restart, tz=dt.timezone.utc)
                          ).total_seconds() < _RESTART_GRACE_SEC:
@@ -484,11 +494,12 @@ def _refresh_health() -> None:
         confirmed_down = [dep for dep, s in dep_streaks.items() if _dep_confirmed_down(s)]
         deps_stable = all(_dep_confirmed_healthy(s) for s in dep_streaks.values())
 
-        writers = [s for s in monitored if s.get("project_tag")]
-        with ThreadPoolExecutor(max_workers=max(len(writers), 1)) as pool:
+        freshness_agents = [s for s in monitored
+                            if s.get("project_tag") or s.get("freshness_table")]
+        with ThreadPoolExecutor(max_workers=max(len(freshness_agents), 1)) as pool:
             last_write_map = dict(zip(
-                [s["name"] for s in writers],
-                pool.map(lambda s: _latest_write_safe(s["project_tag"]), writers)))
+                [s["name"] for s in freshness_agents],
+                pool.map(_latest_write_safe, freshness_agents)))
 
         prev = {name: dict(_STATUS_CACHE.get(name, {})) for name in up_map}
 
@@ -500,7 +511,7 @@ def _refresh_health() -> None:
             last_restart = restarts[-1] if restarts else None
 
             readiness, detail = "n/a", ""
-            if svc.get("project_tag"):
+            if svc.get("project_tag") or svc.get("freshness_table"):
                 readiness, detail = _readiness(svc, now, last_restart,
                                                last_write_map.get(name))
 
@@ -612,6 +623,12 @@ def _selftest() -> None:
             qp = {**svc, "name": QUANT_PAPER}
             sat = dt.datetime(2026, 8, 15, 12, 0, tzinfo=dt.timezone.utc)
             self.assertEqual(_readiness(qp, sat, None, stale)[0], "skipped")
+            # freshness_table-only agent (Study Platform): readiness is still
+            # evaluated -- the source override is what changed, not the gate
+            st = {"name": "S", "freshness_table": "answer_log", "freshness_sec": 43200}
+            stale12 = (now - dt.timedelta(hours=13)).isoformat()
+            self.assertEqual(_readiness(st, now, None, fresh)[0], "ok")
+            self.assertEqual(_readiness(st, now, None, stale12)[0], "stale")
 
         def test_lock_after_three_restarts(self):
             state = {"restarts": {"X": []}}

@@ -82,6 +82,9 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-15 (night) — Study Platform freshness reads `answer_log`, not the LLM ledger
+- **Study's "idle" was a false reading of a real signal.** The readiness check watched the shared `llm_calls` ledger, but practice-mode correct answers never call the LLM (an explanation is generated only for wrong answers), so the card read "idle -- last write 55h ago" right after the user answered several questions. Freshness is now a per-agent source override (`freshness_table`): Study reads its own `answer_log` usage table — every answered question writes a row — so the status flips to healthy within one health cycle of actual use. Quant Paper and Event Radar keep the LLM-ledger signal, which is right for their enforced write cadences.
+
 ### 2026-08-15 (evening) — equal-width / equal-height agent cards
 - **The agent-cards strip moved from a flex row to a CSS grid.** The old `min-w-[200px] grow` row let content-driven sizing compound with `grow`, so cards with more links or more status lines rendered visibly wider and taller than their siblings. The grid uses auto-fill equal-width tracks, and grid items stretch to the row height, so every card in a row matches its siblings regardless of content. A reserved status slot — always present, rendered empty when there's nothing to say — keeps the three no-monitor demo cards the same size as fully-loaded monitored cards instead of shrinking them. Purely layout: no card loses or truncates any information.
 

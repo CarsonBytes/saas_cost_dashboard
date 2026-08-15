@@ -24,6 +24,15 @@ Per-entry fields:
                                  watch, and how old that tag's latest write may
                                  be before the agent reads as "degraded"
                                  (reachable but stale). None = liveness only.
+  freshness_table             -- optional per-agent override of the freshness
+                                 data source. Default (absent) is the shared
+                                 `llm_calls` ledger filtered by project_tag --
+                                 right for enforced-cadence agents. Study
+                                 Platform overrides with "answer_log" (its own
+                                 usage table), because practice-mode correct
+                                 answers never write to the LLM ledger, so the
+                                 LLM-ledger signal read "idle" right after the
+                                 app was used (FIXED 2026-08-15).
   restart_on_staleness        -- whether a STALE readiness result may itself
                                  trigger an auto-restart. Only agents with a
                                  real, enforced write cadence (Quant Paper's
@@ -94,7 +103,12 @@ SERVICES = [
         "links": [("Private", "https://study.carsonng.com")],
         "monitor": True,
         "restart": "auto_heal",
-        "project_tag": "study",
+        # Freshness reads Study's own `answer_log` usage table, NOT the shared
+        # LLM ledger: practice-mode correct answers never call the LLM, so an
+        # LLM-ledger signal read "idle" right after the user answered questions
+        # (FIXED 2026-08-15). Every answered question writes an answer_log row.
+        "project_tag": None,
+        "freshness_table": "answer_log",
         "freshness_sec": 43200,        # user-driven usage, ~daily
         # Staleness here is "nobody studied recently", not a malfunction --
         # restarting the container cannot produce usage. Degrade the card, but
