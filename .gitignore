@@ -6,3 +6,8 @@ venv/
 .nicegui/
 alert_state.json
 alert_settings.json
+
+# runtime state files (never commit)
+noc_state.json
+alert_state.json
+alert_settings.json
