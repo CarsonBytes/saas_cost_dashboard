@@ -177,9 +177,9 @@ def governance_view() -> None:
         with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-3"):
             ui.icon("construction", color="amber-700")
             ui.label(
-                "Governance tables not created yet. Run the Phase 0 SQL in the Supabase "
-                "SQL editor to enable this tab: CREATE TABLE governance_rules (...); "
-                "CREATE TABLE governance_audit_log (...)."
+                "Governance tables not created yet. Run the SQL in "
+                "governance/migrations/001_governance_tables.sql in the Supabase SQL "
+                "editor to enable this tab."
             ).classes("text-sm text-amber-900")
         return
 
