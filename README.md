@@ -82,6 +82,14 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-16 (Phase 3) — governance narrative engine + hourly Today + tab renames + auto_action
+- **Task 1**: the Today (1-day) range chart now buckets by **hour** (`hourly_by_project`) instead of collapsing into one calendar-day bar — the intraday cost shape is visible again.
+- **Task 2**: tabs renamed **Overview / Cost & Usage / Reliability & Incidents / Governance**.
+- **Task 3**: `REGULATORY_SOURCE` env var now wires the compliance snapshot source — when set, the engine fetches that JSON each cycle and matches rules deterministically (RegTech Radar regression readiness). Unset = dormant.
+- **Task 4**: per-rule **`auto_action`** (migration `003_auto_action.sql`) — a rule with `auto_action='quarantine'` auto-pauses its agent's container when it flips OVERDUE (once; only quarantinable agents; never Quant Paper during market hours), and auto-resumes when marked COMPLIED and no other auto-quarantine rule targets the agent. This is the policy-driven isolation — explicit per-rule opt-in, never a blanket "overdue = pause everything".
+- **Task 5**: **Governance Mechanism Summary** (static narrative) at the top of the Governance tab — a plain-language explanation of the methodology (impact grading, deterministic matching, automated tasks, policy isolation, immutable audit trail, human-in-the-loop) so a non-technical stakeholder gets the story in five minutes.
+- **Task 6**: **Generate compliance report** button — aggregates rules, recent regulatory updates and the audit trail into a downloadable Markdown report ending with the human-in-the-loop disclaimer. The evidence generator: one click, not three days.
+
 ### 2026-08-16 (Phase 2.1) — Task A: RegTech Radar emits `regulatory_updates` + UI polish
 - **RegTech Radar now feeds the compliance engine.** Its pipeline (`core/pipeline.py`, change-detection hook) writes one `regulatory_updates` row per detected change via the new `core/regulatory_updates.py`: title `<source>: <article> changed`, `affected_articles`, `impact_hint` derived from the assessment severities (`action_needed`/`high_risk` → high), and `deadline` deliberately NULL until calibrated (a fabricated compliance deadline is worse than none — the dashboard treats NULL as "no deadline" and the rule stays PENDING). The write is idempotent (skips existing unconsumed rows). This is live via the Windows Scheduled Task on its next run — the regtech repo is local-only, no deploy needed.
 - **Verified end-to-end**: emit → row → dashboard ingest → PENDING rule + audit + Telegram (test rows cleaned up afterwards).

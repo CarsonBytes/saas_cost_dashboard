@@ -1,0 +1,12 @@
+-- Phase 3.2 (Task 4): per-rule opt-in for automated compliance isolation.
+-- Run in the Supabase SQL editor AFTER 001 and 002. Idempotent.
+--
+-- Values:
+--   NULL (default)      -- no automatic action; OVERDUE just flags + alerts.
+--   'quarantine'        -- when this rule flips OVERDUE, the agent named by
+--                          agent_slug gets its container PAUSED automatically
+--                          (guarded: only quarantinable agents, never Quant
+--                          Paper during market hours; auto-resumed when the
+--                          rule is marked COMPLIED and no other auto-
+--                          quarantine rule targets the agent).
+ALTER TABLE governance_rules ADD COLUMN IF NOT EXISTS auto_action TEXT;

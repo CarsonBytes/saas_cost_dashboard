@@ -281,6 +281,17 @@ def _restart_container(name: str) -> bool:
         return False
 
 
+def _proxy_action(action: str, name: str) -> bool:
+    """Generic restart-proxy call (restart/pause/unpause). Same allow-list."""
+    try:
+        resp = httpx.post(f"{_RESTART_PROXY_URL}/{action}",
+                          json={"container": name}, timeout=60)
+        return resp.status_code < 300 and bool(resp.json().get("ok"))
+    except Exception as e:                        # noqa: BLE001
+        log.warning("noc: proxy %s of %s failed: %s", action, name, e)
+        return False
+
+
 def _restart_warranted(svc: dict, up: bool, readiness: str,
                        deps_stable: bool = True) -> bool:
     """Whether the agent's CURRENT check results justify attempting a restart.
@@ -559,6 +570,7 @@ def _refresh_health() -> None:
 
         prev = {name: dict(_STATUS_CACHE.get(name, {})) for name in up_map}
         compliance = governance.compliance_health()  # agent -> OVERDUE rule names
+        auto_targets = governance.auto_quarantine_targets()  # agent -> {rule, rule_id}
 
         for svc in monitored:
             name = svc["name"]
@@ -581,7 +593,31 @@ def _refresh_health() -> None:
                               outcome=", ".join(blocked_by),
                               detail="restart suppressed while dependency is down")
             was_quarantined = prev.get(name, {}).get("quarantined")
-            if quarantine and not was_quarantined:
+
+            # Task 4 (Phase 3.2): policy-driven automated isolation -- per-rule
+            # opt-in via governance_rules.auto_action='quarantine'. An OVERDUE
+            # rule targeting this agent pauses its container ONCE (through the
+            # proxy) unless already quarantined. Guards: only quarantinable
+            # agents with a container; never Quant Paper during market hours
+            # (a pause mid-session is the operator's call, not a rule's).
+            auto_target = auto_targets.get(name)
+            if (not quarantine and auto_target
+                    and svc.get("quarantinable") and svc.get("container")):
+                if name == QUANT_PAPER and nyse_session_open(now):
+                    _add_incident(state, name, "auto-quarantine skipped",
+                                  outcome="market hours", detail=auto_target["rule"])
+                elif _proxy_action("pause", svc["container"]):
+                    quarantine_agent(name, reason="compliance-auto")
+                    alerts.send_telegram(
+                        f"\U0001f6d1 {name} auto-quarantined: '{auto_target['rule']}' "
+                        f"is OVERDUE -- container paused by policy",
+                        tag="NOC", emoji="\U0001f6d1")
+                    quarantine = "compliance-auto"
+                else:
+                    _add_incident(state, name, "auto-quarantine failed",
+                                  outcome="pause error", detail=auto_target["rule"])
+
+            if quarantine and not was_quarantined and quarantine != "compliance-auto":
                 _add_incident(state, name, "quarantine", outcome=quarantine,
                               detail="restart suppressed (compliance or manual)")
 

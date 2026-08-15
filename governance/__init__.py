@@ -9,6 +9,8 @@ The package re-exports engine's public functions so callers can use
 `governance.check_pending_rules()` etc. directly.
 """
 from governance.engine import (  # noqa: F401
+    auto_quarantine_targets,
+    build_report,
     cached_audit,
     cached_complied,
     cached_rules,

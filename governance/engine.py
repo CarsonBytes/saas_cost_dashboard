@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import threading
 import time
 
@@ -36,6 +37,7 @@ import httpx
 
 import alerts
 import ledger  # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / to_hkt
+import services  # business_impact for the report's risk overview
 
 log = logging.getLogger(__name__)
 
@@ -218,11 +220,40 @@ def fetch_compliance_snapshot() -> dict:
     """Pluggable source for the current compliance state, e.g.
     {"impact_level": "high", "affected_domains": ["HR"]}.
 
-    Returns {} today: no real source is wired yet (RegTech Radar serves a UI
-    and raw regulatory documents, not a parsed-JSON endpoint), so matching is
-    dormant. The deadline/OVERDUE path does not depend on this.
-    """
-    return {}
+    The source is configured via the REGULATORY_SOURCE env var (Task 3,
+    Phase 3.1): when set, the engine fetches a JSON document from that URL
+    each cycle and matches rules against it. Unset -> {} (matching dormant).
+    RegTech Radar will expose this endpoint when it regresses to a host the
+    dashboard can reach; today nothing sets it, so this is the abstraction
+    layer only. Never raises -- a broken source reads as "no snapshot"."""
+    source = os.environ.get("REGULATORY_SOURCE", "").strip()
+    if not source:
+        return {}
+    try:
+        resp = httpx.get(source, timeout=15, follow_redirects=True)
+        if resp.status_code >= 300:
+            return {}
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:                                    # noqa: BLE001
+        log.exception("governance: compliance snapshot fetch failed")
+        return {}
+
+
+def auto_quarantine_targets() -> dict[str, dict]:
+    """Agent slug -> {"rule": name, "rule_id": id} for every OVERDUE rule with
+    auto_action='quarantine' and an agent_slug. Read from the cache (render-
+    and NOC-safe). Task 4, Phase 3.2: policy-driven automated isolation --
+    per-rule opt-in only, never a blanket "overdue = pause everything"."""
+    with _CACHE_LOCK:
+        rules = _CACHE["rules"]
+    targets: dict[str, dict] = {}
+    for rule in rules:
+        slug = rule.get("agent_slug")
+        if (rule.get("status") == "OVERDUE"
+                and rule.get("auto_action") == "quarantine" and slug):
+            targets[slug] = {"rule": rule["rule_name"], "rule_id": rule["id"]}
+    return targets
 
 
 def _matches(rule: dict, snapshot: dict) -> bool:
@@ -363,6 +394,89 @@ def mark_complied(rule_id: str, actor: str = "dashboard") -> bool:
         _audit(rule_id, "MANUAL_OVERRIDE", actor, {"to": "COMPLIED"})
     refresh_cache()  # so the tab reflects the change on its next render
     return ok
+
+
+# ---- Task 6: dynamic narrative -- one-click compliance report ---------------
+
+def build_report() -> str:
+    """Aggregate governance_rules + regulatory_updates + audit log into a
+    Markdown compliance summary report (the "evidence generator"). Call off
+    the event loop (network). Best-effort: any table that's missing just
+    contributes nothing. Ends with the human-in-the-loop disclaimer -- this
+    report is evidence to support review, never a substitute for it."""
+    lines = [
+        "# Command Deck -- Compliance Summary Report",
+        f"_Generated {ledger.to_hkt(dt.datetime.now(dt.timezone.utc)).strftime('%Y-%m-%d %H:%M:%S')} HKT "
+        f"by the Governance Narrative Engine_",
+        "",
+        "## 1. Current risk overview",
+    ]
+    try:
+        active = fetch_rules()
+        all_rules = _get("governance_rules", {"select": "*"}) or []
+        pending = sum(1 for r in all_rules if r.get("status") == "PENDING")
+        overdue = sum(1 for r in all_rules if r.get("status") == "OVERDUE")
+        complied = sum(1 for r in all_rules if r.get("status") == "COMPLIED")
+        high_impact = [s["name"] for s in services.SERVICES
+                       if s.get("business_impact") == "high"]
+        lines += [
+            f"- Active rules (pending + overdue): **{len(active)}** "
+            f"(pending {pending}, overdue {overdue}, complied {complied})",
+            f"- High-impact agents: **{len(high_impact)}** ({', '.join(high_impact) or 'none'})",
+            f"- Agents with overdue rules: **{len(compliance_health())}**",
+        ]
+    except Exception:                                    # noqa: BLE001
+        log.exception("governance: report risk overview failed")
+
+    lines += ["", "## 2. Compliance board"]
+    try:
+        for r in fetch_rules():
+            slug = r.get("agent_slug") or "(global)"
+            lines.append(f"- **{r['rule_name']}** [{r['status']}] -- agent: {slug}")
+    except Exception:                                    # noqa: BLE001
+        log.exception("governance: report board failed")
+
+    lines += ["", "## 3. Recent regulatory updates (30 days)"]
+    try:
+        updates = _get("regulatory_updates",
+                       {"select": "*", "created_at": f"gte.{(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()}",
+                        "order": "created_at.desc", "limit": "50"}) or []
+        if updates:
+            for u in updates:
+                consumed = "consumed" if u.get("consumed") else "not yet consumed"
+                lines.append(f"- {ledger.to_hkt(u['created_at']).strftime('%Y-%m-%d')} -- "
+                             f"**{u['title']}** ({consumed})")
+        else:
+            lines.append("- (no regulatory updates in the last 30 days)")
+    except Exception:                                    # noqa: BLE001
+        log.exception("governance: report updates failed")
+
+    lines += ["", "## 4. Audit trail (30 days)"]
+    try:
+        audit = _get("governance_audit_log",
+                     {"select": "*", "created_at": f"gte.{(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()}",
+                      "order": "created_at.desc", "limit": "100"}) or []
+        if audit:
+            names = {r["id"]: r["rule_name"] for r in (_get("governance_rules", {"select": "id,rule_name"}) or [])}
+            for a in audit:
+                lines.append(f"- {ledger.to_hkt(a['created_at']).strftime('%Y-%m-%d %H:%M:%S')} -- "
+                             f"**{names.get(a.get('rule_id'), a.get('rule_id') or '(system)')}** | "
+                             f"{a['action_taken']} | actor: {a.get('actor', 'system')}")
+        else:
+            lines.append("- (no audit entries in the last 30 days)")
+    except Exception:                                    # noqa: BLE001
+        log.exception("governance: report audit failed")
+
+    lines += [
+        "",
+        "---",
+        "",
+        "> **Disclaimer**: This report is automatically generated by the Command Deck "
+        "Governance Narrative Engine and is provided as evidence to support review. "
+        "It does not constitute a compliance attestation. Every status shown here must "
+        "be human-verified before it is relied upon (human-in-the-loop principle).",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 # ---- selftest (stdlib only) -------------------------------------------------

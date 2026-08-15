@@ -172,11 +172,33 @@ def _impact_badge(impact: str | None) -> None:
 
 async def _mark_complied(rid: str) -> None:
     """Governance 'Mark as complied' action: DB work off the event loop, then
-    re-render the tab from the refreshed snapshot cache."""
+    re-render the tab from the refreshed snapshot cache. If the rule was
+    auto-quarantining its agent (auto_action='quarantine') and no OTHER
+    auto-quarantine target remains for that agent, resume the container --
+    remediation ends the isolation (Task 4, Phase 3.2)."""
+    rule = next((r for r in governance.cached_rules() if r["id"] == rid), None)
     ok = await run.io_bound(governance.mark_complied, rid)
+    if ok and rule and rule.get("auto_action") == "quarantine" and rule.get("agent_slug"):
+        agent = rule["agent_slug"]
+        if agent not in governance.auto_quarantine_targets():
+            svc = next((s for s in services.SERVICES if s["name"] == agent), None)
+            if svc and svc.get("container") and await _proxy_action("unpause", svc["container"]):
+                noc.unquarantine_agent(agent)
+                ui.notify(f"{agent} resumed -- no overdue auto-quarantine rule left",
+                          type="positive")
     governance_view.refresh()
     ui.notify("Rule marked complied + audited" if ok
               else "Mark-as-complied failed", type="positive" if ok else "negative")
+
+
+async def _generate_report() -> None:
+    """Task 6 (Phase 3.3): one-click compliance report -- aggregate rules,
+    regulatory updates and the audit trail off the event loop, then download
+    the Markdown. The evidence generator: 30 seconds, not three days."""
+    ui.notify("Generating compliance report…", type="info")
+    md = await run.io_bound(governance.build_report)
+    fname = f"compliance-report-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')}.md"
+    ui.download(md.encode(), filename=fname)
 
 
 _RESTART_PROXY_URL = os.environ.get("RESTART_PROXY_URL", "http://restart-proxy:8096")
@@ -250,7 +272,43 @@ def governance_view() -> None:
             ).classes("text-sm text-amber-900")
         return
 
-    # --- Section 0: Compliance Health ring -----------------------------------
+    # --- Section 0a: Governance Mechanism Summary (Task 5, Phase 3.3) -------
+    # Static narrative: plain-language explanation of how this system earns
+    # trust -- for board members, auditors and new engineers alike. Written to
+    # be read without any code knowledge.
+    with ui.card().classes("w-full bg-blue-50 border border-blue-200"):
+        with ui.column().classes("w-full gap-1 p-3"):
+            ui.label("📖 Governance mechanism summary").classes("text-sm font-bold text-blue-900")
+            ui.markdown(
+                "This dashboard runs a **risk-led, policy-driven governance loop** over every "
+                "automated agent (trading, event discovery, study tools):\n\n"
+                "- **Impact-based risk grading** -- every agent carries a business-impact level "
+                "(high / medium / low). High-impact agents are watched more closely; low-impact "
+                "ones are counted but never over-scanned.\n"
+                "- **Deterministic rule matching** -- regulatory updates are matched against "
+                "explicit rules by code, not by a model's judgment. An LLM may help *read* a "
+                "regulation; only code decides whether it *triggers* an action. No alert ever "
+                "fires because a language model 'thought it looked relevant'.\n"
+                "- **Automated task generation** -- when a regulation changes (e.g. the EU AI "
+                "Act), a compliance task appears on the board automatically, with a deadline "
+                "countdown. Nothing waits for someone to read an email.\n"
+                "- **Policy-driven isolation** -- rules may opt in to auto-quarantine: an "
+                "overdue obligation pauses the affected agent's container (with market-hours "
+                "and operator controls), so a non-compliant system cannot silently keep running.\n"
+                "- **Immutable audit trail** -- every status change, alert and override is "
+                "recorded with a timestamp and actor. 'Show me the evidence' is one click away, "
+                "not a memory.\n\n"
+                "**The human-in-the-loop principle**: automation flags, isolates and documents; "
+                "a human decides, remediates and signs off. This dashboard is the evidence "
+                "layer, not the decision layer."
+            ).classes("text-sm text-blue-900")
+            with ui.row().classes("items-center gap-2 mt-1"):
+                ui.button("Generate compliance report", icon="description",
+                          on_click=_generate_report).props("dense color=primary")
+                ui.label("Aggregates rules, regulatory updates and the audit trail into a "
+                         "downloadable Markdown report.").classes("text-xs text-grey-6")
+
+    # --- Section 0b: Compliance Health ring ----------------------------------
     compliance = governance.compliance_health()
     monitored = [s for s in services.SERVICES if s.get("monitor")]
     critical_n = sum(1 for s in monitored if compliance.get(s["name"]))
@@ -488,8 +546,8 @@ def dashboard_body() -> None:
 
     with ui.tabs().classes("w-full") as tabs:
         overview_tab = ui.tab("Overview")
-        cost_tab = ui.tab("Cost breakdown")
-        reliability_tab = ui.tab("Reliability")
+        cost_tab = ui.tab("Cost & Usage")
+        reliability_tab = ui.tab("Reliability & Incidents")
         governance_tab = ui.tab("Governance")
     with ui.tab_panels(tabs, value=overview_tab).classes("w-full"):
         with ui.tab_panel(overview_tab):
@@ -524,9 +582,16 @@ def _overview_tab(data: dict) -> None:
             ui.icon("lightbulb", color="blue-600")
             ui.label(insight).classes("text-sm text-blue-900")
 
-    dbp = data["daily_by_project"]
+    # 1-day range shows HOUR buckets (Task 1, Phase 3.0): a single
+    # calendar-day bar hides the intraday shape entirely.
+    if data["range_days"] == 1:
+        dbp = data["hourly_by_project"]
+        chart_title = "Cost per hour, by project"
+    else:
+        dbp = data["daily_by_project"]
+        chart_title = "Cost per day, by project"
     if dbp["dates"]:
-        ui.label("Cost per day, by project").classes("text-sm font-bold mt-4")
+        ui.label(chart_title).classes("text-sm font-bold mt-4")
         project_series = [
             {"type": "line", "name": s["project"], "data": s["data"], "stack": "total",
              "smooth": True, "areaStyle": {}, "lineStyle": {"width": 1},

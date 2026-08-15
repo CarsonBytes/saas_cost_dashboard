@@ -166,19 +166,36 @@ def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
     return out
 
 
-def daily_by_project(rows: list[dict]) -> dict:
-    """Per-project daily (HKT calendar day) cost, for a stacked trend chart --
-    a single total line can't tell you which project caused a given day's
-    spike."""
-    dates = sorted({_hkt_date_str(r["created_at"]) for r in rows})
+def _hkt_hour_str(created_at: str) -> str:
+    """HKT hour bucket '%Y-%m-%d %H:00' -- for the 1-day range chart (Task 1,
+    Phase 3.0: 'Today' should show hours, not a single calendar-day bar)."""
+    instant = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=dt.timezone.utc)
+    return instant.astimezone(_HKT).strftime("%Y-%m-%d %H:00")
+
+
+def _timeseries_by_project(rows: list[dict], bucket_fn) -> dict:
+    """Per-project cost over sorted time buckets (day or hour), for a stacked
+    trend chart -- a single total line can't tell you which project caused a
+    given bucket's spike."""
+    dates = sorted({bucket_fn(r["created_at"]) for r in rows})
     projects = sorted({_bucket_key(r, "project") for r in rows})
     matrix = {p: {d: 0.0 for d in dates} for p in projects}
     for r in rows:
-        matrix[_bucket_key(r, "project")][_hkt_date_str(r["created_at"])] += r.get("cost_usd") or 0
+        matrix[_bucket_key(r, "project")][bucket_fn(r["created_at"])] += r.get("cost_usd") or 0
     return {
         "dates": dates,
         "series": [{"project": p, "data": [round(matrix[p][d], 6) for d in dates]} for p in projects],
     }
+
+
+def daily_by_project(rows: list[dict]) -> dict:
+    return _timeseries_by_project(rows, _hkt_date_str)
+
+
+def hourly_by_project(rows: list[dict]) -> dict:
+    return _timeseries_by_project(rows, _hkt_hour_str)
 
 
 def build_stats(rows: list[dict], days: int) -> dict:
@@ -205,6 +222,7 @@ def build_stats(rows: list[dict], days: int) -> dict:
         "by_project_call_type_model": aggregate_by(rows, ["project", "call_type", "model"]),
         "daily_series": daily_series,
         "daily_by_project": daily_by_project(rows),
+        "hourly_by_project": hourly_by_project(rows),
     }
 
 
