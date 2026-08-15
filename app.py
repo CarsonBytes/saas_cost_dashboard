@@ -165,30 +165,32 @@ def services_row() -> None:
     # reserved status slot (below) keeps quiet and busy cards the same size
     # instead of letting optional lines change the footprint. Uses a plain
     # div rather than ui.row so its own `display:flex` can't fight the grid.
-    with ui.element("div").classes("w-full grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3"):
+    with ui.element("div").classes("w-full grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3"):
         for svc in services.SERVICES:
             status = noc.get_status(svc["name"])
             with ui.card().classes("w-full h-full min-h-[120px]"):
                 with ui.row().classes("items-center gap-2"):
+                    # The icon is identity, always neutral; the round dot
+                    # carries the status -- a small classic health indicator
+                    # right next to the name. Unmonitored cards get no dot.
+                    ui.icon(svc["icon"], color="grey-600").classes("text-2xl")
                     if svc["monitor"]:
                         up = status["up"] if status else None
                         if up is None:
-                            icon_color = "grey-400"          # not checked yet
+                            dot_color = "bg-grey-400"       # not checked yet
                         elif not up:
-                            icon_color = "red-600"           # down
+                            dot_color = "bg-red-500"        # down
                         elif status and status["readiness"] == "stale":
                             # stale means different things depending on the
                             # agent class: enforced-cadence -> a real fault
                             # (amber); usage-driven (Study Platform) -> just
-                            # idle, neutral tone, nothing wrong (FIXED
-                            # 2026-08-15: both rendered identically).
-                            icon_color = "amber-500" if svc.get("restart_on_staleness") \
-                                else "grey-500"
+                            # idle, neutral tone, nothing wrong.
+                            dot_color = "bg-amber-500" if svc.get("restart_on_staleness") \
+                                else "bg-grey-500"
                         else:
-                            icon_color = "green-600"         # healthy
-                    else:
-                        icon_color = "grey-500"              # no monitor, no dot
-                    ui.icon(svc["icon"], color=icon_color).classes("text-2xl")
+                            dot_color = "bg-green-500"      # healthy
+                        ui.element("div").classes(
+                            f"w-2.5 h-2.5 rounded-full {dot_color} shrink-0")
                     ui.label(svc["name"]).classes("font-bold")
                     if status and status.get("locked"):
                         ui.label("Locked").classes(
@@ -335,7 +337,7 @@ def _cost_tab(data: dict) -> None:
             ui.label("By model").classes("text-sm font-bold")
             _bar_chart(data["by_model"], "model")
         with ui.column().classes("grow min-w-[300px]"):
-            ui.label("By environment (quant paper/live)").classes("text-sm font-bold")
+            ui.label("By project & environment").classes("text-sm font-bold")
             _bar_chart(data["by_environment"], "project", ["environment"])
 
     ui.label("Model usage by project & call type").classes("text-sm font-bold mt-4")

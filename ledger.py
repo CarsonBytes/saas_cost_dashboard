@@ -128,9 +128,18 @@ def fetch_rows(days: int) -> list[dict]:
     return [_fill_fallback(r) for r in rows]
 
 
+# Missing-value label per field: most fields fall back to the generic
+# "(untagged)", but an unset `environment` (study/events/regtech never set it,
+# and older quant rows predate it) reads more honestly as "(no environment)"
+# -- "(untagged)" made users wonder what was meant (FIXED 2026-08-15).
+_FIELD_FALLBACKS = {"environment": "(no environment)"}
+
+
 def _bucket_key(row: dict, field: str) -> str:
     v = row.get(field)
-    return _UNTAGGED if v is None or v == "" else str(v)
+    if v is None or v == "":
+        return _FIELD_FALLBACKS.get(field, _UNTAGGED)
+    return str(v)
 
 
 def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:

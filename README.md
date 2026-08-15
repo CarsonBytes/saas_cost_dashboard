@@ -82,6 +82,11 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-15 (late) — status dots, wider cards, clearer environment chart
+- **Each monitored card now has a round status dot** next to the name (green/amber/red/grey) — the service icon stays neutral as identity, so health is read from a classic indicator at a glance instead of a colored icon. Unmonitored demo cards get no dot.
+- **Cards widened** (`minmax(250px,1fr)` grid tracks) so longer names like "Change Impact Assessor" fit on one line instead of wrapping.
+- **"By environment (quant paper/live)" renamed to "By project & environment"**, and the missing-value bucket for environment now reads **"(no environment)"** instead of the confusing "(untagged)" — study, events, and regtech never set an environment column, so their rows legitimately have none (only quant carries paper/live).
+
 ### 2026-08-15 (night) — Study Platform freshness reads `answer_log`, not the LLM ledger
 - **Study's "idle" was a false reading of a real signal.** The readiness check watched the shared `llm_calls` ledger, but practice-mode correct answers never call the LLM (an explanation is generated only for wrong answers), so the card read "idle -- last write 55h ago" right after the user answered several questions. Freshness is now a per-agent source override (`freshness_table`): Study reads its own `answer_log` usage table — every answered question writes a row — so the status flips to healthy within one health cycle of actual use. Quant Paper and Event Radar keep the LLM-ledger signal, which is right for their enforced write cadences.
 
