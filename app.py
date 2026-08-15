@@ -494,8 +494,10 @@ def services_row() -> None:
                         if overdue:
                             ui.label("⚠ compliance overdue: " + ", ".join(overdue)).classes(
                                 "text-xs text-red-600 mt-1")
-                        if status.get("quarantined") == "manual":
-                            ui.label("quarantined (paused)").classes(
+                        if status.get("quarantined"):
+                            reason = status["quarantined"]
+                            ui.label("auto-quarantined (paused)" if reason == "compliance-auto"
+                                     else "quarantined (paused)").classes(
                                 "text-xs bg-red-100 text-red-700 rounded px-1 mt-1")
                             ui.button("Resume", on_click=lambda s=svc: _resume(s)) \
                                 .props("dense flat color=positive")

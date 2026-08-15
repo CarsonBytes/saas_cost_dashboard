@@ -436,9 +436,13 @@ def clear_lock(name: str) -> None:
 
 def _quarantine_reason(name: str, state: dict,
                        compliance: dict[str, list[str]]) -> str | None:
-    """None | 'manual' | 'compliance' -- why an agent's restart is suppressed."""
-    if name in state.get("quarantined", {}):
-        return "manual"
+    """None | 'manual' | 'compliance-auto' | 'compliance' -- why an agent's
+    restart is suppressed. A pause recorded in state (operator or auto) wins
+    and preserves its reason; otherwise any OVERDUE rule naming the agent
+    counts as 'compliance' (restart suppression even without a pause)."""
+    entry = state.get("quarantined", {}).get(name)
+    if entry:
+        return entry.get("reason", "manual")
     if compliance.get(name):
         return "compliance"
     return None
@@ -597,17 +601,31 @@ def _refresh_health() -> None:
             # Task 4 (Phase 3.2): policy-driven automated isolation -- per-rule
             # opt-in via governance_rules.auto_action='quarantine'. An OVERDUE
             # rule targeting this agent pauses its container ONCE (through the
-            # proxy) unless already quarantined. Guards: only quarantinable
-            # agents with a container; never Quant Paper during market hours
-            # (a pause mid-session is the operator's call, not a rule's).
+            # proxy) unless a pause is already recorded. The gate is "not
+            # already paused/recorded", NOT "not compliance-quarantined" -- the
+            # same OVERDUE rule makes this agent compliance-quarantined for
+            # restart purposes, and that is exactly when the pause should fire.
+            # Guards: only quarantinable agents with a container; never Quant
+            # Paper during market hours (a pause mid-session is the operator's
+            # call, not a rule's).
             auto_target = auto_targets.get(name)
-            if (not quarantine and auto_target
+            if (name not in state.get("quarantined", {}) and auto_target
                     and svc.get("quarantinable") and svc.get("container")):
                 if name == QUANT_PAPER and nyse_session_open(now):
                     _add_incident(state, name, "auto-quarantine skipped",
                                   outcome="market hours", detail=auto_target["rule"])
                 elif _proxy_action("pause", svc["container"]):
-                    quarantine_agent(name, reason="compliance-auto")
+                    # Inline the record: the whole cycle already runs inside
+                    # _STATE_LOCK, so calling quarantine_agent() (which acquires
+                    # it again) would DEADLOCK -- the pause fired but the record
+                    # never saved and the cycle hung (FIXED 2026-08-16). The
+                    # cycle's final _save_state() persists this.
+                    state.setdefault("quarantined", {})[name] = {
+                        "reason": "compliance-auto",
+                        "ts": now.isoformat(),
+                    }
+                    _add_incident(state, name, "quarantine", outcome="compliance-auto",
+                                  detail=f"auto-paused by policy: {auto_target['rule']}")
                     alerts.send_telegram(
                         f"\U0001f6d1 {name} auto-quarantined: '{auto_target['rule']}' "
                         f"is OVERDUE -- container paused by policy",
@@ -745,6 +763,23 @@ def _selftest() -> None:
             del state["locks"]["X"]
             state["restarts"]["X"] = []
             self.assertTrue(_restart_eligible(svc, now, state))
+
+        def test_quarantine_reason(self):
+            # no pause recorded, no overdue rule -> None
+            self.assertIsNone(_quarantine_reason("A", {"quarantined": {}}, {}))
+            # overdue rule without a pause -> compliance (restart suppressed)
+            self.assertEqual(_quarantine_reason("A", {"quarantined": {}}, {"A": ["r"]}),
+                             "compliance")
+            # a recorded pause wins and preserves its reason
+            state = {"quarantined": {"A": {"reason": "compliance-auto", "ts": "x"}}}
+            self.assertEqual(_quarantine_reason("A", state, {"A": ["r"]}), "compliance-auto")
+            state = {"quarantined": {"A": {"reason": "manual", "ts": "x"}}}
+            self.assertEqual(_quarantine_reason("A", state, {"A": ["r"]}), "manual")
+            # quarantined agents are never restart-eligible
+            svc = {"name": "A", "restart": "auto_heal", "container": "a"}
+            now = dt.datetime(2026, 8, 14, 12, 0, tzinfo=dt.timezone.utc)
+            self.assertFalse(_restart_eligible(svc, now, {"quarantined": {"A": {"reason": "manual"}}},
+                                               compliance={"A": ["r"]}))
 
         def test_staleness_restart_gating(self):
             # enforced-cadence agent: stale readiness warrants a restart
