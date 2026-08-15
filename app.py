@@ -724,15 +724,23 @@ def main_page() -> None:
                 ui.button("Refresh", icon="refresh",
                           on_click=lambda: (fetch_stats(STATE["days"]), refresh_all())) \
                     .props("color=primary")
-        ui.label("Cross-project usage: quant (paper + live) + study + event-radar, "
-                 "reading directly from the shared Supabase llm_calls ledger.").classes("text-sm text-grey-6")
+        ui.label("AI Governance Professional (AIGP) class -- cross-project usage: "
+                 "quant (paper + live) + study + event-radar, reading directly from "
+                 "the shared Supabase llm_calls ledger.").classes("text-sm text-grey-6")
+
+        alert_banner()
+        noc_banner()
+        services_row()
 
         def _set_range(e) -> None:
             STATE["days"] = e.value
             fetch_stats(STATE["days"])
             refresh_all()
 
-        with ui.row().classes("items-center gap-2"):
+        # Range + alert-threshold live UNDER the agent cards (layout request
+        # 2026-08-16): the cards are the dashboard's identity, the controls
+        # tune the charts below them.
+        with ui.row().classes("items-center gap-2 mt-1"):
             ui.label("Range:").classes("text-sm")
             ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
                       on_change=_set_range).props("dense")
@@ -748,10 +756,6 @@ def main_page() -> None:
                 refresh_all()
 
             ui.button("Save", on_click=_save_threshold).props("dense flat")
-
-        alert_banner()
-        noc_banner()
-        services_row()
         ui.separator().classes("my-2")
         dashboard_body()
 

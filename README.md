@@ -82,6 +82,11 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-16 (Phase 2.1) — Task A: RegTech Radar emits `regulatory_updates` + UI polish
+- **RegTech Radar now feeds the compliance engine.** Its pipeline (`core/pipeline.py`, change-detection hook) writes one `regulatory_updates` row per detected change via the new `core/regulatory_updates.py`: title `<source>: <article> changed`, `affected_articles`, `impact_hint` derived from the assessment severities (`action_needed`/`high_risk` → high), and `deadline` deliberately NULL until calibrated (a fabricated compliance deadline is worse than none — the dashboard treats NULL as "no deadline" and the rule stays PENDING). The write is idempotent (skips existing unconsumed rows). This is live via the Windows Scheduled Task on its next run — the regtech repo is local-only, no deploy needed.
+- **Verified end-to-end**: emit → row → dashboard ingest → PENDING rule + audit + Telegram (test rows cleaned up afterwards).
+- **UI**: the subtitle under the title now shows the AIGP class, and the Range / Alert-threshold controls moved to under the agent cards (the cards are the identity; the controls tune the charts below them).
+
 ### 2026-08-16 (Phase 2) — regulatory_updates consumer, compliance health, safe quarantine
 - **Task B — compliance task generation**: the engine now polls `regulatory_updates` (migration `002_regulatory_updates.sql`) each 600s cycle, turns unconsumed rows into PENDING `governance_rules` tasks (deduped by name), audits + Telegram-alerts each, and marks the row consumed. Testable today via a manual INSERT; RegTech Radar's pipeline writes these rows in a follow-up step.
 - **Task C — compliance health on the cards**: new `governance_rules.agent_slug` maps a rule to an agent; an OVERDUE rule for an agent turns its status dot RED even while HTTP is 200, plus a "⚠ compliance overdue" line. Rules without `agent_slug` only count into the tab's KPIs.
