@@ -408,6 +408,15 @@ def governance_view() -> None:
 
 
 @ui.refreshable
+def last_refreshed_label() -> None:
+    """Header line under the description (layout request 2026-08-16): the
+    data-staleness stamp lives with the page identity, not inside the tab
+    area. Refreshable so it updates on refresh_all without a page reload."""
+    ui.label(f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT)"
+             if STATE["last_fetch"] else "").classes("text-xs text-grey-6")
+
+
+@ui.refreshable
 def services_row() -> None:
     # No "My Agents" heading: the cards render directly, nothing above them.
     # Equal-width / equal-height grid (FIXED 2026-08-15): the old flex row
@@ -541,10 +550,6 @@ def dashboard_body() -> None:
     if not data:
         ui.label("Loading…").classes("text-sm text-grey")
         return
-
-    with ui.row().classes("items-center gap-2"):
-        ui.label(f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT)"
-                 if STATE["last_fetch"] else "").classes("text-xs text-grey-6")
 
     with ui.tabs().classes("w-full") as tabs:
         overview_tab = ui.tab("Overview")
@@ -715,6 +720,7 @@ def refresh_all() -> None:
     services_row.refresh()
     incident_log.refresh()
     dashboard_body.refresh()
+    last_refreshed_label.refresh()
 
 
 def _refresh_safely(*refreshables) -> None:
@@ -794,6 +800,7 @@ def main_page() -> None:
         ui.label("AI Governance Professional (AIGP) class -- cross-project usage: "
                  "quant (paper + live) + study + event-radar, reading directly from "
                  "the shared Supabase llm_calls ledger.").classes("text-sm text-grey-6")
+        last_refreshed_label()  # under the description (layout request 2026-08-16)
 
         alert_banner()
         noc_banner()
@@ -804,9 +811,10 @@ def main_page() -> None:
             fetch_stats(STATE["days"])
             refresh_all()
 
-        # Range + alert-threshold live UNDER the agent cards (layout request
-        # 2026-08-16): the cards are the dashboard's identity, the controls
-        # tune the charts below them.
+        ui.separator().classes("my-1")
+        # Range + alert-threshold sit JUST ABOVE the tab strip (layout request
+        # 2026-08-16): the cards are the identity, the controls tune the
+        # charts below, and the tab strip is where those charts live.
         with ui.row().classes("items-center gap-2 mt-1"):
             ui.label("Range:").classes("text-sm")
             ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
@@ -823,8 +831,7 @@ def main_page() -> None:
                 refresh_all()
 
             ui.button("Save", on_click=_save_threshold).props("dense flat")
-        ui.separator().classes("my-2")
-        dashboard_body()
+        dashboard_body()  # controls sit just above the tab strip
 
     fetch_stats(STATE["days"])
     refresh_all()
