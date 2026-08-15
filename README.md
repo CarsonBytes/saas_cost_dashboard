@@ -82,6 +82,11 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-16 (hotfix) — Governance render-safe cache + refresh guard
+- **The Governance tab is now network-free at render time.** It reads a snapshot cache that the background compliance loop fills (`governance.refresh_cache`) instead of calling Supabase during page render — a slow/unreachable Supabase can no longer queue blocking calls on the event loop. "Mark as complied" also runs in a thread (`run.io_bound`).
+- **Background-loop refreshables are guarded** (`_refresh_safely`): they skip when no browser is connected and swallow the nicegui #3028 "client deleted but still being used" RuntimeError, which had started spamming the logs under client churn.
+- **Root-cause note on the "frozen app" scare:** most of it was an artifact of non-websocket probe traffic — NiceGUI only runs the page function once a browser's websocket connects, so plain HTTP GETs (curl/httpx) never exercise the render at all, and rapid websocket-less churn degrades the server. Real browsers are unaffected; the public URL serves 200.
+
 ### 2026-08-16 — Governance: compliance radar + risk ledger (lean)
 - **New `governance/` module + a 4th "Governance" tab** (Compliance Calendar with deadline countdown + "Mark as complied", High-Impact Watchlist, read-only Audit Trail). The two tables (`governance_rules`, `governance_audit_log`) must be created via the Supabase SQL editor — until they exist the tab shows a "run the SQL" banner instead of crashing.
 - **Deterministic rule matching only**: LLM is never used to decide whether to alert. The compliance snapshot source is pluggable and currently returns `{}` (RegTech Radar exposes no parsed-JSON endpoint), so matching is dormant — the deadline/PENDING→OVERDUE path is fully live and audited.

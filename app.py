@@ -40,7 +40,7 @@ import datetime as dt
 import io
 import os
 
-from nicegui import app, ui
+from nicegui import app, run, ui
 
 import alerts
 import governance  # compliance radar engine (governance/engine.py)
@@ -168,12 +168,25 @@ def _impact_badge(impact: str | None) -> None:
         ui.label(text).classes(f"text-xs {cls} rounded px-1")
 
 
+async def _mark_complied(rid: str) -> None:
+    """Governance 'Mark as complied' action: DB work off the event loop, then
+    re-render the tab from the refreshed snapshot cache."""
+    ok = await run.io_bound(governance.mark_complied, rid)
+    governance_view.refresh()
+    ui.notify("Rule marked complied + audited" if ok
+              else "Mark-as-complied failed", type="positive" if ok else "negative")
+
+
 @ui.refreshable
 def governance_view() -> None:
     """Governance tab: Compliance Calendar, High-Impact Watchlist, Audit Trail.
     Renders a clear 'run the SQL' banner until the two governance tables exist
-    (they cannot be created from this app -- PostgREST does no DDL)."""
-    if not governance.tables_ready():
+    (they cannot be created from this app -- PostgREST does no DDL).
+
+    Render is NETWORK-FREE: it reads the snapshot cache the background
+    compliance loop fills (governance.refresh_cache). Direct Supabase calls
+    in render froze the event loop under rapid connections (FIXED 2026-08-15)."""
+    if not governance.cached_tables_ready():
         with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-3"):
             ui.icon("construction", color="amber-700")
             ui.label(
@@ -185,7 +198,7 @@ def governance_view() -> None:
 
     # --- Section A: Compliance Calendar -------------------------------------
     ui.label("Compliance calendar").classes("text-sm font-bold")
-    rules = governance.fetch_rules()
+    rules = governance.cached_rules()
     if not rules:
         ui.label("(no pending or overdue rules)").classes("text-sm text-grey")
     else:
@@ -213,15 +226,12 @@ def governance_view() -> None:
                 <q-badge :color="props.row._status === 'OVERDUE' ? 'red' : 'amber'">{{ props.value }}</q-badge>
             </q-td>
         """)
-        # Mark-as-complied buttons live under the table (one per active rule)
-        # rather than inside table cells -- simpler and they refresh cleanly.
+        # Mark-as-complied buttons live under the table (one per active rule).
+        # Handler is async + run.io_bound so the DB calls never block the loop.
         with ui.row().classes("gap-2 mt-1 flex-wrap"):
             for r in rules:
                 ui.button(f"Mark '{r['rule_name']}' complied",
-                          on_click=lambda rid=r["id"]: (
-                              governance.mark_complied(rid),
-                              governance_view.refresh(),
-                              ui.notify("Rule marked complied + audited", type="positive")))\
+                          on_click=lambda rid=r["id"]: _mark_complied(rid))\
                     .props("dense flat color=positive")
 
     # --- Section B: High-Impact Watchlist -----------------------------------
@@ -543,6 +553,25 @@ def refresh_all() -> None:
     dashboard_body.refresh()
 
 
+def _refresh_safely(*refreshables) -> None:
+    """Refresh module-level refreshables from a background loop without
+    letting a deleted-client race (nicegui issue #3028 -- 'Client has been
+    deleted but is still being used') raise through the loop. Also skips the
+    work when no browser is connected, since the refreshables have no client
+    to render into anyway."""
+    try:
+        from nicegui import Client
+        if not any(c.has_socket_connection for c in Client.instances):
+            return
+    except Exception:                                  # noqa: BLE001
+        pass
+    for fn in refreshables:
+        try:
+            fn.refresh()
+        except RuntimeError:                           # noqa: BLE001
+            pass
+
+
 async def _alert_check_loop() -> None:
     """Runs regardless of whether a browser tab is open (an app-startup
     background task, not tied to any page/client) so a Telegram push can
@@ -551,34 +580,35 @@ async def _alert_check_loop() -> None:
     while True:
         await asyncio.sleep(_ALERT_CHECK_INTERVAL_SEC)
         await asyncio.to_thread(fetch_stats, STATE["days"])
-        alert_banner.refresh()
+        _refresh_safely(alert_banner)
 
 
 async def _services_check_loop() -> None:
     while True:
         await asyncio.to_thread(noc.refresh_health)
-        noc_banner.refresh()
-        services_row.refresh()
-        incident_log.refresh()
+        _refresh_safely(noc_banner, services_row, incident_log)
         await asyncio.sleep(_SERVICES_CHECK_INTERVAL_SEC)
 
 
 async def _risk_ledger_loop() -> None:
     """Risk-ledger scan (Phase 3): runs off the event loop so a slow Supabase
     call never blocks rendering; separate task so it can't stall the other
-    loops (same resilience pattern as the existing per-loop tasks)."""
+    loops (same resilience pattern as the existing per-loop tasks). Work
+    first, then sleep, so the very first scan happens at startup."""
     while True:
-        await asyncio.sleep(_RISK_LEDGER_INTERVAL_SEC)
         await asyncio.to_thread(ledger.scan_high_impact_calls)
+        await asyncio.sleep(_RISK_LEDGER_INTERVAL_SEC)
 
 
 async def _compliance_loop() -> None:
     """Compliance radar (Phase 2): deadline enforcement + rule matching.
     Same isolation as _risk_ledger_loop -- each loop hangs independently at
-    worst, never together."""
+    worst, never together. Work first, then sleep, so the UI snapshot cache
+    (governance.refresh_cache) is populated at startup -- the tab renders
+    from that cache, never from network calls."""
     while True:
-        await asyncio.sleep(_COMPLIANCE_INTERVAL_SEC)
         await asyncio.to_thread(governance.check_pending_rules)
+        await asyncio.sleep(_COMPLIANCE_INTERVAL_SEC)
 
 
 @ui.page("/")

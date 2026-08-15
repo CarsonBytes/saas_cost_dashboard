@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import threading
 import time
 
 import httpx
@@ -44,6 +45,14 @@ _TABLES = ("governance_rules", "governance_audit_log")
 # cooldown one day, so a persistent match doesn't spam Telegram every cycle.
 _MATCH_COOLDOWN_SEC = 86400
 _MATCH_CACHE: dict[str, float] = {}
+
+# UI snapshot cache. Page renders must NEVER do network I/O on the event loop
+# (the app's rule of thumb -- it turns a slow Supabase into a frozen page);
+# the background compliance loop fills this, and the Governance tab reads it.
+# FIXED 2026-08-15: the tab initially fetched directly during render, which
+# queued blocking calls on the loop and froze the app under rapid connections.
+_CACHE_LOCK = threading.Lock()
+_CACHE: dict = {"tables_ready": False, "rules": [], "audit": []}
 
 
 def _headers() -> dict:
@@ -88,6 +97,41 @@ def _patch(table: str, row_id: str, payload: dict) -> bool:
 def tables_ready() -> bool:
     """Both governance tables exist (the user ran the Phase 0 SQL)."""
     return all(_get(t, {"select": "id", "limit": "1"}) is not None for t in _TABLES)
+
+
+# ---- UI snapshot cache (background-filled, render-safe) ---------------------
+
+def refresh_cache() -> dict:
+    """Best-effort snapshot for the Governance tab. Called from background
+    tasks only (the compliance loop, mark_complied) -- never from a page
+    render. Never raises."""
+    try:
+        with _CACHE_LOCK:
+            _CACHE["tables_ready"] = tables_ready()
+            if _CACHE["tables_ready"]:
+                _CACHE["rules"] = fetch_rules()
+                _CACHE["audit"] = get_audit_log()
+            else:
+                _CACHE["rules"], _CACHE["audit"] = [], []
+        return dict(_CACHE)
+    except Exception:                                 # noqa: BLE001
+        log.exception("governance: cache refresh failed")
+        return dict(_CACHE)
+
+
+def cached_tables_ready() -> bool:
+    with _CACHE_LOCK:
+        return _CACHE["tables_ready"]
+
+
+def cached_rules() -> list[dict]:
+    with _CACHE_LOCK:
+        return list(_CACHE["rules"])
+
+
+def cached_audit() -> list[dict]:
+    with _CACHE_LOCK:
+        return list(_CACHE["audit"])
 
 
 def _parse_ts(value: str | None) -> dt.datetime | None:
@@ -210,6 +254,7 @@ def _check_pending_rules() -> dict:
                    {"snapshot": snapshot})
             _MATCH_CACHE[rule["id"]] = now.timestamp()
             matched.append(rule["rule_name"])
+    refresh_cache()  # keep the UI snapshot fresh (runs in this background thread)
     return {"ok": True, "rules_checked": len(rules), "overdue": flipped, "matched": matched}
 
 
@@ -218,6 +263,7 @@ def mark_complied(rule_id: str, actor: str = "dashboard") -> bool:
     ok = _patch("governance_rules", rule_id, {"status": "COMPLIED"})
     if ok:
         _audit(rule_id, "MANUAL_OVERRIDE", actor, {"to": "COMPLIED"})
+    refresh_cache()  # so the tab reflects the change on its next render
     return ok
 
 
