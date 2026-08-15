@@ -52,7 +52,7 @@ _MATCH_CACHE: dict[str, float] = {}
 # FIXED 2026-08-15: the tab initially fetched directly during render, which
 # queued blocking calls on the loop and froze the app under rapid connections.
 _CACHE_LOCK = threading.Lock()
-_CACHE: dict = {"tables_ready": False, "rules": [], "audit": []}
+_CACHE: dict = {"tables_ready": False, "rules": [], "complied": [], "audit": []}
 
 
 def _headers() -> dict:
@@ -80,6 +80,21 @@ def _post(table: str, payload: dict) -> bool:
         return resp.status_code < 300
     except Exception:                              # noqa: BLE001
         return False
+
+
+def _post_returning(table: str, payload: dict) -> dict | None:
+    """INSERT returning the created row (for rule ids in the audit trail)."""
+    try:
+        resp = httpx.post(f"{ledger.SUPABASE_URL}/rest/v1/{table}",
+                          json=payload, headers={**_headers(), "Content-Type": "application/json",
+                                                 "Prefer": "return=representation"},
+                          timeout=10)
+        if resp.status_code >= 300:
+            return None
+        rows = resp.json()
+        return rows[0] if rows else None
+    except Exception:                              # noqa: BLE001
+        return None
 
 
 def _patch(table: str, row_id: str, payload: dict) -> bool:
@@ -110,9 +125,10 @@ def refresh_cache() -> dict:
             _CACHE["tables_ready"] = tables_ready()
             if _CACHE["tables_ready"]:
                 _CACHE["rules"] = fetch_rules()
+                _CACHE["complied"] = fetch_rules(("COMPLIED",))[:20]
                 _CACHE["audit"] = get_audit_log()
             else:
-                _CACHE["rules"], _CACHE["audit"] = [], []
+                _CACHE["rules"], _CACHE["complied"], _CACHE["audit"] = [], [], []
         return dict(_CACHE)
     except Exception:                                 # noqa: BLE001
         log.exception("governance: cache refresh failed")
@@ -129,9 +145,31 @@ def cached_rules() -> list[dict]:
         return list(_CACHE["rules"])
 
 
+def cached_complied() -> list[dict]:
+    with _CACHE_LOCK:
+        return list(_CACHE["complied"])
+
+
 def cached_audit() -> list[dict]:
     with _CACHE_LOCK:
         return list(_CACHE["audit"])
+
+
+def compliance_health() -> dict[str, list[str]]:
+    """Agent slug -> OVERDUE rule names, computed from the cached active rules.
+    Render-safe (no network). Agents absent from the map are compliant.
+
+    Task C: a rule maps to an agent via governance_rules.agent_slug (the exact
+    services.py display name). Rules without agent_slug never flag a card --
+    they only count into the tab's global KPIs."""
+    with _CACHE_LOCK:
+        rules = _CACHE["rules"]
+    health: dict[str, list[str]] = {}
+    for rule in rules:
+        slug = rule.get("agent_slug")
+        if rule.get("status") == "OVERDUE" and slug:
+            health.setdefault(slug, []).append(rule["rule_name"])
+    return health
 
 
 def _parse_ts(value: str | None) -> dt.datetime | None:
@@ -224,9 +262,68 @@ def check_pending_rules() -> dict:
         return {"ok": False}
 
 
+# ---- Task B: ingest regulatory_updates -> governance_rules ------------------
+
+def _rule_payload(update: dict) -> dict:
+    """Build a governance_rules row from a regulatory_updates row. Pure --
+    unit-tested. condition_json maps affected_articles / impact_hint."""
+    condition: dict = {}
+    articles = update.get("affected_articles") or []
+    if articles:
+        condition["affected_articles"] = list(articles)
+    hint = update.get("impact_hint")
+    if hint:
+        condition["impact_level"] = [str(hint)]
+    return {
+        "rule_name": update["title"],
+        "condition_json": json.dumps(condition or {}),
+        "action_type": "ALERT",
+        "enforcement_deadline": update.get("deadline"),
+        "status": "PENDING",
+        "agent_slug": update.get("agent_slug"),
+    }
+
+
+def ingest_regulatory_updates() -> list[str]:
+    """Task B: turn unconsumed `regulatory_updates` rows into PENDING
+    governance_rules tasks (deduped by rule_name), audit + Telegram each, then
+    mark the row consumed. Missing table -> graceful no-op. Never raises."""
+    try:
+        rows = _get("regulatory_updates",
+                    {"select": "*", "consumed": "eq.false",
+                     "order": "created_at.asc", "limit": "20"}) or []
+        created = []
+        for update in rows:
+            name = update["title"]
+            # idempotence guard: if the rule already exists (e.g. a previous
+            # cycle created it but the consumed-mark failed), just mark consumed.
+            existing = _get("governance_rules",
+                            {"select": "id", "rule_name": f"eq.{name}", "limit": "1"}) or []
+            if not existing:
+                new_rule = _post_returning("governance_rules", _rule_payload(update))
+                if new_rule:
+                    _audit(new_rule.get("id"), "AUTO_ALERT_SENT", "system",
+                           {"from": "regulatory_updates", "title": name,
+                            "deadline": update.get("deadline"),
+                            "impact_hint": update.get("impact_hint")})
+                    deadline_txt = ledger.to_hkt(update["deadline"]).strftime("%Y-%m-%d") \
+                        if update.get("deadline") else "no deadline"
+                    alerts.send_telegram(
+                        f"new compliance task: '{name}' (deadline {deadline_txt} HKT) "
+                        f"-- created from regulatory update",
+                        tag="GOV", emoji="\U0001f4cb")
+                    created.append(name)
+            _patch("regulatory_updates", update["id"], {"consumed": True})
+        return created
+    except Exception:                                 # noqa: BLE001
+        log.exception("governance: regulatory_updates ingest failed")
+        return []
+
+
 def _check_pending_rules() -> dict:
     if not tables_ready():
         return {"ok": False, "tables": False}
+    ingested = ingest_regulatory_updates()
     now = dt.datetime.now(dt.timezone.utc)
     rules = fetch_rules()
     flipped, matched = [], []
@@ -255,7 +352,8 @@ def _check_pending_rules() -> dict:
             _MATCH_CACHE[rule["id"]] = now.timestamp()
             matched.append(rule["rule_name"])
     refresh_cache()  # keep the UI snapshot fresh (runs in this background thread)
-    return {"ok": True, "rules_checked": len(rules), "overdue": flipped, "matched": matched}
+    return {"ok": True, "rules_checked": len(rules), "overdue": flipped,
+            "matched": matched, "ingested": ingested}
 
 
 def mark_complied(rule_id: str, actor: str = "dashboard") -> bool:
@@ -297,6 +395,35 @@ def _selftest() -> None:
             self.assertTrue(_deadline_passed(past, now))
             self.assertFalse(_deadline_passed(future, now))
             self.assertFalse(_deadline_passed(no_deadline, now))
+
+        def test_rule_payload(self):
+            payload = _rule_payload({
+                "title": "Art 5 amended", "affected_articles": ["Article 5"],
+                "deadline": "2026-12-31T00:00:00+00:00", "impact_hint": "high",
+            })
+            self.assertEqual(payload["rule_name"], "Art 5 amended")
+            self.assertEqual(payload["status"], "PENDING")
+            self.assertEqual(payload["action_type"], "ALERT")
+            self.assertEqual(payload["enforcement_deadline"], "2026-12-31T00:00:00+00:00")
+            self.assertEqual(payload["agent_slug"], None)
+            cond = json.loads(payload["condition_json"])
+            self.assertEqual(cond["affected_articles"], ["Article 5"])
+            self.assertEqual(cond["impact_level"], ["high"])
+            # no hint/articles -> empty condition (never matches anything)
+            bare = _rule_payload({"title": "x"})
+            self.assertEqual(json.loads(bare["condition_json"]), {})
+
+        def test_compliance_health(self):
+            with _CACHE_LOCK:
+                _CACHE["rules"] = [
+                    {"rule_name": "r1", "status": "OVERDUE", "agent_slug": "Quant Trading (Paper)"},
+                    {"rule_name": "r2", "status": "PENDING", "agent_slug": "Quant Trading (Paper)"},
+                    {"rule_name": "r3", "status": "OVERDUE", "agent_slug": None},  # global, no card
+                ]
+            health = compliance_health()
+            self.assertEqual(health, {"Quant Trading (Paper)": ["r1"]})
+            with _CACHE_LOCK:
+                _CACHE["rules"] = []
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(GovernanceSelftest)
     result = unittest.TextTestRunner(verbosity=2).run(suite)

@@ -51,6 +51,11 @@ Per-entry fields:
                                  restart cannot fix, so it degrades the card
                                  but never restarts on its own. Default False.
   container                   -- Docker container name to restart (auto_heal).
+  quarantinable               -- whether the UI offers a manual "Quarantine
+                                 (pause)" action for this agent (operator
+                                 decision, never automatic). Only agents with
+                                 a container on the restart proxy's allow-list
+                                 can be quarantined. Default False.
 
 Health semantics (details in noc.py): liveness is a plain reachability probe
 (did we get *any* HTTP response, not a specific status code) -- these apps sit
@@ -74,6 +79,7 @@ SERVICES = [
         "freshness_sec": 900,          # writes every ~1min during market hours
         "restart_on_staleness": True,  # enforced scan loop -- a stalled loop is a real fault
         "container": "quant-dashboard-docker",
+        "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
         # Splitting the old combined Quant Trading card: Live runs as a native
@@ -107,6 +113,7 @@ SERVICES = [
         "freshness_sec": 86400,        # ingest runs every 24h
         "restart_on_staleness": True,  # enforced ingest schedule -- a missed run is a real fault
         "container": "event-radar",
+        "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
         "name": "Study Platform",
@@ -129,6 +136,7 @@ SERVICES = [
         # was auto-restarting every ~6min while idle and lock/re-lock cycling).
         "restart_on_staleness": False,
         "container": "study-app",
+        "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
         "name": "Portfolio",

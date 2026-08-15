@@ -10,12 +10,15 @@ The package re-exports engine's public functions so callers can use
 """
 from governance.engine import (  # noqa: F401
     cached_audit,
+    cached_complied,
     cached_rules,
     cached_tables_ready,
     check_pending_rules,
+    compliance_health,
     fetch_compliance_snapshot,
     fetch_rules,
     get_audit_log,
+    ingest_regulatory_updates,
     mark_complied,
     refresh_cache,
     tables_ready,

@@ -7,10 +7,11 @@ effectively root over every container on the host (including the paper
 trading engine) -- an acceptable trade on a machine only its owner touches,
 but a different one once the container holding it is dashboard.carsonng.com,
 public with no auth gate. This proxy is the narrow replacement: it alone
-mounts the socket, and it accepts exactly one action -- POST /restart for a
-container name on an explicit allow-list. A compromised dashboard can
-therefore only restart the three auto-heal agents; it cannot create, delete,
-exec into, or otherwise touch anything else on the daemon.
+mounts the socket, and it accepts exactly a few actions -- POST /restart,
+POST /pause, POST /unpause -- each for a container name on an explicit
+allow-list. A compromised dashboard can therefore only restart or
+pause/unpause the three auto-heal agents; it cannot create, delete, exec
+into, or otherwise touch anything else on the daemon.
 
 Only reachable on the compose-internal network (no host port is published);
 the dashboard calls it at http://restart-proxy:8096 (see noc.py
@@ -33,18 +34,26 @@ ALLOWED = {c.strip() for c in os.environ.get(
 
 _SOCKET = "/var/run/docker.sock"
 
+# action -> Docker Engine API endpoint suffix on /containers/{name}
+_ACTIONS = {
+    "restart": "/restart",
+    "pause": "/pause",
+    "unpause": "/unpause",
+}
 
-def _docker_restart(name: str) -> tuple[int, bool]:
-    """POST /containers/{name}/restart via the Engine API over the socket."""
+
+def _docker_action(name: str, action: str) -> tuple[int, bool]:
+    """POST /containers/{name}/{action} via the Engine API over the socket."""
     transport = httpx.HTTPTransport(uds=_SOCKET)
     with httpx.Client(transport=transport, timeout=60) as client:
-        resp = client.post(f"http://localhost/containers/{name}/restart")
+        resp = client.post(f"http://localhost/containers/{name}{_ACTIONS[action]}")
     return resp.status_code, resp.status_code < 300
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
-        if self.path != "/restart":
+        action = self.path.lstrip("/")
+        if action not in _ACTIONS:
             self._reply(404, {"ok": False, "error": "unknown action"})
             return
         try:
@@ -57,10 +66,10 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(403, {"ok": False, "error": "container not in allow-list"})
             return
         try:
-            status, ok = _docker_restart(name)
-            self._reply(200, {"ok": ok, "container": name, "status": status})
+            status, ok = _docker_action(name, action)
+            self._reply(200, {"ok": ok, "action": action, "container": name, "status": status})
         except Exception as e:                      # noqa: BLE001
-            self._reply(502, {"ok": False, "container": name, "error": str(e)})
+            self._reply(502, {"ok": False, "action": action, "container": name, "error": str(e)})
 
     def _reply(self, code: int, payload: dict) -> None:
         data = json.dumps(payload).encode()

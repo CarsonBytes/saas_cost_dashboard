@@ -64,6 +64,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 import alerts
+import governance  # compliance_health (OVERDUE rules by agent) for quarantine
 import ledger  # same Supabase connection config this app already reads the ledger with
 import services
 
@@ -315,12 +316,17 @@ def _restart_count(state: dict, name: str, now: dt.datetime) -> int:
     return sum(1 for ts in state.get("restarts", {}).get(name, []) if ts >= window)
 
 
-def _restart_eligible(svc: dict, now: dt.datetime, state: dict) -> bool:
+def _restart_eligible(svc: dict, now: dt.datetime, state: dict,
+                      compliance: dict[str, list[str]] | None = None) -> bool:
     """Permission gates for auto-restart (unhealthy/blocked gating lives in
-    refresh_health, which has the fresh check results)."""
+    refresh_health, which has the fresh check results). Quarantined agents --
+    manually paused, or compliance-critical (an OVERDUE rule naming them) --
+    are never auto-restarted."""
     if svc["restart"] != "auto_heal" or not svc.get("container"):
         return False
     if svc["name"] in state.get("locks", {}):
+        return False
+    if _quarantine_reason(svc["name"], state, compliance or {}):
         return False
     if svc["name"] == QUANT_PAPER and not nyse_session_open(now):
         return False
@@ -406,6 +412,56 @@ def clear_lock(name: str) -> None:
         _save_state(state)
     if name in _STATUS_CACHE:
         _STATUS_CACHE[name]["locked"] = False
+
+
+# ---- quarantine (Task D, Phase 2.3) -----------------------------------------
+# "Safe quarantine": an operator decision, never automatic. Quarantine means
+# (a) the container is PAUSED via the restart proxy (the caller does that) and
+# (b) the NOC stops auto-restarting the agent -- a paused container reads as
+# "down" to liveness probes, and restarting it would fight the quarantine.
+# A compliance-critical agent (an OVERDUE rule naming it) is also treated as
+# quarantined for restart purposes: you don't bounce a system while its
+# compliance posture is red, even if the container is technically healthy.
+
+def _quarantine_reason(name: str, state: dict,
+                       compliance: dict[str, list[str]]) -> str | None:
+    """None | 'manual' | 'compliance' -- why an agent's restart is suppressed."""
+    if name in state.get("quarantined", {}):
+        return "manual"
+    if compliance.get(name):
+        return "compliance"
+    return None
+
+
+def quarantine_agent(name: str, reason: str = "manual") -> None:
+    """Operator-initiated quarantine. The container pause is done by the
+    caller through the restart proxy; this records the state so the NOC stops
+    auto-restarting the agent. Logged to the incident log."""
+    with _STATE_LOCK:
+        state = _load_state()
+        state.setdefault("quarantined", {})[name] = {
+            "reason": reason,
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        _add_incident(state, name, "quarantine", outcome=reason,
+                      detail="operator paused container")
+        _save_state(state)
+    if name in _STATUS_CACHE:
+        _STATUS_CACHE[name]["quarantined"] = "manual"
+
+
+def unquarantine_agent(name: str) -> bool:
+    """Lift a manual quarantine (the caller also unpauses the container)."""
+    with _STATE_LOCK:
+        state = _load_state()
+        if state.get("quarantined", {}).pop(name, None):
+            _add_incident(state, name, "quarantine-lifted",
+                          outcome="operator resumed container")
+            _save_state(state)
+            return True
+    if name in _STATUS_CACHE:
+        _STATUS_CACHE[name]["quarantined"] = False
+    return False
 
 
 # ---- incidents -------------------------------------------------------------
@@ -502,6 +558,7 @@ def _refresh_health() -> None:
                 pool.map(_latest_write_safe, freshness_agents)))
 
         prev = {name: dict(_STATUS_CACHE.get(name, {})) for name in up_map}
+        compliance = governance.compliance_health()  # agent -> OVERDUE rule names
 
         for svc in monitored:
             name = svc["name"]
@@ -509,6 +566,7 @@ def _refresh_health() -> None:
             locked = name in state.get("locks", {})
             restarts = state.get("restarts", {}).get(name, [])
             last_restart = restarts[-1] if restarts else None
+            quarantine = _quarantine_reason(name, state, compliance)
 
             readiness, detail = "n/a", ""
             if svc.get("project_tag") or svc.get("freshness_table"):
@@ -522,6 +580,10 @@ def _refresh_health() -> None:
                 _add_incident(state, name, "blocked-by-dependency",
                               outcome=", ".join(blocked_by),
                               detail="restart suppressed while dependency is down")
+            was_quarantined = prev.get(name, {}).get("quarantined")
+            if quarantine and not was_quarantined:
+                _add_incident(state, name, "quarantine", outcome=quarantine,
+                              detail="restart suppressed (compliance or manual)")
 
             if _restart_warranted(svc, up, readiness, deps_stable) \
                     and svc["restart"] == "auto_heal":
@@ -529,7 +591,9 @@ def _refresh_health() -> None:
                     pass  # circuit breaker: dependency confirmed down
                 elif locked:
                     pass
-                elif _restart_eligible(svc, now, state):
+                elif quarantine:
+                    pass  # quarantined: never bounce while red/manually paused
+                elif _restart_eligible(svc, now, state, compliance):
                     outcome = "ok" if _restart_container(svc["container"]) else "failed"
                     state.setdefault("restarts", {}).setdefault(name, []).append(now.timestamp())
                     _add_incident(state, name, "restarted", outcome=outcome, detail="auto-heal")
@@ -561,6 +625,7 @@ def _refresh_health() -> None:
                 "readiness_detail": detail,
                 "blocked_by": blocked_by,
                 "locked": locked,
+                "quarantined": quarantine,  # None | 'manual' | 'compliance'
                 "last_write": last_write_map.get(name),
                 "checked_at": time.time(),
                 "uptime_7d": _uptime_7d(state, name, now),

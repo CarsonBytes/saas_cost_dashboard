@@ -82,6 +82,13 @@ python app.py                                          # http://localhost:8095
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
 
+### 2026-08-16 (Phase 2) — regulatory_updates consumer, compliance health, safe quarantine
+- **Task B — compliance task generation**: the engine now polls `regulatory_updates` (migration `002_regulatory_updates.sql`) each 600s cycle, turns unconsumed rows into PENDING `governance_rules` tasks (deduped by name), audits + Telegram-alerts each, and marks the row consumed. Testable today via a manual INSERT; RegTech Radar's pipeline writes these rows in a follow-up step.
+- **Task C — compliance health on the cards**: new `governance_rules.agent_slug` maps a rule to an agent; an OVERDUE rule for an agent turns its status dot RED even while HTTP is 200, plus a "⚠ compliance overdue" line. Rules without `agent_slug` only count into the tab's KPIs.
+- **Task D — safe quarantine (not automatic)**: quarantine means the NOC stops auto-restarting an agent — either because an operator paused it via the new proxy `/pause` (with a confirm dialog + Resume button in the UI), or because it has an OVERDUE rule. The restart proxy gained `/pause` + `/unpause` (same allow-list as restart); nothing pauses automatically.
+- **Governance tab**: compliance-health ring (agents clear vs overdue) + a Trello-like Pending/Overdue/Complied board replacing the table.
+- **Required SQL** (`governance/migrations/002_regulatory_updates.sql`): `regulatory_updates` table + `governance_rules.agent_slug` column.
+
 ### 2026-08-16 (hotfix) — Governance render-safe cache + refresh guard
 - **The Governance tab is now network-free at render time.** It reads a snapshot cache that the background compliance loop fills (`governance.refresh_cache`) instead of calling Supabase during page render — a slow/unreachable Supabase can no longer queue blocking calls on the event loop. "Mark as complied" also runs in a thread (`run.io_bound`).
 - **Background-loop refreshables are guarded** (`_refresh_safely`): they skip when no browser is connected and swallow the nicegui #3028 "client deleted but still being used" RuntimeError, which had started spamming the logs under client churn.

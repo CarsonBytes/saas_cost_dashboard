@@ -42,6 +42,8 @@ import os
 
 from nicegui import app, run, ui
 
+import httpx
+
 import alerts
 import governance  # compliance radar engine (governance/engine.py)
 import ledger  # both load .env themselves on import
@@ -177,6 +179,58 @@ async def _mark_complied(rid: str) -> None:
               else "Mark-as-complied failed", type="positive" if ok else "negative")
 
 
+_RESTART_PROXY_URL = os.environ.get("RESTART_PROXY_URL", "http://restart-proxy:8096")
+
+
+async def _proxy_action(action: str, container: str) -> bool:
+    """Call the restart proxy (restart/pause/unpause). Off the event loop."""
+    try:
+        resp = await asyncio.to_thread(
+            lambda: httpx.post(f"{_RESTART_PROXY_URL}/{action}",
+                               json={"container": container}, timeout=30))
+        return bool(resp.json().get("ok"))
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+async def _quarantine(svc: dict) -> None:
+    """Operator-initiated quarantine: pause the container via the proxy, then
+    record it so the NOC stops auto-restarting the agent. Never automatic."""
+    ok = await _proxy_action("pause", svc["container"])
+    if ok:
+        noc.quarantine_agent(svc["name"], reason="manual")
+        alerts.send_telegram(f"\U0001f6d1 {svc['name']} quarantined (operator pause)",
+                             tag="NOC", emoji="\U0001f6d1")
+        ui.notify(f"{svc['name']} paused + quarantined", type="warning")
+    else:
+        ui.notify("Pause failed (proxy unreachable?)", type="negative")
+    services_row.refresh()
+
+
+async def _resume(svc: dict) -> None:
+    """Lift a manual quarantine: unpause the container and clear the state."""
+    ok = await _proxy_action("unpause", svc["container"])
+    if ok:
+        noc.unquarantine_agent(svc["name"])
+        ui.notify(f"{svc['name']} resumed", type="positive")
+    else:
+        ui.notify("Resume failed (proxy unreachable?)", type="negative")
+    services_row.refresh()
+
+
+def _confirm_quarantine(svc: dict) -> None:
+    """Confirmation dialog before pausing a container (disruptive, manual)."""
+    with ui.dialog() as dialog, ui.card():
+        ui.label(f"Quarantine {svc['name']}?").classes("font-bold")
+        ui.label("The container will be PAUSED until you resume it manually. "
+                 "Auto-restart is suppressed while quarantined.").classes("text-sm")
+        with ui.row().classes("justify-end gap-2 mt-2"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+            ui.button("Quarantine", on_click=lambda: (dialog.close(), _quarantine(svc)))\
+                .props("color=red")
+    dialog.open()
+
+
 @ui.refreshable
 def governance_view() -> None:
     """Governance tab: Compliance Calendar, High-Impact Watchlist, Audit Trail.
@@ -196,43 +250,68 @@ def governance_view() -> None:
             ).classes("text-sm text-amber-900")
         return
 
-    # --- Section A: Compliance Calendar -------------------------------------
-    ui.label("Compliance calendar").classes("text-sm font-bold")
-    rules = governance.cached_rules()
-    if not rules:
-        ui.label("(no pending or overdue rules)").classes("text-sm text-grey")
-    else:
-        now = dt.datetime.now(dt.timezone.utc)
-        cols = [
-            {"name": "rule", "label": "Rule", "field": "rule", "sortable": True},
-            {"name": "deadline", "label": "Deadline (HKT)", "field": "deadline", "sortable": True},
-            {"name": "status", "label": "Status", "field": "status", "sortable": True},
-        ]
-        rows = []
-        for r in rules:
-            deadline = governance._parse_ts(r.get("enforcement_deadline"))
-            if deadline:
-                days = (deadline - now).total_seconds() / 86400
-                deadline_txt = f"{ledger.to_hkt(deadline):%Y-%m-%d %H:%M} ({int(days)}d left)" \
-                    if days >= 0 else f"{ledger.to_hkt(deadline):%Y-%m-%d %H:%M} (overdue {int(-days)}d)"
-            else:
-                deadline_txt = "—"
-            rows.append({"rule": r["rule_name"], "deadline": deadline_txt,
-                         "status": r["status"], "_status": r["status"]})
-        table = ui.table(columns=cols, rows=rows, row_key="rule").classes("w-full").props("dense")
-        # Status rendered as a colored badge: OVERDUE red, PENDING amber.
-        table.add_slot("body-cell-status", """
-            <q-td :props="props">
-                <q-badge :color="props.row._status === 'OVERDUE' ? 'red' : 'amber'">{{ props.value }}</q-badge>
-            </q-td>
-        """)
-        # Mark-as-complied buttons live under the table (one per active rule).
-        # Handler is async + run.io_bound so the DB calls never block the loop.
-        with ui.row().classes("gap-2 mt-1 flex-wrap"):
-            for r in rules:
-                ui.button(f"Mark '{r['rule_name']}' complied",
-                          on_click=lambda rid=r["id"]: _mark_complied(rid))\
-                    .props("dense flat color=positive")
+    # --- Section 0: Compliance Health ring -----------------------------------
+    compliance = governance.compliance_health()
+    monitored = [s for s in services.SERVICES if s.get("monitor")]
+    critical_n = sum(1 for s in monitored if compliance.get(s["name"]))
+    ok_n = len(monitored) - critical_n
+    with ui.row().classes("items-center gap-4 flex-wrap"):
+        ui.echart({
+            "tooltip": {"formatter": "{b}: {c}"},
+            "series": [{
+                "type": "pie", "radius": ["62%", "82%"], "avoidLabelOverlap": False,
+                "label": {"show": False},
+                "data": [
+                    {"value": ok_n, "name": "Compliant", "itemStyle": {"color": "#16a34a"}},
+                    {"value": critical_n, "name": "Overdue", "itemStyle": {"color": "#dc2626"}},
+                ],
+            }],
+            "title": {"text": f"Compliance health: {ok_n}/{len(monitored)} agents clear",
+                      "left": "center", "top": "88%",
+                      "textStyle": {"fontSize": 11, "fontWeight": "normal"}},
+        }).classes("w-40 h-36")
+        with ui.column().classes("gap-1"):
+            ui.label("Compliance health").classes("text-sm font-bold")
+            ui.label(f"🟢 {ok_n} agent(s) compliant").classes("text-xs text-green-700")
+            ui.label(f"🔴 {critical_n} agent(s) with overdue rules").classes("text-xs text-red-600")
+            ui.label(f"{len(governance.cached_rules())} active rule(s) · "
+                     f"{len(governance.cached_complied())} complied").classes("text-xs text-grey-6")
+
+    # --- Section A: Compliance board (Trello-like) ---------------------------
+    ui.label("Compliance board").classes("text-sm font-bold mt-4")
+    now = dt.datetime.now(dt.timezone.utc)
+    active = governance.cached_rules()
+    complied = governance.cached_complied()
+
+    def _rule_card(r: dict, status_label: str, badge_cls: str) -> None:
+        deadline = governance._parse_ts(r.get("enforcement_deadline"))
+        if deadline:
+            days = (deadline - now).total_seconds() / 86400
+            deadline_txt = f"{ledger.to_hkt(deadline):%m-%d %H:%M} ({int(days)}d left)" \
+                if days >= 0 else f"{ledger.to_hkt(deadline):%m-%d %H:%M} (overdue {int(-days)}d)"
+        else:
+            deadline_txt = "no deadline"
+        with ui.card().classes("w-full p-2"):
+            ui.label(status_label).classes(f"text-xs {badge_cls} rounded px-1")
+            ui.label(r["rule_name"]).classes("text-sm font-bold mt-1")
+            ui.label(deadline_txt).classes("text-xs text-grey-6")
+            if r["status"] != "COMPLIED":
+                ui.button("Mark complied", on_click=lambda rid=r["id"]: _mark_complied(rid)) \
+                    .props("dense flat color=positive").classes("mt-1")
+
+    with ui.row().classes("w-full items-start gap-3 flex-nowrap"):
+        for status, label, badge, rules_list in (
+                ("PENDING", "Pending", "bg-amber-100 text-amber-700", active),
+                ("OVERDUE", "Overdue", "bg-red-100 text-red-700", active),
+                ("COMPLIED", "Complied", "bg-green-100 text-green-700", complied)):
+            col_rules = [r for r in rules_list if r["status"] == status]
+            with ui.column().classes("grow bg-grey-100 rounded p-2 min-h-[80px]"):
+                ui.label(f"{label} ({len(col_rules)})").classes(
+                    f"text-xs font-bold {badge} rounded px-1")
+                if not col_rules:
+                    ui.label("(none)").classes("text-xs text-grey-6")
+                for r in col_rules:
+                    _rule_card(r, label, badge)
 
     # --- Section B: High-Impact Watchlist -----------------------------------
     ui.label("High-impact watchlist").classes("text-sm font-bold mt-4")
@@ -282,8 +361,11 @@ def services_row() -> None:
     # instead of letting optional lines change the footprint. Uses a plain
     # div rather than ui.row so its own `display:flex` can't fight the grid.
     with ui.element("div").classes("w-full grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3"):
+        compliance = governance.compliance_health()  # agent -> OVERDUE rule names (render-safe cache)
         for svc in services.SERVICES:
             status = noc.get_status(svc["name"])
+            overdue = compliance.get(svc["name"], [])
+            quarantined = bool(status and status.get("quarantined"))
             with ui.card().classes("w-full h-full min-h-[120px]"):
                 with ui.row().classes("items-center gap-2"):
                     # The icon is identity, always neutral; the round dot
@@ -292,7 +374,11 @@ def services_row() -> None:
                     ui.icon(svc["icon"], color="grey-600").classes("text-2xl")
                     if svc["monitor"]:
                         up = status["up"] if status else None
-                        if up is None:
+                        if overdue or quarantined:
+                            # Compliance/operator quarantine outranks HTTP
+                            # health: "operationally fine, compliance dead".
+                            dot_color = "bg-red-500"
+                        elif up is None:
                             dot_color = "bg-grey-400"       # not checked yet
                         elif not up:
                             dot_color = "bg-red-500"        # down
@@ -347,6 +433,17 @@ def services_row() -> None:
                         if status.get("uptime_7d") is not None:
                             ui.label(f"7d uptime: {status['uptime_7d']:.1f}%").classes(
                                 "text-xs text-grey-6 mt-1")
+                        if overdue:
+                            ui.label("⚠ compliance overdue: " + ", ".join(overdue)).classes(
+                                "text-xs text-red-600 mt-1")
+                        if status.get("quarantined") == "manual":
+                            ui.label("quarantined (paused)").classes(
+                                "text-xs bg-red-100 text-red-700 rounded px-1 mt-1")
+                            ui.button("Resume", on_click=lambda s=svc: _resume(s)) \
+                                .props("dense flat color=positive")
+                        elif svc.get("quarantinable") and svc.get("container"):
+                            ui.button("Quarantine (pause)", on_click=lambda s=svc: _confirm_quarantine(s)) \
+                                .props("dense flat color=red")
                         if svc["restart"] == "auto_heal" and status.get("locked"):
                             ui.button("Clear lock", on_click=lambda s=svc: (
                                 noc.clear_lock(s["name"]), services_row.refresh())) \
