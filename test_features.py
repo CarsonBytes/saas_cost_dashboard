@@ -128,3 +128,110 @@ def test_hkt_day_start_conversion():
     start = ledger._hkt_day_start_utc("2026-08-26")
     assert start.utcoffset() == dt.timedelta(0)
     assert start.strftime("%Y-%m-%d %H:%M") == "2026-08-25 16:00"
+
+
+# ---- A1: supervised auto-unlock with escalation --------------------------------
+
+def _meta(locked_min_ago: float, strikes: int = 1, sticky: bool = False):
+    now = dt.datetime.now(dt.timezone.utc)
+    return {"locked_at": (now - dt.timedelta(minutes=locked_min_ago)).isoformat(),
+            "strikes": strikes, "sticky": sticky}
+
+
+def test_auto_unlock_waits_for_cooldown_then_needs_stable_deps():
+    now = dt.datetime.now(dt.timezone.utc)
+    # inside the 60-min cooldown: nothing happens
+    assert noc._auto_unlock_decision(_meta(30), now, deps_stable=True) is None
+    # elapsed + dependencies stable -> one supervised recovery
+    assert noc._auto_unlock_decision(_meta(61), now, deps_stable=True) == "unlock"
+    # elapsed but a dependency is still down -> stay locked, retry later
+    assert noc._auto_unlock_decision(_meta(61), now, deps_stable=False) == "wait-deps"
+    # no metadata at all -> never decide from nothing
+    assert noc._auto_unlock_decision({}, now, deps_stable=True) is None
+
+
+def test_second_strike_is_sticky_and_doubles_cooldown():
+    now = dt.datetime.now(dt.timezone.utc)
+    m = _meta(90, strikes=2, sticky=True)
+    # sticky: even elapsed + stable deps NEVER auto-unlocks -- two supervised
+    # recoveries failing means restarts aren't healing; only a human proceeds
+    assert noc._auto_unlock_decision(m, now, deps_stable=True) is None
+
+
+def test_lock_strikes_escalate_within_window_reset_outside(monkeypatch):
+    monkeypatch.setattr(noc, "_send_lock_alert", lambda name: True)
+    now = dt.datetime.now(dt.timezone.utc)
+    state = {}
+    noc._lock_agent(state, "X", now)          # fresh problem -> strike 1
+    meta = state["lock_meta"]["X"]
+    assert meta["strikes"] == 1 and not meta["sticky"]
+    # simulate a supervised auto-unlock...
+    meta["last_auto_unlock"] = now.timestamp()
+    meta.pop("locked_at")
+    state.get("locks", {}).pop("X", None)
+    # ...and a re-lock 2h later (inside the 6h window) escalates to sticky
+    noc._lock_agent(state, "X", now + dt.timedelta(hours=2))
+    meta = state["lock_meta"]["X"]
+    assert meta["strikes"] == 2 and meta["sticky"] is True
+    # ...but a lock >6h after the last auto-unlock starts fresh at strike 1
+    meta["last_auto_unlock"] = (now - dt.timedelta(hours=7)).timestamp()
+    noc._lock_agent(state, "X", now)
+    meta = state["lock_meta"]["X"]
+    assert meta["strikes"] == 1 and not meta["sticky"]
+
+
+# ---- A3: maintenance window ------------------------------------------------------
+
+def test_maintenance_window_lifecycle(tmp_path, monkeypatch):
+    state_file = tmp_path / "noc_state.json"
+    monkeypatch.setattr(noc, "_STATE_FILE", state_file)
+    try:
+        assert noc.maintenance_active() is None
+        noc.set_maintenance(30)
+        assert noc.maintenance_active() is not None
+        assert noc.maintenance_active("Quant Trading (Paper)") is not None  # global covers all
+        assert noc.maintenance_remaining_min() >= 29
+        noc.clear_maintenance()
+        assert noc.maintenance_active() is None
+        # scoped window: named agents covered, others not
+        noc.set_maintenance(15, scope="Quant Trading (Paper)")
+        assert noc.maintenance_active("Quant Trading (Paper)") is not None
+        assert noc.maintenance_active("Study Platform") is None
+        noc.clear_maintenance()
+    finally:
+        if state_file.exists():
+            state_file.unlink()
+
+
+# ---- A2: Telegram command handlers -------------------------------------------------
+
+def test_command_handlers(monkeypatch):
+    import commands
+    unlocked, muted, cleared = [], [], []
+    monkeypatch.setattr(noc, "clear_lock", lambda n: unlocked.append(n))
+    monkeypatch.setattr(noc, "set_maintenance", lambda m, scope="all": muted.append((m, scope)))
+    monkeypatch.setattr(noc, "clear_maintenance", lambda: cleared.append(True))
+
+    # /unlock matches by substring, demands specificity on ambiguity
+    reply = commands.handle_text("/unlock paper")
+    assert reply and "Quant Trading (Paper)" in reply   # unlocked, or not locked
+    assert unlocked == ["Quant Trading (Paper)"]
+    ambiguous = commands.handle_text("/unlock quant")
+    assert ambiguous and "specific" in ambiguous.lower()   # Paper AND Live match
+    # unknown agent -> helpful, no crash
+    assert "0 match" in commands.handle_text("/unlock zzz")
+
+    # /mute global vs scoped
+    assert "maintenance" in commands.handle_text("/mute 30").lower()
+    assert muted[-1] == (30, "all")
+    commands.handle_text("/mute 15 study")
+    assert muted[-1][0] == 15 and "Study Platform" in muted[-1][1]
+    assert "usage" in commands.handle_text("/mute").lower()
+
+    # /status lists monitored agents and never raises without network extras
+    status = commands.handle_text("/status")
+    assert "Quant Trading (Paper)" in status and "$" in status
+
+    # non-commands stay silent
+    assert commands.handle_text("hello?") is None
+    assert commands.handle_text("/definitely-not-a-command x") is None

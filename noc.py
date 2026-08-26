@@ -429,7 +429,21 @@ def _restart_eligible(svc: dict, now: dt.datetime, state: dict,
 
 def _lock_agent(state: dict, name: str, now: dt.datetime) -> None:
     state.setdefault("locks", {})[name] = now.isoformat()
-    _add_incident(state, name, "locked", outcome="auto-heal disabled")
+    # Strike bookkeeping (Phase 5 A1): locks tied together by an AUTO-unlock
+    # within 6h are the same underlying failure repeating -- strikes escalate
+    # (cooldown doubles, 2nd strike = sticky manual-only). An operator's
+    # manual Clear resets strikes entirely (clear_lock); a lock arriving >6h
+    # after the last auto-unlock is treated as a fresh problem.
+    meta = state.setdefault("lock_meta", {}).setdefault(name, {})
+    last_auto = meta.get("last_auto_unlock")
+    within_window = (last_auto is not None
+                     and (now.timestamp() - last_auto) < _LOCK_STICKY_WINDOW_SEC)
+    meta["strikes"] = (meta.get("strikes", 0) + 1) if within_window else 1
+    meta["sticky"] = meta["strikes"] >= 2
+    meta["locked_at"] = now.isoformat()
+    _add_incident(state, name, "locked",
+                  outcome=f"auto-heal disabled (strike {meta['strikes']}"
+                          + (", sticky" if meta["sticky"] else "") + ")")
     if _send_lock_alert(name):
         _add_incident(state, name, "alert sent", outcome="telegram", detail="lock alert")
     else:
@@ -445,12 +459,49 @@ def _lock_agent(state: dict, name: str, now: dt.datetime) -> None:
                       detail="lock alert queued for retry -- see dashboard banner")
 
 
+# ---- Phase 5 A1: supervised auto-unlock with escalation ---------------------
+# The manual-only lock protected against a multi-operator failure mode
+# ("someone carelessly clicks clear") while taxing the only person who can
+# clear it -- a flapping dependency at 2am left the agent dead until morning
+# even though the dependency had recovered at 2:20. New model: self-recover
+# with guardrails, keep the human informed.
+_LOCK_BASE_COOLDOWN_SEC = 3600      # first strike: supervised recovery after 1h
+_LOCK_STICKY_WINDOW_SEC = 6 * 3600  # re-lock within 6h of an auto-unlock escalates
+
+
+def _auto_unlock_decision(meta: dict, now: dt.datetime, deps_stable: bool) -> str | None:
+    """Decision for one locked agent this cycle: 'unlock' | 'wait-deps' | None.
+
+    None        = cooldown not elapsed yet, no usable metadata, or STICKY
+                  (2nd+ strike within the window -- restarts demonstrably
+                  aren't healing; that is exactly what the lock exists to
+                  stop, so only a human proceeds).
+    'unlock'    = cooldown elapsed AND dependencies confirmed healthy for 2+
+                  consecutive cycles (the same flapping-proof hysteresis that
+                  gates staleness restarts) -- safe to attempt one supervised
+                  recovery.
+    'wait-deps' = cooldown elapsed but dependencies still down -- stay locked,
+                  re-evaluate next cycle; unlocking into a known-down
+                  Supabase/LLM API would just manufacture another restart.
+    Pure -- testable without state files."""
+    if not meta or meta.get("sticky") or not meta.get("locked_at"):
+        return None
+    locked_at = dt.datetime.fromisoformat(meta["locked_at"])
+    if locked_at.tzinfo is None:
+        locked_at = locked_at.replace(tzinfo=dt.timezone.utc)
+    cooldown = _LOCK_BASE_COOLDOWN_SEC * (2 ** (meta.get("strikes", 1) - 1))
+    if (now - locked_at).total_seconds() < cooldown:
+        return None
+    return "unlock" if deps_stable else "wait-deps"
+
+
 def _send_lock_alert(name: str) -> bool:
     """Send the lock Telegram alert, retrying once after a short pause -- the
     2026-08-14 failure was a transient network blip (the next alert eight
     seconds later landed), so one immediate retry would have caught it."""
     msg = (f"{name} locked: {_RESTART_LOCK_COUNT} restarts within the last hour "
-           f"-- clear the lock from the dashboard")
+           f"-- auto-unlock will be attempted after a cooldown, or clear it from "
+           f"the dashboard / reply /unlock")
     if alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8"):
         return True
     time.sleep(5)
@@ -492,13 +543,16 @@ def dismiss_pending() -> None:
 
 def clear_lock(name: str) -> None:
     """UI action: unlock an auto-heal agent and reset its restart window so the
-    cooldown doesn't immediately re-lock it. Logged to the incident log."""
+    cooldown doesn't immediately re-lock it. Logged to the incident log.
+    Operator override also resets strike escalation -- the human has said
+    'it's fine', so the next lock starts fresh at strike 1."""
     with _STATE_LOCK:
         state = _load_state()
         if name in state.get("locks", {}):
             del state["locks"][name]
             state.get("restarts", {}).pop(name, None)
             _add_incident(state, name, "unlocked", outcome="restart window reset")
+        state.get("lock_meta", {}).pop(name, None)
         state.get("pending_alerts", {}).pop(name, None)  # stale once unlocked
         _save_state(state)
     if name in _STATUS_CACHE:
@@ -794,6 +848,62 @@ def _uptime_7d(state: dict, name: str, now: dt.datetime | None = None) -> float 
     return round(ok / total * 100, 1) if total else None
 
 
+# ---- Phase 5 A3: maintenance window -----------------------------------------
+# Deploys bounce containers outside this dashboard's knowledge; each bounce
+# reads as a liveness failure and feeds the very restart/lock machinery an
+# operator is trying to keep quiet. A maintenance window suppresses ACTIONS
+# (restarts, alert_only alerts, blocked-by incidents) and uptime recording --
+# "no data" during planned work must not score as downtime -- while probes
+# still run so the cards stay honest afterwards.
+
+def set_maintenance(minutes: int, scope: str = "all") -> None:
+    """Arm a maintenance window. scope 'all' covers every agent; otherwise a
+    comma-separated agent-name list (Telegram: /mute 30 quant-paper)."""
+    until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
+    with _STATE_LOCK:
+        state = _load_state()
+        state["maintenance"] = {"until": until.isoformat(), "scope": scope}
+        _save_state(state)
+
+
+def clear_maintenance() -> None:
+    with _STATE_LOCK:
+        state = _load_state()
+        if state.pop("maintenance", None) is not None:
+            _add_incident(state, "(global)", "maintenance-cleared",
+                          outcome="monitoring resumed")
+            _save_state(state)
+
+
+def maintenance_active(name: str | None = None,
+                       now: dt.datetime | None = None) -> dict | None:
+    """The active maintenance entry covering `name` (or any, when None), or
+    None. Read-only; safe from render paths."""
+    entry = _load_state().get("maintenance")
+    if not entry:
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    try:
+        until = dt.datetime.fromisoformat(entry["until"])
+    except (KeyError, ValueError):
+        return None
+    if now >= until:
+        return None
+    scope = entry.get("scope", "all")
+    if scope != "all" and name and name not in scope.split(","):
+        return None
+    return entry
+
+
+def maintenance_remaining_min() -> int | None:
+    """Whole minutes left in the global window, for the dashboard banner."""
+    entry = maintenance_active()
+    if not entry:
+        return None
+    until = dt.datetime.fromisoformat(entry["until"])
+    return max(1, int((until - dt.datetime.now(dt.timezone.utc)).total_seconds() // 60))
+
+
 # ---- state file (same pattern as alerts.py) --------------------------------
 
 def _load_state() -> dict:
@@ -852,6 +962,7 @@ def _refresh_health() -> None:
             name = svc["name"]
             up = up_map[name]
             locked = name in state.get("locks", {})
+            muted = maintenance_active(name, now)  # Phase 5 A3
             restarts = state.get("restarts", {}).get(name, [])
             last_restart = restarts[-1] if restarts else None
             if svc.get("quarantinable"):
@@ -866,7 +977,7 @@ def _refresh_health() -> None:
             unhealthy = (not up) or (readiness == "stale")
             blocked_by = list(confirmed_down) if (unhealthy and confirmed_down) else []
             was_blocked = bool(prev.get(name, {}).get("blocked_by"))
-            if blocked_by and not was_blocked:
+            if blocked_by and not was_blocked and not muted:
                 _add_incident(state, name, "blocked-by-dependency",
                               outcome=", ".join(blocked_by),
                               detail="restart suppressed while dependency is down")
@@ -915,9 +1026,62 @@ def _refresh_health() -> None:
                 _add_incident(state, name, "quarantine", outcome=quarantine,
                               detail="restart suppressed (compliance or manual)")
 
+            # Phase 5 A1: supervised auto-unlock. Cooldown elapsed + deps
+            # confirmed stable -> clear, alert, and attempt ONE recovery
+            # restart. Deliberately bypasses _restart_eligible's grace checks:
+            # this IS the supervised recovery, not another blind auto-heal.
+            lock_info = None
+            if locked:
+                meta = state.get("lock_meta", {}).get(name, {})
+                decision = _auto_unlock_decision(meta, now, deps_stable)
+                strikes = meta.get("strikes", 1)
+                locked_at_iso = meta.get("locked_at")
+                if meta.get("sticky"):
+                    lock_info = {"sticky": True, "strikes": strikes,
+                                 "unlocks_in_min": None}
+                elif locked_at_iso:
+                    locked_at = dt.datetime.fromisoformat(locked_at_iso)
+                    if locked_at.tzinfo is None:
+                        locked_at = locked_at.replace(tzinfo=dt.timezone.utc)
+                    cooldown_sec = _LOCK_BASE_COOLDOWN_SEC * (2 ** (strikes - 1))
+                    remaining = max(0, cooldown_sec
+                                    - (now - locked_at).total_seconds())
+                    lock_info = {"sticky": False, "strikes": strikes,
+                                 "unlocks_in_min": int(remaining // 60) + (1 if remaining % 60 else 0)}
+                else:
+                    # Legacy lock (created before strike bookkeeping existed):
+                    # no known locked-at time -> can't schedule a supervised
+                    # recovery; show it as needing the operator instead of
+                    # crashing the whole monitoring cycle (found live 2026-08-26:
+                    # the deployed state file held a pre-Phase-5 lock).
+                    lock_info = {"sticky": True, "strikes": strikes,
+                                 "unlocks_in_min": None}
+                if decision == "unlock" and svc.get("container"):
+                    del state["locks"][name]
+                    state.get("restarts", {}).pop(name, None)
+                    meta["last_auto_unlock"] = now.timestamp()
+                    meta["locked_at"] = None
+                    locked = False
+                    _add_incident(state, name, "auto-unlocked",
+                                  outcome=f"cooldown elapsed ({strikes} strike(s)), deps stable",
+                                  detail="one supervised recovery restart follows")
+                    alerts.send_telegram(
+                        f"\u2705 {name} auto-unlocked after cooldown -- attempting "
+                        f"one supervised recovery restart", tag="NOC", emoji="\u2705")
+                    outcome = "ok" if _restart_container(svc["container"]) else "failed"
+                    state.setdefault("restarts", {}).setdefault(name, []).append(now.timestamp())
+                    window = now.timestamp() - _RESTART_WINDOW_SEC
+                    state["restarts"][name] = [ts for ts in state["restarts"][name]
+                                               if ts >= window]
+                    _add_incident(state, name, "restarted", outcome=outcome,
+                                  detail="supervised recovery after auto-unlock")
+                    locked = name in state.get("locks", {})  # re-lock would need 3 fresh restarts
+
             if _restart_warranted(svc, up, readiness, deps_stable) \
                     and svc["restart"] == "auto_heal":
-                if blocked_by:
+                if muted:
+                    pass  # maintenance window: observe, don't act (A3)
+                elif blocked_by:
                     pass  # circuit breaker: dependency confirmed down
                 elif locked:
                     pass
@@ -937,11 +1101,13 @@ def _refresh_health() -> None:
                         locked = True
             elif unhealthy and svc["restart"] == "alert_only" \
                     and not prev.get(name, {}).get("alerted_unhealthy"):
+                if muted:
+                    pass  # maintenance window: record, don't page (A3)
                 # ADDED 2026-08-17: this used to always say "liveness check
                 # failed" -- fine while every alert_only agent was liveness-
                 # only, wrong the moment one (Quant Live) can also go
                 # unhealthy purely from staleness while still reachable.
-                if not up:
+                elif not up:
                     reason = "liveness check failed"
                     incident_detail = "down alert"
                 else:
@@ -959,14 +1125,19 @@ def _refresh_health() -> None:
             # simply having no users) counts healthy, the same way a skipped
             # check (grace / market closed) already does.
             healthy = _check_healthy(svc, up, readiness)
-            _record_check(state, name, healthy, now)
+            if muted:
+                pass  # planned work: "no data" must not score as downtime (A3)
+            else:
+                _record_check(state, name, healthy, now)
 
             _STATUS_CACHE[name] = {
                 "up": up,
                 "readiness": readiness,
                 "readiness_detail": detail,
-                "blocked_by": blocked_by,
+                "blocked_by": blocked_by if not muted else [],
                 "locked": locked,
+                "lock_info": lock_info,
+                "muted": bool(muted),
                 "quarantined": quarantine,  # None | 'manual' | 'compliance'
                 "last_write": last_write_map.get(name),
                 "checked_at": time.time(),

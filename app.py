@@ -38,6 +38,7 @@ import asyncio
 import csv
 import datetime as dt
 import io
+import logging
 import os
 
 from nicegui import app, run, ui
@@ -45,10 +46,13 @@ from nicegui import app, run, ui
 import httpx
 
 import alerts
+import commands  # Telegram control plane (/unlock /status /mute)
 import governance  # compliance radar engine (governance/engine.py)
 import ledger  # both load .env themselves on import
 import noc
 import services
+
+log = logging.getLogger("command-deck")
 
 STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch": None,
                "alert": None,
@@ -260,6 +264,24 @@ def noc_banner() -> None:
         ).classes("text-red-800 font-medium")
         ui.button("Dismiss", on_click=lambda: (noc.dismiss_pending(), refresh_all())) \
             .props("dense flat color=red")
+
+
+@ui.refreshable
+def maintenance_banner() -> None:
+    """Active maintenance window (Phase 5 A3): NOC actions suppressed so a
+    deploy bouncing containers doesn't trip restarts/uptime. Amber, with one-
+    click resume."""
+    remaining = noc.maintenance_remaining_min()
+    if remaining is None:
+        return
+    with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-3"):
+        ui.icon("build", color="amber-700")
+        ui.label(f"Monitoring paused ({remaining} min remaining) -- restarts, "
+                 f"alerts and uptime recording are suppressed.").classes(
+            "text-amber-900 font-medium")
+        ui.button("Resume monitoring now",
+                  on_click=lambda: (noc.clear_maintenance(), refresh_all())) \
+            .props("dense flat color=amber-8").mark("resume-mute")
 
 
 def _impact_badge(impact: str | None) -> None:
@@ -677,8 +699,17 @@ def services_row() -> None:
                             .props("dense flat round size=sm color=grey-6") \
                             .tooltip(f"Show only {svc['name']}'s costs")
                     if status and status.get("locked"):
-                        ui.label("Locked").classes(
-                            "text-xs bg-red-100 text-red-700 rounded px-1")
+                        # Phase 5 A1: say WHAT KIND of lock -- auto-unlock
+                        # pending vs sticky "needs you" -- so the red button
+                        # only demands attention when it truly requires it.
+                        info = status.get("lock_info") or {}
+                        if info.get("sticky"):
+                            ui.label("Locked · needs you (2nd strike)").classes(
+                                "text-xs bg-red-100 text-red-700 rounded px-1")
+                        else:
+                            ui.label(f"Locked · auto-unlock "
+                                     f"~{info.get('unlocks_in_min', '?')}m").classes(
+                                "text-xs bg-amber-100 text-amber-800 rounded px-1")
                 ui.label(svc["desc"]).classes("text-xs text-grey-6")
                 with ui.row().classes("items-center gap-3 mt-1 flex-wrap"):
                     for label, url in svc["links"]:
@@ -699,6 +730,11 @@ def services_row() -> None:
                 # stays visually even without hiding any information.
                 with ui.column().classes("w-full mt-1 min-h-[40px] justify-start"):
                     if svc["monitor"] and status:
+                        if status.get("muted"):
+                            # Phase 5 A3: the card says why it's quiet -- the
+                            # NOC is observing, not acting, by operator choice.
+                            ui.label("monitoring paused (maintenance)").classes(
+                                "text-xs text-grey-6")
                         if status["up"] is False:
                             ui.label("down").classes("text-xs text-red-600")
                         elif status["readiness"] == "stale":
@@ -763,6 +799,21 @@ def services_row() -> None:
                             ui.button("Clear lock", on_click=lambda s=svc: (
                                 noc.clear_lock(s["name"]), services_row.refresh())) \
                                 .props("dense flat color=red")
+                        # Phase 5 A4: this agent's own recent incidents, inline
+                        # -- deciding "clear the lock or investigate" shouldn't
+                        # require scrolling the shared log.
+                        agent_incidents = [i for i in noc.get_incidents()
+                                           if i["agent"] == svc["name"]][:5]
+                        if agent_incidents:
+                            with ui.expansion(
+                                    f"recent incidents ({len(agent_incidents)})") \
+                                    .classes("w-full text-xs").props("dense icon=history"):
+                                for i in agent_incidents:
+                                    ts = ledger.to_hkt(i["ts"]).strftime("%m-%d %H:%M")
+                                    line = f"{ts} · {i['event']}"
+                                    if i.get("outcome"):
+                                        line += f" · {i['outcome']}"
+                                    ui.label(line).classes("text-xs text-grey-7")
 
 
 _INCIDENT_FILTER = {"q": ""}
@@ -1028,6 +1079,7 @@ def _reliability_tab(data: dict) -> None:
 def refresh_all() -> None:
     alert_banner.refresh()
     noc_banner.refresh()
+    maintenance_banner.refresh()
     services_row.refresh()
     project_filter_chip.refresh()
     _incident_log_table.refresh()
@@ -1068,8 +1120,20 @@ async def _alert_check_loop() -> None:
 async def _services_check_loop() -> None:
     while True:
         await asyncio.to_thread(noc.refresh_health)
-        _refresh_safely(noc_banner, services_row, _incident_log_table)
+        _refresh_safely(noc_banner, maintenance_banner, services_row, _incident_log_table)
         await asyncio.sleep(_SERVICES_CHECK_INTERVAL_SEC)
+
+
+async def _telegram_command_loop() -> None:
+    """Phase 5 A2: long-poll the operator's chat for /unlock /status /mute.
+    Its own task -- a hung Telegram call can't stall the health loops (same
+    isolation pattern as every other loop here)."""
+    while True:
+        try:
+            await asyncio.to_thread(commands.poll_updates)
+        except Exception:                              # noqa: BLE001
+            log.exception("telegram command loop failed")
+        await asyncio.sleep(1)
 
 
 async def _risk_ledger_loop() -> None:
@@ -1119,6 +1183,30 @@ async def main_page() -> None:
                 ui.button("Refresh", icon="refresh",
                           on_click=lambda: (fetch_stats(), refresh_all())) \
                     .props("color=primary")
+
+        def _pause_monitoring(minutes: int) -> None:
+            noc.set_maintenance(minutes)
+            ui.notify(f"Monitoring paused for {minutes} min", type="info")
+            refresh_all()
+
+        def _pause_dialog() -> None:
+            with ui.dialog() as dialog, ui.card():
+                ui.label("Pause NOC monitoring?").classes("font-bold")
+                ui.label("Restarts, alerts and uptime recording are suppressed "
+                         "(probes keep running). Use before a deploy so bouncing "
+                         "containers don't trip the auto-heal machinery."
+                         ).classes("text-sm text-grey-7")
+                with ui.row().classes("justify-end gap-2 mt-2"):
+                    for m in (15, 30, 60):
+                        ui.button(f"{m}m", on_click=lambda m_=m: (
+                            dialog.close(), _pause_monitoring(m_))) \
+                            .props("dense outline").mark(f"mute-{m}")
+                    ui.button("Cancel", on_click=dialog.close).props("flat")
+            dialog.open()
+
+        ui.button("Pause monitoring", icon="build",
+                  on_click=_pause_dialog).props("dense outline color=grey-8") \
+            .mark("mute-btn")
         ui.label("What my agents cost, and whether they're up -- LLM spend across "
                  "quant, study, and event-radar from the shared usage ledger, plus "
                  "live health, auto-heal, and an incident log for every monitored "
@@ -1127,6 +1215,7 @@ async def main_page() -> None:
 
         alert_banner()
         noc_banner()
+        maintenance_banner()
         services_row()
 
         def _set_range(e) -> None:
@@ -1213,6 +1302,7 @@ app.on_startup(lambda: asyncio.create_task(_alert_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_services_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_risk_ledger_loop()))
 app.on_startup(lambda: asyncio.create_task(_compliance_loop()))
+app.on_startup(lambda: asyncio.create_task(_telegram_command_loop()))
 
 # storage_secret enables app.storage.user -- used to persist the dark-mode
 # toggle across reloads. Any non-empty string; not a user-facing secret.

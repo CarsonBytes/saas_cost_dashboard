@@ -16,12 +16,13 @@ import app  # noqa: F401 -- registers the page; ui.run stays guarded
 MAIN = pytest.mark.nicegui_main_file("deck_test_main.py")
 
 
-def _one(user: User, marker: str):
+def _one(user: User, marker: str, required: bool = True):
     from nicegui import ElementFilter
     with user:
         found = list(ElementFilter(marker=marker))
-    assert found, f"no element marked {marker!r}"
-    return found[0]
+    if required:
+        assert found, f"no element marked {marker!r}"
+    return found[0] if found else None
 
 
 def _set(user: User, element, value) -> None:
@@ -203,3 +204,84 @@ async def test_csv_exports_execute(user: User):
         deck._download_call_types_csv(data)
         deck._download_model_usage_csv(data)
         deck._download_latency_csv(data)
+
+
+# ---- A3: maintenance pause/resume ---------------------------------------------------
+
+@MAIN
+async def test_maintenance_pause_and_resume(user: User):
+    import asyncio
+    import noc
+    try:
+        await user.open("/")
+        _trigger(user, _one(user, "mute-btn"), "click")       # opens the dialog
+        _trigger(user, _one(user, "mute-30"), "click")        # pick 30 minutes
+        await user.should_see("Monitoring paused")
+        for _ in range(10):              # banner renders async after the handler
+            if _one(user, "resume-mute", required=False):
+                break
+            await asyncio.sleep(0.5)
+        _trigger(user, _one(user, "resume-mute"), "click")
+        await user.should_not_see("Resume monitoring now")
+    finally:
+        noc.clear_maintenance()                                # never leave it armed
+
+
+# ---- A1: lock states on cards --------------------------------------------------------
+
+def _inject_lock(name: str, sticky: bool, unlocks_in_min: int | None) -> None:
+    import noc
+    st = noc._STATUS_CACHE.setdefault(name, {
+        "up": True, "readiness": "n/a", "readiness_detail": "", "blocked_by": [],
+        "locked": False, "quarantined": None, "last_write": None,
+        "checked_at": 0.0, "uptime_7d": None, "alerted_unhealthy": False,
+    })
+    st.update({"locked": True,
+               "lock_info": {"sticky": sticky, "strikes": 2 if sticky else 1,
+                             "unlocks_in_min": unlocks_in_min}})
+
+
+@MAIN
+async def test_card_shows_countdown_for_first_strike_lock(user: User, monkeypatch):
+    import noc
+    monkeypatch.setattr(noc, "refresh_health", lambda: None)  # keep the injection intact
+    name = "Quant Trading (Paper)"
+    old = dict(noc._STATUS_CACHE.get(name, {}))
+    _inject_lock(name, sticky=False, unlocks_in_min=45)
+    try:
+        await user.open("/")
+        await user.should_see("auto-unlock ~45m")
+    finally:
+        noc._STATUS_CACHE[name] = old
+
+
+@MAIN
+async def test_card_shows_needs_you_for_sticky_lock(user: User, monkeypatch):
+    import noc
+    monkeypatch.setattr(noc, "refresh_health", lambda: None)
+    name = "Quant Trading (Live)"
+    old = dict(noc._STATUS_CACHE.get(name, {}))
+    _inject_lock(name, sticky=True, unlocks_in_min=None)
+    try:
+        await user.open("/")
+        await user.should_see("Locked · needs you (2nd strike)")
+    finally:
+        noc._STATUS_CACHE[name] = old
+
+
+# ---- A4: per-agent incidents expander -------------------------------------------------
+
+@MAIN
+async def test_agent_cards_show_recent_incidents_expander(user: User):
+    await user.open("/")
+    await user.should_see("recent incidents")
+
+
+# ---- A2: command handlers (UI-independent surface already unit-tested;
+#      here just prove the loop's entry point is wired and safe offline) -------
+
+@MAIN
+async def test_commands_module_wired(user: User):
+    import commands
+    assert callable(commands.handle_text)
+    assert commands.handle_text("/help").startswith("commands:")
