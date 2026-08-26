@@ -1343,44 +1343,45 @@ async def main_page() -> None:
 
         services_row()
 
-    # Full-width sticky controls: deck scrolls away, this bar stays pinned and
-    # spans the entire viewport width (not just the max-w column) so it reads
-    # as a proper app chrome. Content inside stays centered at max-w.
+    # Full-width sticky controls: responsive single flex that reflows by width,
+    # not by hard 3 rows — deck scrolls away, this bar stays pinned edge-to-edge.
+    # Wide: chip | Range+Custom | Alert+Budget on one line (~48px). Narrow: wraps to 2 lines.
     with ui.element("div").classes("sticky top-0 z-20 bg-white border-b border-zinc-200 shadow-sm w-screen ml-[calc(-50vw+50%)]"):
-        with ui.column().classes("max-w-[1100px] mx-auto px-4 py-3 gap-2"):
-            project_filter_chip()
-            with ui.row().classes("items-center gap-2 flex-wrap"):
-                ui.label("Range:").classes("text-sm")
+        with ui.element("div").classes("max-w-[1100px] mx-auto px-4 py-2 flex flex-wrap items-center gap-3 gap-y-2"):
+            with ui.element("div").classes("shrink-0"):
+                project_filter_chip()
+            with ui.element("div").classes("flex flex-wrap items-center gap-2 grow min-w-[380px] basis-[420px]"):
+                ui.label("Range:").classes("text-sm shrink-0")
                 ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
-                          on_change=lambda e: (_set_range(e))).props("dense")
-                ui.label("Custom:").classes("text-sm text-grey-6")
+                          on_change=lambda e: (_set_range(e))).props("dense").classes("shrink-0")
+                ui.label("Custom:").classes("text-sm text-grey-6 shrink-0")
                 start_date = ui.input(placeholder="Start YYYY-MM-DD") \
-                    .props("dense outlined style='max-width:130px'").mark("range-start")
-                ui.label("→").classes("text-xs text-grey-6")
+                    .props("dense outlined style='max-width:130px'").classes("shrink-0").mark("range-start")
+                ui.label("→").classes("text-xs text-grey-6 shrink-0")
                 end_date = ui.input(placeholder="End YYYY-MM-DD") \
-                    .props("dense outlined style='max-width:130px'").mark("range-end")
-                ui.button("Apply", on_click=lambda: _apply_custom()).props("dense flat").mark("apply-custom")
-                ui.button(icon="close", on_click=lambda: _clear_custom()).props("dense flat round size=sm") \
+                    .props("dense outlined style='max-width:130px'").classes("shrink-0").mark("range-end")
+                ui.button("Apply", on_click=lambda: _apply_custom()).props("dense flat").classes("shrink-0").mark("apply-custom")
+                ui.button(icon="close", on_click=lambda: _clear_custom()).props("dense flat round size=sm").classes("shrink-0") \
                     .tooltip("Back to preset range").mark("clear-custom")
 
-            with ui.row().classes("items-center gap-2 flex-wrap"):
-                ui.label("Alert threshold ($/day):").classes("text-sm")
+            with ui.element("div").classes("flex flex-wrap items-center gap-2 shrink-0 ml-auto"):
+                ui.label("Alert threshold ($/day):").classes("text-sm shrink-0")
                 threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
-                                            format="%.2f").props("dense outlined").classes("w-24") \
+                                            format="%.2f").props("dense outlined").classes("w-[88px] sm:w-24 shrink-0") \
                     .mark("threshold-input")
 
                 budget_label = ("Monthly budget ($/mo):" if alerts.MONTHLY_BUDGET_USD
                                 else f"Budget (implied ${alerts.effective_monthly_budget():.2f}/mo):")
-                ui.label(budget_label).classes("text-sm text-grey-6")
+                ui.label(budget_label).classes("text-sm text-grey-6 shrink-0")
                 budget_input = ui.number(value=alerts.MONTHLY_BUDGET_USD, min=0, step=5,
-                                         format="%.2f").props("dense outlined").classes("w-28") \
+                                         format="%.2f").props("dense outlined").classes("w-[96px] sm:w-28 shrink-0") \
                 .mark("budget-input")
 
-            # Enter-to-save on both inputs (B5): a number field's natural
-            # commit gesture shouldn't dead-end.
-            threshold_input.on("keydown.enter", _save_settings)
-            budget_input.on("keydown.enter", _save_settings)
-            ui.button("Save", on_click=_save_settings).props("dense flat")
+                # Enter-to-save on both inputs (B5): a number field's natural
+                # commit gesture shouldn't dead-end.
+                threshold_input.on("keydown.enter", _save_settings)
+                budget_input.on("keydown.enter", _save_settings)
+                ui.button("Save", on_click=_save_settings).props("dense flat").classes("shrink-0")
 
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4 pt-2"):
         dashboard_body()  # stays centered, scrolls under the full-width sticky bar
