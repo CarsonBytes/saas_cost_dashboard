@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Command Deck — Phase 6 UI Spec Visual</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap">
+<style>body{font-family:Inter,system-ui,sans-serif} .mono{font-family:"JetBrains Mono",monospace}</style>
+</head>
+<body class="bg-[#f6f7f9] text-zinc-900">
+<!-- top banner -->
+<div class="sticky top-0 z-40 bg-white border-b border-zinc-200">
+  <div class="max-w-[1280px] mx-auto px-4 py-3 flex items-center justify-between gap-4">
+    <div>
+      <div class="text-[11px] tracking-widest font-semibold text-zinc-500">COMMAND DECK — PHASE 6</div>
+      <div class="text-xl font-bold leading-none">UI Spec Visual <span class="font-normal text-zinc-500">· preview in localhost</span></div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="text-xs bg-zinc-900 text-white rounded-full px-2.5 py-1">P0: shell + deck</span>
+      <span class="text-xs bg-violet-600 text-white rounded-full px-2.5 py-1">P1: timeline + palette</span>
+      <span class="text-xs bg-zinc-200 rounded-full px-2.5 py-1">P2: polish</span>
+      <a href="http://localhost:8097" target="_blank" class="text-xs font-semibold text-violet-700 underline ml-2">Live preview →</a>
+    </div>
+  </div>
+  <!-- budget burn bar mock -->
+  <div class="h-1 bg-zinc-100"><div class="h-full bg-violet-600 w-[68%] relative"><div class="absolute right-0 top-0 h-full w-0.5 bg-red-500"></div></div></div>
+  <div class="max-w-[1280px] mx-auto px-4 py-1 flex items-center justify-between">
+    <div class="text-[11px] text-zinc-600 mono">Projected $42.18 / $60.00 budget · 7 days left · <span class="text-amber-600">68% burned</span> — click → Cost tab</div>
+    <div class="text-[11px] text-zinc-500">Cmd+K palette · g o/c/r/g</div>
+  </div>
+</div>
+
+<div class="max-w-[1280px] mx-auto px-4 py-6 space-y-8">
+
+<!-- 1. SHELL -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between">
+    <h2 class="font-bold">1 — Shell & Sticky Sub-header</h2>
+    <span class="text-xs bg-zinc-900 text-white rounded px-2 py-1">P0</span>
+  </div>
+  <div class="p-4 grid lg:grid-cols-[1.15fr_0.85fr] gap-4">
+    <!-- mock sticky header -->
+    <div class="rounded-xl border border-zinc-200 overflow-hidden bg-white">
+      <div class="px-3 py-2 flex items-center justify-between border-b bg-zinc-50">
+        <div class="font-bold text-sm">Command Deck</div>
+        <div class="flex items-center gap-1.5">
+          <div class="w-7 h-7 rounded-full border bg-white grid place-items-center text-xs">🌙</div>
+          <div class="px-2.5 py-1 rounded-full bg-zinc-900 text-white text-xs font-semibold">Refresh</div>
+          <div class="px-2.5 py-1 rounded-full border bg-white text-xs">⏸ Pause monitoring</div>
+        </div>
+      </div>
+      <div class="px-3 py-2 text-[11px] leading-relaxed text-zinc-600">What my agents cost, and whether they're up — LLM spend + live health + incidents<br>
+        <span class="inline-flex items-center gap-1.5 mt-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> Last refreshed: 10:31:04 (HKT) · monitoring paused · 22m</span>
+      </div>
+      <div class="mx-3 mb-2 flex flex-wrap gap-1.5">
+        <span class="text-[11px] bg-amber-50 border border-amber-200 text-amber-800 rounded-full px-2 py-0.5">Monitoring paused (22m) — restarts suppressed · Resume</span>
+        <span class="text-[11px] bg-red-50 border border-red-200 text-red-700 rounded-full px-2 py-0.5">NOC alert delivery failed — Dismiss</span>
+        <span class="text-[11px] bg-violet-50 border border-violet-200 text-violet-700 rounded-full px-2 py-0.5">Costs filtered to: quant ×</span>
+      </div>
+      <div class="px-3 pb-3 flex flex-wrap items-center gap-2 text-xs">
+        <span class="font-semibold">Range:</span>
+        <span class="inline-flex rounded-full border overflow-hidden text-[11px]"><span class="px-2 py-1 bg-zinc-900 text-white">7d</span><span class="px-2 py-1">30d</span><span class="px-2 py-1">90d</span><span class="px-2 py-1">Today</span></span>
+        <span class="text-zinc-400">·</span><span class="text-zinc-600">Custom</span>
+        <span class="border rounded px-1.5 py-0.5 mono text-[11px]">2026-08-20</span>→<span class="border rounded px-1.5 py-0.5 mono text-[11px]">2026-08-26</span>
+        <span class="bg-zinc-900 text-white rounded px-2 py-1 text-[11px]">Apply</span>
+        <span class="text-[11px] text-violet-700">Showing 08-20 → 08-26 (7d) ×</span>
+        <span class="ml-auto text-[11px]">Alert $0.40/d · Budget $60/mo ✓ Saved</span>
+      </div>
+      <div class="px-3 pb-2 flex gap-1.5 text-[10px]">
+        <span class="flex-1 py-1.5 rounded bg-zinc-900 text-white text-center font-semibold">Overview</span>
+        <span class="flex-1 py-1.5 rounded bg-zinc-100 text-center">Cost & Usage</span>
+        <span class="flex-1 py-1.5 rounded bg-zinc-100 text-center">Reliability</span>
+        <span class="flex-1 py-1.5 rounded bg-zinc-100 text-center">Governance</span>
+      </div>
+    </div>
+    <div class="text-xs leading-relaxed text-zinc-600 space-y-2">
+      <div class="font-semibold text-zinc-900">What changes vs today</div>
+      <ul class="list-disc pl-4 space-y-1">
+        <li><b>Sticky sub-header:</b> deck + chip + controls stay on scroll</li>
+        <li><b>Burn bar</b> always visible (4px) — click drills to Cost</li>
+        <li><b>Controls one-line:</b> Range + Custom chip + inline threshold/budget (auto-save, micro-feedback)</li>
+        <li>Skeleton shimmer instead of <span class="mono">Loading…</span></li>
+        <li>Deep-linkable tabs <span class="mono">?tab=cost</span> + hotkeys</li>
+        <li>Cmd+K palette (unlock / mute / filter)</li>
+      </ul>
+      <div class="rounded-lg bg-amber-50 border border-amber-200 p-2 mono text-[11px]">Sticky = deck+chip+controls pinned · banners stack + collapse after action · toasts top-right 4s</div>
+    </div>
+  </div>
+</section>
+
+<!-- 2. DECK -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between">
+    <h2 class="font-bold">2 — Agent Deck 2.0</h2>
+    <div class="flex items-center gap-2">
+      <span class="text-xs bg-zinc-900 text-white rounded px-2 py-1">P0</span>
+      <button onclick="document.getElementById('deck').classList.toggle('compact')" class="text-xs border rounded-full px-3 py-1">Toggle compact ↔ comfy</button>
+    </div>
+  </div>
+  <div id="deck" class="p-4">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      <!-- card: healthy -->
+      <div class="rounded-xl border bg-white p-3 space-y-2">
+        <div class="flex items-center gap-2"><span class="text-lg">📈</span><span class="w-2 h-2 rounded-full bg-emerald-500"></span><span class="font-bold text-sm">Quant Paper</span><span class="text-[10px] bg-red-100 text-red-700 rounded px-1">High</span><span class="ml-auto text-[11px] border rounded-full px-1.5">◧</span></div>
+        <div class="text-[11px] text-zinc-500">Weekly-TSMOM dashboard, paper</div>
+        <div class="flex gap-1.5 text-[11px]"><span class="border rounded-full px-2 py-0.5">Paper</span><span class="border rounded-full px-2 py-0.5">GitHub</span></div>
+        <div class="text-[11px] text-emerald-700">● healthy</div>
+        <div class="flex items-center gap-1"><span class="text-[11px] text-zinc-500">7d 98.2%</span><span class="flex gap-[1px] ml-1"><span class="w-1 h-2.5 bg-emerald-500 rounded-sm"></span><span class="w-1 h-2.5 bg-emerald-500 rounded-sm"></span><span class="w-1 h-2.5 bg-amber-400 rounded-sm"></span><span class="w-1 h-2.5 bg-zinc-200 rounded-sm"></span></span></div>
+      </div>
+      <!-- card: locked countdown -->
+      <div class="rounded-xl border-2 border-amber-300 bg-amber-50/40 p-3 space-y-2">
+        <div class="flex items-center gap-2"><span class="text-lg">📈</span><span class="w-2 h-2 rounded-full bg-amber-500"></span><span class="font-bold text-sm">Quant Live</span><span class="text-[10px] bg-amber-100 text-amber-800 rounded px-1">Locked · auto-unlock ~42m</span></div>
+        <div class="text-[11px] text-amber-700">● degraded — last write 2.4h ago</div>
+        <div class="flex gap-1"><span class="text-[10px] bg-white border rounded px-1.5 py-0.5">Clear lock</span><span class="text-[10px] text-zinc-500">⋯</span></div>
+        <details open class="text-[11px]"><summary class="cursor-pointer font-semibold">recent incidents (3)</summary><div class="mt-1 space-y-0.5 mono text-[11px] text-zinc-600"><div>08-25 16:43 · locked · strike 1</div><div>08-25 16:40 · restarted · ok</div></div></details>
+      </div>
+      <!-- card: sticky -->
+      <div class="rounded-xl border-2 border-red-300 bg-red-50/40 p-3 space-y-2">
+        <div class="flex items-center gap-2"><span class="text-lg">🎯</span><span class="w-2 h-2 rounded-full bg-red-500"></span><span class="font-bold text-sm">Event Radar</span><span class="text-[10px] bg-red-100 text-red-700 rounded px-1">Locked · needs you (2nd strike)</span></div>
+        <div class="text-[11px] text-red-600">● down</div>
+        <div class="text-[11px]"><span class="bg-white border rounded px-2 py-0.5 font-semibold text-red-700">Clear lock</span></div>
+      </div>
+      <!-- card: muted -->
+      <div class="rounded-xl border border-zinc-200 bg-zinc-50 p-3 space-y-2 opacity-80">
+        <div class="flex items-center gap-2"><span class="text-lg">🎓</span><span class="w-2 h-2 rounded-full bg-zinc-400"></span><span class="font-bold text-sm">Study Platform</span><span class="text-[10px] bg-zinc-200 rounded px-1">Low</span></div>
+        <div class="text-[11px] text-zinc-500">monitoring paused (maintenance)</div>
+        <div class="text-[11px] text-zinc-500">● idle — no recent usage</div>
+      </div>
+      <!-- more cards -->
+      <div class="rounded-xl border bg-white p-3"><div class="flex items-center gap-2"><span>🛡️</span><span class="w-2 h-2 bg-emerald-500 rounded-full"></span><b class="text-sm">Portfolio</b><span class="text-[10px] bg-amber-100 rounded px-1">Med</span></div><div class="text-[11px] text-emerald-700">● healthy</div></div>
+      <div class="rounded-xl border bg-white p-3"><div class="flex items-center gap-2"><span>⚖️</span><span class="w-2 h-2 bg-emerald-500 rounded-full"></span><b class="text-sm">RegTech Radar</b></div><div class="text-[11px]">● healthy</div></div>
+      <div class="rounded-xl border border-dashed bg-zinc-50 p-3"><div class="flex items-center gap-2"><span>✅</span><b class="text-sm">Change Impact</b></div><div class="text-[11px] text-zinc-500">Demo · not monitored</div></div>
+      <div class="rounded-xl border border-dashed bg-zinc-50 p-3"><div class="flex items-center gap-2"><span>📊</span><b class="text-sm">Sprint Analyzer</b></div><div class="text-[11px] text-zinc-500">Demo · not monitored</div></div>
+    </div>
+    <div class="mt-3 grid lg:grid-cols-3 gap-2 text-[11px] leading-relaxed">
+      <div class="rounded-lg bg-zinc-50 border p-2"><b>Sort:</b> locked → quarantined → degraded → muted → healthy (stable within group)</div>
+      <div class="rounded-lg bg-zinc-50 border p-2"><b>Hover-reveal:</b> quarantine/clear only on hover; 28-slot strip `h-2` in compact mode</div>
+      <div class="rounded-lg bg-zinc-50 border p-2"><b>One-line status:</b> <span class="mono">● healthy | ● degraded — 2.1h ago</span> (color + text for a11y)</div>
+    </div>
+  </div>
+  <style>#deck.compact .rounded-xl{padding:8px} #deck.compact .text-\[11px\]{font-size:10px} #deck.compact [class*="h-2.5"]{height:6px}</style>
+</section>
+
+<!-- 3. OVERVIEW -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between"><h2 class="font-bold">3 — Overview</h2><span class="text-xs bg-zinc-900 text-white rounded px-2 py-1">P0</span></div>
+  <div class="p-4 space-y-3">
+    <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2">
+      <div class="rounded-xl border p-3"><div class="text-[11px] text-zinc-500">Total calls</div><div class="font-bold">1,247 <span class="text-emerald-600 text-[11px]">↑ 4% vs prev 7d</span></div><svg viewBox="0 0 60 14" class="w-full h-4 mt-1"><polyline fill="none" stroke="#16a34a" stroke-width="1.5" points="0,10 10,8 20,9 30,6 40,7 50,4 60,5"/></svg></div>
+      <div class="rounded-xl border-2 border-violet-200 p-3"><div class="text-[11px] text-zinc-500">Total cost</div><div class="font-bold">$3.42 <span class="text-red-600 text-[11px]">↑ 18% vs prev</span></div><svg viewBox="0 0 60 14" class="w-full h-4 mt-1"><polyline fill="none" stroke="#7c3aed" stroke-width="1.5" points="0,10 10,9 20,10 30,11 40,6 50,9 60,11"/></svg></div>
+      <div class="rounded-xl border p-3"><div class="text-[11px] text-zinc-500">Prompt tokens</div><div class="font-bold">892k</div></div>
+      <div class="rounded-xl border p-3"><div class="text-[11px] text-zinc-500">Completion</div><div class="font-bold">411k</div></div>
+      <div class="rounded-xl border p-3"><div class="text-[11px] text-zinc-500">Projected / Budget</div><div class="font-bold text-sm">$48 / $60</div><div class="h-1 bg-zinc-100 rounded mt-1"><div class="h-full bg-violet-600 w-3/4 rounded"></div></div></div>
+      <div class="rounded-xl border p-3"><div class="text-[11px] text-zinc-500">Attribution</div><div class="font-bold">72% tagged</div><div class="text-[11px] text-violet-700 underline">Fix →</div></div>
+    </div>
+    <div class="rounded-xl border p-3">
+      <div class="flex items-center justify-between"><div class="font-semibold text-sm">Cost per day, by project — 90d brush</div><div class="text-[11px] text-amber-600">● spike 08-24 (3.2× avg) — click to filter</div></div>
+      <div class="mt-2 h-24 rounded bg-gradient-to-r from-emerald-50 via-violet-50 to-zinc-50 border relative overflow-hidden">
+        <div class="absolute inset-0 flex items-end gap-[1px] px-2 pb-2"><div class="flex-1 bg-emerald-400/70 h-[30%]"></div><div class="flex-1 bg-emerald-400/70 h-[40%]"></div><div class="flex-1 bg-violet-500/70 h-[55%] flex items-start justify-center"><span class="w-2 h-2 bg-amber-500 rounded-full -mt-1 border-2 border-white"></span></div><div class="flex-1 bg-emerald-400/60 h-[35%]"></div></div>
+        <div class="absolute bottom-1 left-1/3 right-1/3 h-5 border border-violet-300 bg-violet-100/40 rounded flex items-center justify-between px-1 text-[10px]">◀ brush ▶</div>
+        <div class="absolute top-1 right-2 text-[10px] mono border border-dashed border-red-300 text-red-600 px-1 rounded">— alert threshold</div>
+      </div>
+    </div>
+    <div class="grid lg:grid-cols-2 gap-3">
+      <div class="rounded-xl border p-3"><div class="font-semibold text-xs">By project</div><div class="mt-2 space-y-1 text-xs"><div class="flex items-center gap-2"><span class="w-16">quant</span><span class="flex-1 h-2 bg-emerald-500 rounded" style="width:60%"></span> 58%</div><div class="flex items-center gap-2"><span class="w-16">study</span><span class="flex-1 h-2 bg-blue-500 rounded" style="width:22%"></span> 22%</div></div></div>
+      <div class="rounded-xl border p-3"><div class="font-semibold text-xs">By provider</div><div class="mt-2 text-xs mono">chatanywhere 82% · deepseek 18%</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- 4. COST -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between"><h2 class="font-bold">4 — Cost & Usage</h2><span class="text-xs bg-violet-600 text-white rounded px-2 py-1">P1</span></div>
+  <div class="p-4 grid lg:grid-cols-2 gap-3">
+    <div class="rounded-xl border p-3"><div class="font-semibold text-xs flex justify-between">By model <span class="font-normal border rounded px-1.5">CSV</span></div><div class="mt-2 space-y-1 text-xs"><div class="flex gap-2"><span class="w-24">gpt-5-mini</span><span class="flex-1 h-2 bg-zinc-800 rounded"></span></div><div class="flex gap-2"><span class="w-24">deepseek</span><span class="flex-1 h-2 bg-zinc-400 rounded w-1/2"></span></div></div></div>
+    <div class="rounded-xl border p-3"><div class="font-semibold text-xs">Model efficiency ($/1K)</div><div class="mt-2 space-y-1 text-xs"><div class="flex items-center gap-2">deepseek <span class="flex-1 h-1.5 bg-emerald-500 rounded w-1/3"></span> $0.002</div><div class="flex items-center gap-2">gpt-5-mini <span class="flex-1 h-1.5 bg-amber-400 rounded w-2/3"></span> $0.008</div></div></div>
+  </div>
+  <div class="px-4 pb-4"><div class="rounded-xl border p-3"><div class="font-semibold text-xs flex justify-between">Model usage by project × call_type <span class="border rounded px-1.5 text-xs">CSV</span></div><div class="mt-2 grid grid-cols-5 gap-1 mono text-[11px] text-zinc-600 border rounded p-2 bg-zinc-50"><span>project</span><span>call_type</span><span>model</span><span>calls</span><span>cost</span><span>quant</span><span>board_scan</span><span>gpt-5-mini</span><span>89</span><span>$0.21</span></div></div></div>
+</section>
+
+<!-- 5. RELIABILITY -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between"><h2 class="font-bold">5 — Reliability & Incidents</h2><span class="text-xs bg-violet-600 text-white rounded px-2 py-1">P1</span></div>
+  <div class="p-4 space-y-3">
+    <div class="flex items-center gap-2 text-xs"><span class="font-semibold">View:</span><span class="bg-zinc-900 text-white rounded-full px-2.5 py-1">Table</span><span class="border rounded-full px-2.5 py-1">Timeline</span><span class="ml-auto border rounded-full px-2 py-1">Agent: all ▾</span><span class="border rounded-full px-2 py-1">Last 7d ▾</span><span class="border rounded-full px-2 py-1">CSV</span></div>
+    <div class="rounded-xl border p-3">
+      <div class="font-semibold text-xs">Slowest call types</div>
+      <div class="mt-2 mono text-[11px] grid grid-cols-4 gap-1 border rounded bg-zinc-50 p-2"><span>project</span><span>call_type</span><span>avg ms</span><span>calls</span><span>events</span><span>ingest</span><span>2 400</span><span>12</span></div>
+    </div>
+    <div class="rounded-xl border p-3">
+      <div class="font-semibold text-xs">Incident timeline (toggle)</div>
+      <div class="mt-2 relative pl-4 border-l-2 border-zinc-200 space-y-2 text-xs">
+        <div class="relative"><span class="absolute -left-[9px] top-1 w-2 h-2 bg-red-500 rounded-full"></span><span class="mono text-[11px] text-zinc-500">08-26 01:33</span> — <b>Event Radar</b> locked · auto-heal disabled <span class="text-zinc-500">→ Clear lock</span></div>
+        <div class="relative"><span class="absolute -left-[9px] top-1 w-2 h-2 bg-amber-400 rounded-full"></span><span class="mono text-[11px]">08-25 16:43</span> — <b>Quant Paper</b> restarted · ok</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 6. GOVERNANCE -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between"><h2 class="font-bold">6 — Governance</h2><span class="text-xs bg-zinc-200 rounded px-2 py-1">P2</span></div>
+  <div class="p-4 grid lg:grid-cols-3 gap-3">
+    <div class="rounded-xl border p-3 text-center"><div class="w-16 h-16 rounded-full border-4 border-emerald-500 mx-auto grid place-items-center text-sm font-bold">4/6</div><div class="text-xs mt-1">Agents clear</div></div>
+    <div class="rounded-xl border p-3">
+      <div class="font-semibold text-xs">Compliance board</div>
+      <div class="mt-2 grid grid-cols-3 gap-2 text-[11px]">
+        <div class="rounded bg-amber-50 border p-2"><div class="font-semibold">Pending (2)</div><div class="mt-1 rounded bg-white border p-1">EU AI Act Art 5 <span class="bg-amber-100 rounded px-1">3d left</span></div></div>
+        <div class="rounded bg-red-50 border p-2"><div class="font-semibold">Overdue (1)</div><div class="mt-1 rounded bg-white border p-1">Logging retention <span class="bg-red-100 rounded px-1">overdue 2d</span></div></div>
+        <div class="rounded bg-emerald-50 border p-2"><div class="font-semibold">Complied (2)</div><div class="mt-1 rounded bg-white border p-1">HR impact review ✓</div></div>
+      </div>
+    </div>
+    <div class="rounded-xl border p-3"><div class="font-semibold text-xs">Audit trail</div><div class="mono text-[11px] mt-2 border rounded bg-zinc-50 p-2">2026-08-26 · marked complied · operator</div></div>
+  </div>
+</section>
+
+<!-- 7. MOBILE -->
+<section class="bg-white rounded-2xl border border-zinc-200 overflow-hidden">
+  <div class="px-5 py-4 border-b border-zinc-100 flex items-center justify-between"><h2 class="font-bold">7 — Mobile (375px)</h2><span class="text-xs bg-zinc-200 rounded px-2 py-1">P1</span></div>
+  <div class="p-4 flex justify-center">
+    <div class="w-[200px] rounded-[18px] border-[6px] border-zinc-900 overflow-hidden bg-white">
+      <div class="h-3 bg-zinc-900"></div>
+      <div class="p-2 space-y-2">
+        <div class="h-3 bg-zinc-900 rounded w-2/3"></div>
+        <div class="grid grid-cols-1 gap-1.5"><div class="h-8 border rounded"></div><div class="h-8 border rounded border-amber-300 bg-amber-50"></div><div class="h-8 border rounded"></div></div>
+        <div class="grid grid-cols-2 gap-1"><div class="h-6 border rounded bg-zinc-50"></div><div class="h-6 border rounded bg-zinc-50"></div></div>
+        <div class="h-12 border rounded bg-zinc-50"></div>
+      </div>
+    </div>
+    <div class="ml-4 text-xs leading-relaxed text-zinc-600 max-w-[260px]">
+      <div class="font-semibold text-zinc-900">Responsive rules</div>
+      <ul class="list-disc pl-4 mt-1 space-y-1">
+        <li>Deck → 1 col, cards full-width</li>
+        <li>KPIs → 1 col, sparklines stay</li>
+        <li>Controls → Custom collapses to 📅</li>
+        <li>Tables → swipe hint on first load</li>
+        <li>Sticky header keeps burn bar + chip</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<div class="text-center text-[11px] text-zinc-500 mono pb-6">File: <span class="underline">spec-preview.html</span> · also saved as <span class="underline">docs/UI_SPEC_VISUAL.html</span> for the repo · Live app: <a class="underline text-violet-700" href="http://localhost:8097">localhost:8097</a> · <a class="underline text-violet-700" href="https://dashboard.carsonng.com">dashboard.carsonng.com</a></div>
+
+</div>
+</body>
+</html>

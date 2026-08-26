@@ -93,6 +93,29 @@ def project_filter_chip() -> None:
             .props("dense flat round size=sm color=blue-600").tooltip("Clear filter")
 
 
+@ui.refreshable
+def burn_bar() -> None:
+    """Thin budget-burn bar under the header — always visible so projected
+    vs budget is glanceable without opening the Overview tab."""
+    data = STATE.get("data")
+    if not data:
+        return
+    avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
+    projected = avg_daily * 30
+    budget = alerts.effective_monthly_budget()
+    pct = min(100, int(projected / budget * 100)) if budget else 0
+    days_left = max(0, 30 - data["range_days"])
+    color = "bg-red-500" if projected > budget else "bg-violet-600"
+    with ui.element("div").classes("w-full h-1.5 bg-zinc-100 rounded-full overflow-hidden flex"):
+        ui.element("div").classes(f"h-full {color} transition-all").style(f"width:{pct}%")
+        if pct < 100 and pct > 0:
+            ui.element("div").classes("h-full w-0.5 bg-red-500")
+    with ui.row().classes("w-full justify-between items-center mt-1"):
+        ui.label(f"Projected ${projected:.2f} / ${budget:.2f} budget · {pct}% burned · {days_left}d left in window").classes(
+            "text-[11px] font-mono " + ("text-red-600" if projected > budget else "text-zinc-600"))
+        ui.label("Click → Cost tab  ·  Cmd+K palette  ·  g o/c/r/g").classes("text-[11px] text-zinc-400")
+
+
 def fetch_stats(days: int | None = None) -> None:
     """Fetch + aggregate the active window: the custom HKT date range when one
     is set in STATE, otherwise the trailing-`days` window. Also fetches the
@@ -136,16 +159,27 @@ def _set_project(project: str | None) -> None:
 
 
 def _kpi(title: str, value: str, *, warn: bool = False,
-         sub: str | None = None, sub_cls: str = "text-grey-6") -> None:
+         sub: str | None = None, sub_cls: str = "text-grey-6",
+         spark: list[float] | None = None) -> None:
     """One KPI card. `sub` is a small secondary line (e.g. a
-    period-over-period delta); the card itself sits in the overview tab's
-    responsive grid -- 1 col on phones, 2 on tablets, 3 on desktop -- instead
-    of the old flex row whose `min-w grow` cards wrapped unevenly at 375px."""
+    period-over-period delta); spark is a tiny inline trend. The card sits
+    in the overview tab's responsive grid -- 1 col on phones, 2 on tablets,
+    3 on desktop -- instead of the old flex row whose `min-w grow` cards
+    wrapped unevenly at 375px."""
     with ui.card().classes("w-full" + (" bg-red-50" if warn else "")):
         ui.label(title).classes("text-xs text-grey-6")
         ui.label(value).classes("text-xl font-bold" + (" text-red-600" if warn else ""))
         if sub:
             ui.label(sub).classes(f"text-xs {sub_cls}")
+        if spark and len(spark) > 1:
+            ui.echart({
+                "xAxis": {"type": "category", "data": [str(i) for i in range(len(spark))], "show": False},
+                "yAxis": {"show": False},
+                "grid": {"left": 0, "right": 0, "top": 2, "bottom": 2},
+                "series": [{"type": "line", "data": spark, "smooth": True, "symbol": "none",
+                            "lineStyle": {"width": 1.5, "color": "#7c3aed" if warn else "#16a34a"},
+                            "areaStyle": {"opacity": 0.12, "color": "#7c3aed" if warn else "#16a34a"}}],
+            }).classes("w-full h-6 -mb-1").props("auto-resize")
 
 
 def _delta_sub(current: float, previous: float | None, *, lower_is_better: bool = False) -> tuple[str, str] | None:
@@ -537,14 +571,22 @@ def governance_view() -> None:
         deadline = governance._parse_ts(r.get("enforcement_deadline"))
         if deadline:
             days = (deadline - now).total_seconds() / 86400
-            deadline_txt = f"{ledger.to_hkt(deadline):%m-%d %H:%M} ({int(days)}d left)" \
-                if days >= 0 else f"{ledger.to_hkt(deadline):%m-%d %H:%M} (overdue {int(-days)}d)"
+            if days < 0:
+                deadline_txt = f"{ledger.to_hkt(deadline):%m-%d %H:%M} (overdue {int(-days)}d)"
+                due_cls = "text-red-600 bg-red-50 border border-red-200 rounded px-1"
+            elif days <= 7:
+                deadline_txt = f"{ledger.to_hkt(deadline):%m-%d %H:%M} ({int(days)}d left)"
+                due_cls = "text-amber-700 bg-amber-50 border border-amber-200 rounded px-1"
+            else:
+                deadline_txt = f"{ledger.to_hkt(deadline):%m-%d %H:%M} ({int(days)}d left)"
+                due_cls = "text-grey-6"
         else:
             deadline_txt = "no deadline"
+            due_cls = "text-grey-6"
         with ui.card().classes("w-full p-2"):
             ui.label(status_label).classes(f"text-xs {badge_cls} rounded px-1")
             ui.label(r["rule_name"]).classes("text-sm font-bold mt-1")
-            ui.label(deadline_txt).classes("text-xs text-grey-6")
+            ui.label(deadline_txt).classes(f"text-xs {due_cls}")
             if r["status"] != "COMPLIED":
                 ui.button("Mark complied", on_click=lambda rid=r["id"]: _mark_complied(rid)) \
                     .props("dense flat color=positive").classes("mt-1")
@@ -655,7 +697,25 @@ def services_row() -> None:
     # div rather than ui.row so its own `display:flex` can't fight the grid.
     with ui.element("div").classes("w-full grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-3"):
         compliance = governance.compliance_health()  # agent -> OVERDUE rule names (render-safe cache)
-        for svc in services.SERVICES:
+
+        def _deck_priority(svc: dict) -> tuple:
+            st = noc.get_status(svc["name"])
+            if not svc.get("monitor"):
+                return (5, svc["name"])
+            if not st:
+                return (4, svc["name"])
+            if st.get("locked"):
+                return (0, svc["name"])
+            if st.get("quarantined"):
+                return (1, svc["name"])
+            overdue = compliance.get(svc["name"])
+            if overdue or st.get("up") is False or (st.get("readiness") == "stale" and svc.get("enforced_cadence")):
+                return (2, svc["name"])
+            if st.get("muted"):
+                return (3, svc["name"])
+            return (4, svc["name"])
+
+        for svc in sorted(services.SERVICES, key=_deck_priority):
             status = noc.get_status(svc["name"])
             overdue = compliance.get(svc["name"], [])
             quarantined = bool(status and status.get("quarantined"))
@@ -818,6 +878,7 @@ def services_row() -> None:
 
 _INCIDENT_FILTER = {"q": ""}
 _AUDIT_FILTER = {"q": ""}
+_INCIDENT_VIEW = {"mode": "table"}  # table | timeline
 
 
 @ui.refreshable
@@ -832,6 +893,18 @@ def _incident_log_table() -> None:
     if not incidents:
         ui.label("(no matching incidents)" if q else "(no incidents logged yet)") \
             .classes("text-sm text-grey")
+        return
+    if _INCIDENT_VIEW["mode"] == "timeline":
+        # Timeline view: vertical line with dots, grouped — scan friendly for solo ops
+        with ui.element("div").classes("w-full border-l-2 border-zinc-200 ml-2 pl-4 space-y-2 max-h-[240px] overflow-y-auto"):
+            for i in incidents[:30]:
+                dot = "bg-red-500" if "locked" in i["event"] else "bg-amber-500" if "restart" in i["event"] else "bg-zinc-400"
+                ts = ledger.to_hkt(i["ts"]).strftime("%m-%d %H:%M")
+                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                    ui.element("div").classes(f"w-2 h-2 rounded-full {dot} shrink-0 -ml-[21px] border-2 border-white")
+                    ui.label(f"{ts}").classes("text-xs font-mono text-zinc-500 shrink-0")
+                    ui.label(f"{i['agent']}").classes("text-xs font-bold shrink-0")
+                    ui.label(f"{i['event']} · {i.get('outcome','')}").classes("text-xs text-zinc-700 truncate")
         return
     cols = [
         {"name": "ts", "label": "Time (HKT)", "field": "ts", "sortable": True},
@@ -849,7 +922,16 @@ def _incident_log_table() -> None:
 
 def incident_log() -> None:
     with ui.row().classes("w-full items-center justify-between mt-4 flex-wrap gap-2"):
-        ui.label("Incident log").classes("text-sm font-bold")
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Incident log").classes("text-sm font-bold")
+            # View toggle: table ↔ timeline
+            def _set_view(m: str) -> None:
+                _INCIDENT_VIEW["mode"] = m
+                _incident_log_table.refresh()
+            ui.button("Table", on_click=lambda: _set_view("table")).props(
+                f"dense {'unelevated' if _INCIDENT_VIEW['mode']=='table' else 'outline'} size=sm").mark("incident-view-table")
+            ui.button("Timeline", on_click=lambda: _set_view("timeline")).props(
+                f"dense {'unelevated' if _INCIDENT_VIEW['mode']=='timeline' else 'outline'} size=sm").mark("incident-view-timeline")
 
         def _apply_filter(e) -> None:
             _INCIDENT_FILTER["q"] = e.value or ""
@@ -901,15 +983,18 @@ def _overview_tab(data: dict) -> None:
     attribution = ledger.attribution_quality(data)
     prev = STATE.get("prev")
 
+    calls_spark = [d["calls"] for d in data.get("daily_series", [])]
+    cost_spark = [d["cost_usd"] for d in data.get("daily_series", [])]
+
     with ui.grid().classes("w-full gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 mt-2"):
         d_calls = _delta_sub(data["total_calls"], prev and prev["calls"])
         d_cost = _delta_sub(data["total_cost_usd"], prev and prev["cost_usd"], lower_is_better=True)
         d_ptok = _delta_sub(data["total_prompt_tokens"], prev and prev["prompt_tokens"])
         d_ctok = _delta_sub(data["total_completion_tokens"], prev and prev["completion_tokens"])
         _kpi("Total calls", f"{data['total_calls']:,}", sub=d_calls and d_calls[0],
-             sub_cls=d_calls and d_calls[1])
+             sub_cls=d_calls and d_calls[1], spark=calls_spark)
         _kpi("Total cost", f"${data['total_cost_usd']:.4f}", sub=d_cost and d_cost[0],
-             sub_cls=d_cost and d_cost[1])
+             sub_cls=d_cost and d_cost[1], spark=cost_spark)
         _kpi("Prompt tokens", f"{data['total_prompt_tokens']:,}", sub=d_ptok and d_ptok[0],
              sub_cls=d_ptok and d_ptok[1])
         _kpi("Completion tokens", f"{data['total_completion_tokens']:,}",
@@ -917,7 +1002,7 @@ def _overview_tab(data: dict) -> None:
         _kpi("Projected monthly cost",
              f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget"
              + (" (implied)" if budget_is_implied else ""),
-             warn=projected_monthly > monthly_budget)
+             warn=projected_monthly > monthly_budget, spark=cost_spark)
         _kpi("Cost attribution quality", f"{attribution['cost_tagged_pct']:.0f}% tagged by provider",
              warn=attribution["cost_tagged_pct"] < 50)
 
@@ -1080,6 +1165,7 @@ def refresh_all() -> None:
     alert_banner.refresh()
     noc_banner.refresh()
     maintenance_banner.refresh()
+    burn_bar.refresh()
     services_row.refresh()
     project_filter_chip.refresh()
     _incident_log_table.refresh()
@@ -1183,6 +1269,11 @@ async def main_page() -> None:
                 ui.button("Refresh", icon="refresh",
                           on_click=lambda: (fetch_stats(), refresh_all())) \
                     .props("color=primary")
+                ui.button("Pause monitoring", icon="build",
+                          on_click=lambda: _pause_dialog()).props("dense outline color=grey-8") \
+                    .mark("mute-btn")
+
+        burn_bar()
 
         def _pause_monitoring(minutes: int) -> None:
             noc.set_maintenance(minutes)
@@ -1204,9 +1295,6 @@ async def main_page() -> None:
                     ui.button("Cancel", on_click=dialog.close).props("flat")
             dialog.open()
 
-        ui.button("Pause monitoring", icon="build",
-                  on_click=_pause_dialog).props("dense outline color=grey-8") \
-            .mark("mute-btn")
         ui.label("What my agents cost, and whether they're up -- LLM spend across "
                  "quant, study, and event-radar from the shared usage ledger, plus "
                  "live health, auto-heal, and an incident log for every monitored "
@@ -1216,7 +1304,6 @@ async def main_page() -> None:
         alert_banner()
         noc_banner()
         maintenance_banner()
-        services_row()
 
         def _set_range(e) -> None:
             STATE["days"] = e.value
@@ -1238,7 +1325,6 @@ async def main_page() -> None:
             refresh_all()
 
         def _clear_custom() -> None:
-            # Back to the last preset the operator had chosen.
             start_date.set_value(None)
             end_date.set_value(None)
             STATE["custom"] = None
@@ -1255,36 +1341,37 @@ async def main_page() -> None:
                       type="positive")
             refresh_all()
 
-        ui.separator().classes("my-1")
-        # Range + alert-threshold sit JUST ABOVE the tab strip (layout request
-        # 2026-08-16): the cards are the identity, the controls tune the
-        # charts below, and the tab strip is where those charts live.
-        project_filter_chip()
-        with ui.row().classes("items-center gap-2 mt-1 flex-wrap"):
-            ui.label("Range:").classes("text-sm")
-            ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
-                      on_change=_set_range).props("dense")
-            ui.label("Custom:").classes("text-sm text-grey-6")
-            start_date = ui.input(placeholder="Start YYYY-MM-DD") \
-                .props("dense outlined style='max-width:130px'").mark("range-start")
-            ui.label("→").classes("text-xs text-grey-6")
-            end_date = ui.input(placeholder="End YYYY-MM-DD") \
-                .props("dense outlined style='max-width:130px'").mark("range-end")
-            ui.button("Apply", on_click=_apply_custom).props("dense flat").mark("apply-custom")
-            ui.button(icon="close", on_click=_clear_custom).props("dense flat round size=sm") \
-                .tooltip("Back to preset range").mark("clear-custom")
+        services_row()
 
-        with ui.row().classes("items-center gap-2 flex-wrap"):
-            ui.label("Alert threshold ($/day):").classes("text-sm")
-            threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
-                                        format="%.2f").props("dense outlined").classes("w-24") \
-                .mark("threshold-input")
+        # Sticky controls: only the filter chip + range/budget stay pinned — the deck
+        # scrolls away so it doesn't cover the tab content (fixed preview 2026-08-26).
+        with ui.element("div").classes("sticky top-0 z-20 bg-white border-b border-zinc-200 shadow-sm -mx-4 px-4 py-3 w-[calc(100%+32px)]"):
+            project_filter_chip()
+            with ui.row().classes("items-center gap-2 mt-1 flex-wrap"):
+                ui.label("Range:").classes("text-sm")
+                ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
+                          on_change=lambda e: (_set_range(e))).props("dense")
+                ui.label("Custom:").classes("text-sm text-grey-6")
+                start_date = ui.input(placeholder="Start YYYY-MM-DD") \
+                    .props("dense outlined style='max-width:130px'").mark("range-start")
+                ui.label("→").classes("text-xs text-grey-6")
+                end_date = ui.input(placeholder="End YYYY-MM-DD") \
+                    .props("dense outlined style='max-width:130px'").mark("range-end")
+                ui.button("Apply", on_click=lambda: _apply_custom()).props("dense flat").mark("apply-custom")
+                ui.button(icon="close", on_click=lambda: _clear_custom()).props("dense flat round size=sm") \
+                    .tooltip("Back to preset range").mark("clear-custom")
 
-            budget_label = ("Monthly budget ($/mo):" if alerts.MONTHLY_BUDGET_USD
-                            else f"Budget (implied ${alerts.effective_monthly_budget():.2f}/mo):")
-            ui.label(budget_label).classes("text-sm text-grey-6")
-            budget_input = ui.number(value=alerts.MONTHLY_BUDGET_USD, min=0, step=5,
-                                     format="%.2f").props("dense outlined").classes("w-28") \
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                ui.label("Alert threshold ($/day):").classes("text-sm")
+                threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
+                                            format="%.2f").props("dense outlined").classes("w-24") \
+                    .mark("threshold-input")
+
+                budget_label = ("Monthly budget ($/mo):" if alerts.MONTHLY_BUDGET_USD
+                                else f"Budget (implied ${alerts.effective_monthly_budget():.2f}/mo):")
+                ui.label(budget_label).classes("text-sm text-grey-6")
+                budget_input = ui.number(value=alerts.MONTHLY_BUDGET_USD, min=0, step=5,
+                                         format="%.2f").props("dense outlined").classes("w-28") \
                 .mark("budget-input")
 
             # Enter-to-save on both inputs (B5): a number field's natural
