@@ -29,6 +29,18 @@ Study Platform degrade visibly on staleness but never restart from it --
 restarting a container cannot produce usage (FIXED 2026-08-15: Study was
 auto-restarting every ~6min while merely idle, locking and re-locking).
 
+restart_on_staleness vs enforced_cadence (ADDED 2026-08-17): these look like
+the same flag and, for every agent before Quant Live, were the same value --
+but they answer different questions. restart_on_staleness is restart
+AUTHORITY ("may staleness trigger an auto-restart"). enforced_cadence is a
+DISPLAY/uptime fact ("is staleness here a real fault, or just this agent
+being unused"). Quant Live has a real enforced cadence -- its staleness is a
+genuine problem worth showing amber and alerting on -- but must never
+auto-restart, since this dashboard's restart logic doesn't understand IBKR's
+reconciliation state well enough to safely bounce a live trading agent.
+enforced_cadence=True, restart_on_staleness=False: the one agent where they
+diverge.
+
 Threading: everything here is blocking (HTTP probes, Supabase reads, Docker
 Engine API calls, file writes). Call refresh_health() via asyncio.to_thread
 from async code, never from a page-render path -- restarts fire only from the
@@ -36,13 +48,16 @@ background loop.
 
 Readiness exceptions (both needed to avoid false alarms):
   1. 5-minute grace after a dashboard-initiated restart (still warming up).
-  2. Quant Trading (Paper): skipped outside the real NYSE session -- computed
-     in US Eastern time with DST via zoneinfo("America/New_York"), plus real
-     US market holidays via pandas_market_calendars (the same approach quant's
-     own dashboard/app.py::_market_open() + core/market_calendar.py use --
-     that exact DST bug was found and fixed there first, so this mirrors it
-     rather than reinventing a fixed-HK-range that drifts an hour wrong twice
-     a year).
+  2. Any agent with services.py market_hours_only=True (Quant Paper, Quant
+     Live): skipped outside the real NYSE session -- computed in US Eastern
+     time with DST via zoneinfo("America/New_York"), plus real US market
+     holidays via pandas_market_calendars (the same approach quant's own
+     dashboard/app.py::_market_open() + core/market_calendar.py use -- that
+     exact DST bug was found and fixed there first, so this mirrors it rather
+     than reinventing a fixed-HK-range that drifts an hour wrong twice a
+     year). Originally a hardcoded "is this literally Quant Paper" name
+     check; generalized to the field 2026-08-17 once Quant Live also needed
+     it, rather than growing a second hardcoded name.
 
 State: file-backed JSON (noc_state.json), same pattern as alerts.py's
 alert_state.json -- incidents/restart counts/locks survive a dashboard
@@ -52,6 +67,7 @@ copy is the only writer.
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import json
 import logging
 import os
@@ -80,7 +96,37 @@ _RESTART_LOCK_COUNT = 3            # restarts within the window that trigger a l
 _UPTIME_DAYS = 7
 _INCIDENT_LIMIT = 50
 
-_STATE_FILE = Path(__file__).parent / "noc_state.json"
+# Uptime-strip buckets (ADDED 2026-08-26): the daily ok/fail buckets behind
+# _uptime_7d can't draw a status-page strip -- a day is too coarse to show
+# WHEN in the week an agent was down. The health cycle additionally folds each
+# result into fixed 6-hour slots, kept for the trailing 28 slots (one week).
+# Bounded state: exactly 28 entries per agent.
+_SLOT_SEC = 6 * 3600
+_SLOT_COUNT = 28
+
+# Manual quarantine (pause) / resume passcode gate (FIXED 2026-08-17): neither
+# action had any authentication at all, and this dashboard is public with no
+# Cloudflare Access -- anyone loading the page could pause a live trading
+# agent's container in two clicks. A single shared passcode, checked
+# server-side only (never in the browser, which would just leak it via
+# view-source) -- proportionate for a single-operator dashboard, not a
+# multi-user auth system. Unset = both actions stay disabled (fails closed).
+_ACTION_PASSCODE = os.environ.get("NOC_ACTION_PASSCODE", "")
+_AUTH_FAIL_LIMIT = 5               # failed attempts against one agent...
+_AUTH_FAIL_WINDOW_SEC = 600        # ...within this window locks it out
+
+# ADDED 2026-08-18: lives under state/, a named Docker volume (see
+# docker-compose.yml), not directly in /app -- previously this sat in the
+# container's writable layer with nothing mounted, so every redeploy wiped
+# incidents/restarts/locks/quarantine flags. That's already caused two real
+# problems live: an outage's evidence disappearing mid-investigation, and a
+# quarantine flag getting cleared by a redeploy while the container it
+# tracked was still genuinely paused, leaving auto-heal about to "restart"
+# an intentionally-paused container. mkdir here so local (non-Docker) runs
+# and the very first container start both just work.
+_STATE_DIR = Path(__file__).parent / "state"
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
+_STATE_FILE = _STATE_DIR / "noc_state.json"
 _STATE_LOCK = threading.Lock()
 
 _STATUS_CACHE: dict[str, dict] = {}
@@ -212,14 +258,24 @@ def _latest_write(svc: dict) -> str | None:
     `freshness_table` override reads that table instead -- Study Platform
     watches `answer_log`, because practice-mode correct answers never touch
     the LLM ledger (FIXED 2026-08-15: the card read "idle" right after the
-    user answered several questions). Raises on Supabase failure -- callers
-    treat that as stale + let the dependency probe decide whether it's a
-    blocked-by situation."""
+    user answered several questions).
+
+    `environment_tag`, when set, additionally filters on the ledger's
+    `environment` column (ADDED 2026-08-17): Quant Paper and Quant Live share
+    the same project_tag "quant", split only by environment "paper"/"live" --
+    without this, monitoring both at once would let each one's freshness leak
+    into the other's (Paper reading "fresh" off Live's writes, or vice versa).
+
+    Raises on Supabase failure -- callers treat that as stale + let the
+    dependency probe decide whether it's a blocked-by situation."""
     table = svc.get("freshness_table", "llm_calls")
     params = {"select": "created_at", "order": "created_at.desc", "limit": "1"}
     tag = svc.get("project_tag")
     if table == "llm_calls" and tag:
         params["project"] = f"eq.{tag}"
+        env = svc.get("environment_tag")
+        if env:
+            params["environment"] = f"eq.{env}"
     resp = httpx.get(
         f"{ledger.SUPABASE_URL}/rest/v1/{table}",
         params=params,
@@ -251,7 +307,7 @@ def _readiness(svc: dict, now: dt.datetime, last_restart: float | None,
     if last_restart and (now - dt.datetime.fromtimestamp(last_restart, tz=dt.timezone.utc)
                          ).total_seconds() < _RESTART_GRACE_SEC:
         return "skipped", "warming up"
-    if svc["name"] == QUANT_PAPER and not nyse_session_open(now):
+    if svc.get("market_hours_only") and not nyse_session_open(now):
         return "skipped", "market closed"
     if last_write_ts is None:
         return "stale", "no recent ledger write"
@@ -312,14 +368,22 @@ def _restart_warranted(svc: dict, up: bool, readiness: str,
 
 def _check_healthy(svc: dict, up: bool, readiness: str) -> bool:
     """Whether this cycle counts as healthy for the 7-day uptime figure.
-    Idle (stale but not restart_on_staleness -- e.g. Study Platform simply
-    having no users) counts healthy, the same way a skipped check (grace
-    period, market closed) already does: the agent itself is fine either way."""
+    Idle (stale but not enforced_cadence -- e.g. Study Platform simply having
+    no users) counts healthy, the same way a skipped check (grace period,
+    market closed) already does: the agent itself is fine either way.
+
+    Keyed off enforced_cadence, NOT restart_on_staleness (ADDED 2026-08-17):
+    Quant Live has a real enforced cadence -- its staleness is a genuine
+    fault worth counting against uptime -- but must never auto-restart, so
+    the two fields diverge for it. Using restart_on_staleness here would have
+    scored Quant Live's staleness as "idle" and its uptime as artificially
+    perfect, the same class of mistake already fixed once for Study
+    Platform's uptime, just from the opposite direction."""
     if not up:
         return False
     if readiness in ("ok", "skipped", "n/a"):
         return True
-    return readiness == "stale" and not svc.get("restart_on_staleness")
+    return readiness == "stale" and not svc.get("enforced_cadence")
 
 
 def _restart_count(state: dict, name: str, now: dt.datetime) -> int:
@@ -328,18 +392,34 @@ def _restart_count(state: dict, name: str, now: dt.datetime) -> int:
 
 
 def _restart_eligible(svc: dict, now: dt.datetime, state: dict,
-                      compliance: dict[str, list[str]] | None = None) -> bool:
+                      compliance: dict[str, list[str]] | None = None,
+                      liveness_failure: bool = False) -> bool:
     """Permission gates for auto-restart (unhealthy/blocked gating lives in
     refresh_health, which has the fresh check results). Quarantined agents --
     manually paused, or compliance-critical (an OVERDUE rule naming them) --
-    are never auto-restarted."""
+    are never auto-restarted.
+
+    The NYSE-session gate (any agent with market_hours_only=True -- ADDED
+    2026-08-17, replacing a hardcoded "is this literally Quant Paper" name
+    check now that Quant Live trades the same session) applies ONLY to a
+    staleness-triggered restart (no new data is expected outside market
+    hours, so there's nothing to fix) -- NOT to a genuine liveness failure
+    (FIXED 2026-08-17: this gate previously blocked ALL restarts for Quant
+    Paper outside market hours, including a real hung/dead process. A
+    container that hung Saturday sat unreachable the entire weekend, since
+    nyse_session_open() is never true then, and still hadn't recovered by
+    Monday's pre-market check -- only a manual restart fixed it. A dead
+    process is exactly as dead whether or not the market happens to be open,
+    and leaving it dead until the open is strictly worse, not more
+    cautious.)"""
     if svc["restart"] != "auto_heal" or not svc.get("container"):
         return False
     if svc["name"] in state.get("locks", {}):
         return False
-    if _quarantine_reason(svc["name"], state, compliance or {}):
+    if _quarantine_blocks_restart(_quarantine_reason(svc["name"], state, compliance or {}),
+                                  liveness_failure):
         return False
-    if svc["name"] == QUANT_PAPER and not nyse_session_open(now):
+    if not liveness_failure and svc.get("market_hours_only") and not nyse_session_open(now):
         return False
     restarts = state.get("restarts", {}).get(svc["name"], [])
     if restarts and now.timestamp() - restarts[-1] < _RESTART_GRACE_SEC:
@@ -448,6 +528,26 @@ def _quarantine_reason(name: str, state: dict,
     return None
 
 
+def _quarantine_blocks_restart(reason: str | None, liveness_failure: bool) -> bool:
+    """Whether a quarantine reason should hold back THIS restart attempt.
+    'manual' and 'compliance-auto' both mean the container was actually
+    paused (an operator, or policy, took a deliberate action) -- restarting
+    would directly fight that, so both always block, liveness failure or not.
+    A bare 'compliance' reason means an OVERDUE rule names this agent but
+    nothing was ever paused (FIXED 2026-08-17: this used to block a genuine
+    liveness failure too, for a reason that might have nothing to do with the
+    agent's technical health -- e.g. an unrelated paperwork deadline going
+    overdue shouldn't leave a hung process unrepaired). A staleness-triggered
+    restart still respects a bare 'compliance' flag -- bouncing a technically-
+    reachable agent while its compliance posture is red is exactly the
+    caution that flag exists for."""
+    if not reason:
+        return False
+    if reason == "compliance" and liveness_failure:
+        return False
+    return True
+
+
 def quarantine_agent(name: str, reason: str = "manual") -> None:
     """Operator-initiated quarantine. The container pause is done by the
     caller through the restart proxy; this records the state so the NOC stops
@@ -479,6 +579,147 @@ def unquarantine_agent(name: str) -> bool:
     return False
 
 
+_QUARANTINE_RECONCILE_STREAK = 2   # consecutive reachable cycles before a stale flag self-clears
+
+
+def _reconcile_quarantine(state: dict, name: str, up: bool) -> bool:
+    """Self-heal a stale 'quarantined' flag: if an agent marked quarantined
+    is actually reachable for _QUARANTINE_RECONCILE_STREAK consecutive
+    cycles, the container was almost certainly unpaused through some path
+    other than resume_agent() -- a proxy call whose response was lost even
+    though the underlying unpause succeeded, a manual `docker unpause`
+    outside the dashboard, anything. Mutates `state` in place; returns True
+    if this call cleared the flag. Pure aside from that mutation -- no file
+    I/O, so it's directly testable.
+
+    FIXED 2026-08-18: previously nothing ever re-checked a quarantine flag
+    against reality. A resume attempt reported "proxy unreachable", the
+    container became reachable again a few minutes later regardless, and
+    the card kept showing "quarantined (paused)" indefinitely -- the only
+    way out was clicking Resume again and hoping. Deliberately requires TWO
+    consecutive reachable cycles (4 min), not one, so a single flaky probe
+    can't prematurely clear a quarantine that's still genuinely in effect.
+
+    Only reconciles 'manual' quarantines. A 'compliance-auto' pause is
+    policy-driven -- if the container answers again, that's not proof the
+    underlying compliance issue is resolved, so it stays paused until the
+    rule is actually marked complied (see app.py::_mark_complied(), which
+    already handles that resume path deliberately, not via this reconciler)."""
+    entry = state.get("quarantined", {}).get(name)
+    streaks = state.setdefault("quarantine_up_streak", {})
+    if not entry or entry.get("reason") == "compliance-auto":
+        streaks.pop(name, None)
+        return False
+    if not up:
+        streaks[name] = 0
+        return False
+    streaks[name] = streaks.get(name, 0) + 1
+    if streaks[name] < _QUARANTINE_RECONCILE_STREAK:
+        return False
+    del state["quarantined"][name]
+    del streaks[name]
+    _add_incident(state, name, "quarantine-reconciled",
+                  outcome="container reachable again -- stale quarantine flag cleared",
+                  detail="not resumed via this dashboard's Resume action")
+    return True
+
+
+# ---- quarantine passcode gate -----------------------------------------------
+# Both manual container actions -- Quarantine (pause) and Resume -- go through
+# check_quarantine_passcode() before the caller is allowed to touch the
+# container. Every attempt is logged to the incident log, success or failure,
+# same as everything else in this module (FIXED 2026-08-17: previously
+# neither action required anything at all beyond a confirm-dialog click, on a
+# dashboard the open internet can reach). Repeated failures against the same
+# agent lock further attempts out and page Telegram, mirroring the existing
+# 3-restarts-in-an-hour cooldown pattern exactly.
+
+def passcode_configured() -> bool:
+    """Whether NOC_ACTION_PASSCODE is set -- the UI disables both manual
+    actions entirely when this is False, rather than silently letting them
+    through unauthenticated."""
+    return bool(_ACTION_PASSCODE)
+
+
+def is_auth_locked(name: str) -> bool:
+    """Whether repeated failed passcode attempts have locked out further
+    manual actions for this agent. Distinct from the restart cooldown lock
+    (state key `locks`) -- this one is about who's allowed to try, not
+    whether auto-heal should keep retrying."""
+    return name in _load_state().get("auth_locks", {})
+
+
+def clear_auth_lock(name: str) -> None:
+    """UI action: clear a repeated-failed-passcode lockout. Logged."""
+    with _STATE_LOCK:
+        state = _load_state()
+        if state.get("auth_locks", {}).pop(name, None) is not None:
+            state.get("auth_failures", {}).pop(name, None)
+            _add_incident(state, name, "auth-unlocked", outcome="operator cleared lockout")
+            _save_state(state)
+
+
+def _passcode_attempt(state: dict, name: str, entered: str, now: dt.datetime) -> tuple[bool, str]:
+    """Pure decision + in-memory state mutation for one passcode attempt --
+    no file I/O, so it's directly testable (matching every other interesting
+    function in this module). See check_quarantine_passcode() for the public,
+    file-backed wrapper. Mutates `state` in place (failure list, lock,
+    incidents); the caller is responsible for persisting it."""
+    if name in state.get("auth_locks", {}):
+        _add_incident(state, name, "quarantine-auth-failed",
+                      outcome="blocked -- already auth-locked",
+                      detail="attempt made while locked out")
+        return False, "locked out from too many failed attempts -- clear the lock first"
+
+    if not _ACTION_PASSCODE:
+        _add_incident(state, name, "quarantine-auth-failed",
+                      outcome="no passcode configured", detail="action blocked")
+        return False, "passcode not configured -- action disabled"
+
+    if hmac.compare_digest(entered or "", _ACTION_PASSCODE):
+        return True, ""
+
+    failures = state.setdefault("auth_failures", {}).setdefault(name, [])
+    failures.append(now.timestamp())
+    window = now.timestamp() - _AUTH_FAIL_WINDOW_SEC
+    state["auth_failures"][name] = [ts for ts in failures if ts >= window]
+    fail_count = len(state["auth_failures"][name])
+    _add_incident(state, name, "quarantine-auth-failed",
+                  outcome=f"wrong passcode ({fail_count}/{_AUTH_FAIL_LIMIT})")
+
+    if fail_count >= _AUTH_FAIL_LIMIT:
+        state.setdefault("auth_locks", {})[name] = now.isoformat()
+        _add_incident(state, name, "auth-locked",
+                      outcome=f"{_AUTH_FAIL_LIMIT} failed attempts within "
+                              f"{_AUTH_FAIL_WINDOW_SEC // 60} min")
+        alerts.send_telegram(
+            f"\U0001f512 {name}: {_AUTH_FAIL_LIMIT} failed quarantine-passcode attempts "
+            f"in {_AUTH_FAIL_WINDOW_SEC // 60} min -- manual actions locked, "
+            f"clear from the dashboard if this was you",
+            tag="NOC", emoji="\U0001f512")
+
+    return False, "wrong passcode"
+
+
+def check_quarantine_passcode(name: str, entered: str) -> tuple[bool, str]:
+    """Verify a passcode attempt for a manual Quarantine/Resume action
+    against `name`. Returns (allowed, reason) -- reason is empty on success,
+    otherwise a short string safe to show the operator. Every attempt is
+    logged to the incident log regardless of outcome, since a failed attempt
+    is itself a signal worth keeping, not just a UI toast that vanishes.
+
+    Fails closed: no configured passcode means nothing is ever allowed
+    through, logged the same as a wrong one. Already-locked-out agents are
+    rejected before the passcode is even checked, and that rejection is
+    logged too (continued probing after a lockout is worth seeing)."""
+    now = dt.datetime.now(dt.timezone.utc)
+    with _STATE_LOCK:
+        state = _load_state()
+        allowed, reason = _passcode_attempt(state, name, entered, now)
+        _save_state(state)
+        return allowed, reason
+
+
 # ---- incidents -------------------------------------------------------------
 
 def _add_incident(state: dict, agent: str, event: str, outcome: str = "",
@@ -507,6 +748,37 @@ def _record_check(state: dict, name: str, healthy: bool, now: dt.datetime) -> No
               ).strftime("%Y-%m-%d")
     for stale in [d for d in checks if d < cutoff]:
         del checks[stale]
+    _record_slot(state, name, healthy, now)
+
+
+def _record_slot(state: dict, name: str, healthy: bool, now: dt.datetime) -> None:
+    """Fold this cycle's result into the current 6-hour slot (see _SLOT_SEC).
+    Mutates `state`; persisted by the caller's _save_state. Pure aside from
+    that mutation."""
+    slot_start = int(now.timestamp()) // _SLOT_SEC * _SLOT_SEC
+    slots = state.setdefault("check_slots", {}).setdefault(name, [])
+    if not slots or slots[-1]["start"] != slot_start:
+        slots.append({"start": slot_start, "ok": 0, "fail": 0})
+        del slots[:-_SLOT_COUNT]
+    slots[-1]["ok" if healthy else "fail"] += 1
+
+
+def uptime_slots(name: str) -> list[str]:
+    """The trailing 28 six-hour slots for one agent, OLDEST FIRST, each
+    'ok' | 'fail' | 'none' -- the data behind the card's uptime strip.
+    Reads only from the state file; render-safe (no network)."""
+    slots_by_start = {s["start"]: s for s in _load_state().get("check_slots", {}).get(name, [])}
+    current_start = int(time.time()) // _SLOT_SEC * _SLOT_SEC
+    out = []
+    for i in range(_SLOT_COUNT):
+        start = current_start - (_SLOT_COUNT - 1 - i) * _SLOT_SEC
+        entry = slots_by_start.get(start)
+        if not entry or (entry["ok"] + entry["fail"]) == 0:
+            out.append("none")
+        else:
+            out.append("fail" if entry["fail"] > 0 and entry["ok"] == 0
+                       else ("mixed" if entry["fail"] else "ok"))
+    return out
 
 
 def _uptime_7d(state: dict, name: str, now: dt.datetime | None = None) -> float | None:
@@ -582,6 +854,8 @@ def _refresh_health() -> None:
             locked = name in state.get("locks", {})
             restarts = state.get("restarts", {}).get(name, [])
             last_restart = restarts[-1] if restarts else None
+            if svc.get("quarantinable"):
+                _reconcile_quarantine(state, name, up)
             quarantine = _quarantine_reason(name, state, compliance)
 
             readiness, detail = "n/a", ""
@@ -605,13 +879,15 @@ def _refresh_health() -> None:
             # already paused/recorded", NOT "not compliance-quarantined" -- the
             # same OVERDUE rule makes this agent compliance-quarantined for
             # restart purposes, and that is exactly when the pause should fire.
-            # Guards: only quarantinable agents with a container; never Quant
-            # Paper during market hours (a pause mid-session is the operator's
-            # call, not a rule's).
+            # Guards: only quarantinable agents with a container; never a
+            # market_hours_only agent during its own session (a pause
+            # mid-session is the operator's call, not a rule's -- ADDED
+            # 2026-08-17: generalized off the field rather than hardcoding a
+            # second agent name now that Quant Live is also a trading agent).
             auto_target = auto_targets.get(name)
             if (name not in state.get("quarantined", {}) and auto_target
                     and svc.get("quarantinable") and svc.get("container")):
-                if name == QUANT_PAPER and nyse_session_open(now):
+                if svc.get("market_hours_only") and nyse_session_open(now):
                     _add_incident(state, name, "auto-quarantine skipped",
                                   outcome="market hours", detail=auto_target["rule"])
                 elif _proxy_action("pause", svc["container"]):
@@ -645,9 +921,11 @@ def _refresh_health() -> None:
                     pass  # circuit breaker: dependency confirmed down
                 elif locked:
                     pass
-                elif quarantine:
+                elif _quarantine_blocks_restart(quarantine, liveness_failure=not up):
                     pass  # quarantined: never bounce while red/manually paused
-                elif _restart_eligible(svc, now, state, compliance):
+                    # (unless it's a bare compliance flag AND this is a genuine
+                    # liveness failure -- see _quarantine_blocks_restart)
+                elif _restart_eligible(svc, now, state, compliance, liveness_failure=not up):
                     outcome = "ok" if _restart_container(svc["container"]) else "failed"
                     state.setdefault("restarts", {}).setdefault(name, []).append(now.timestamp())
                     _add_incident(state, name, "restarted", outcome=outcome, detail="auto-heal")
@@ -659,15 +937,25 @@ def _refresh_health() -> None:
                         locked = True
             elif unhealthy and svc["restart"] == "alert_only" \
                     and not prev.get(name, {}).get("alerted_unhealthy"):
+                # ADDED 2026-08-17: this used to always say "liveness check
+                # failed" -- fine while every alert_only agent was liveness-
+                # only, wrong the moment one (Quant Live) can also go
+                # unhealthy purely from staleness while still reachable.
+                if not up:
+                    reason = "liveness check failed"
+                    incident_detail = "down alert"
+                else:
+                    reason = f"stale -- {detail or 'no recent data'}"
+                    incident_detail = "staleness alert"
                 ok = alerts.send_telegram(
-                    f"{name} is down (liveness check failed)", tag="NOC",
+                    f"{name} is unhealthy ({reason})", tag="NOC",
                     emoji="\U0001f6a8")
                 _add_incident(state, name, "alert sent",
                               outcome="telegram" if ok else "telegram failed",
-                              detail="down alert")
+                              detail=incident_detail)
 
             # uptime: "healthy" = liveness ok AND readiness not a real fault.
-            # Idle (stale but not restart_on_staleness, e.g. Study Platform
+            # Idle (stale but not enforced_cadence, e.g. Study Platform
             # simply having no users) counts healthy, the same way a skipped
             # check (grace / market closed) already does.
             healthy = _check_healthy(svc, up, readiness)
@@ -738,10 +1026,15 @@ def _selftest() -> None:
             self.assertEqual(_readiness(svc, now, None, None)[0], "stale")
             # grace: last restart 60s ago -> skipped
             self.assertEqual(_readiness(svc, now, now.timestamp() - 60, stale)[0], "skipped")
-            # quant paper outside market hours -> skipped (Sat)
-            qp = {**svc, "name": QUANT_PAPER}
+            # market_hours_only agent outside market hours -> skipped (Sat)
+            qp = {**svc, "name": QUANT_PAPER, "market_hours_only": True}
             sat = dt.datetime(2026, 8, 15, 12, 0, tzinfo=dt.timezone.utc)
             self.assertEqual(_readiness(qp, sat, None, stale)[0], "skipped")
+            # a stale agent WITHOUT market_hours_only is not skipped on a
+            # weekend -- proves the exception is field-driven, not name-driven
+            # (Event Radar has no session; its staleness never gets a pass).
+            no_session = {**svc, "name": "Event Radar"}
+            self.assertEqual(_readiness(no_session, sat, None, stale)[0], "stale")
             # freshness_table-only agent (Study Platform): readiness is still
             # evaluated -- the source override is what changed, not the gate
             st = {"name": "S", "freshness_table": "answer_log", "freshness_sec": 43200}
@@ -764,6 +1057,29 @@ def _selftest() -> None:
             state["restarts"]["X"] = []
             self.assertTrue(_restart_eligible(svc, now, state))
 
+        def test_market_hours_gate_applies_only_to_staleness(self):
+            # FIXED 2026-08-17: a container that hung over a weekend was never
+            # auto-restarted, because the NYSE gate blocked every restart
+            # attempt for Quant Paper regardless of WHY it was being attempted.
+            state = {"restarts": {}}
+            sat = dt.datetime(2026, 8, 15, 12, 0, tzinfo=dt.timezone.utc)  # market closed
+            svc = {"restart": "auto_heal", "container": "quant-dashboard-docker",
+                   "name": QUANT_PAPER, "market_hours_only": True}
+            # staleness-triggered (default liveness_failure=False): still held
+            # for market hours, as intended -- no new data is expected anyway.
+            self.assertFalse(_restart_eligible(svc, sat, state))
+            # an agent WITHOUT market_hours_only is never held back by it --
+            # proves the gate is field-driven, not a second hardcoded name.
+            no_session = {**svc, "name": "Event Radar", "market_hours_only": False}
+            self.assertTrue(_restart_eligible(no_session, sat, state))
+            # a genuine liveness failure must be restart-eligible regardless --
+            # a dead process is exactly as dead whether the market is open.
+            self.assertTrue(_restart_eligible(svc, sat, state, liveness_failure=True))
+            # during market hours, both paths are eligible as before.
+            mon_open = dt.datetime(2026, 8, 17, 14, 0, tzinfo=dt.timezone.utc)  # 10:00 ET
+            self.assertTrue(_restart_eligible(svc, mon_open, state))
+            self.assertTrue(_restart_eligible(svc, mon_open, state, liveness_failure=True))
+
         def test_quarantine_reason(self):
             # no pause recorded, no overdue rule -> None
             self.assertIsNone(_quarantine_reason("A", {"quarantined": {}}, {}))
@@ -780,6 +1096,139 @@ def _selftest() -> None:
             now = dt.datetime(2026, 8, 14, 12, 0, tzinfo=dt.timezone.utc)
             self.assertFalse(_restart_eligible(svc, now, {"quarantined": {"A": {"reason": "manual"}}},
                                                compliance={"A": ["r"]}))
+
+        def test_quarantine_blocks_restart_scoping(self):
+            # FIXED 2026-08-17: a bare 'compliance' flag (an overdue rule
+            # names the agent, but nothing was ever actually paused) must not
+            # hold back a genuine liveness failure -- an unrelated paperwork
+            # deadline going overdue shouldn't leave a hung process unrepaired.
+            self.assertFalse(_quarantine_blocks_restart(None, liveness_failure=False))
+            self.assertFalse(_quarantine_blocks_restart(None, liveness_failure=True))
+            self.assertFalse(_quarantine_blocks_restart("compliance", liveness_failure=True))
+            self.assertTrue(_quarantine_blocks_restart("compliance", liveness_failure=False))
+            # an ACTUAL pause -- manual or policy-driven -- always blocks,
+            # liveness failure or not: restarting would directly fight a
+            # deliberate action someone (or some rule) already took.
+            self.assertTrue(_quarantine_blocks_restart("manual", liveness_failure=True))
+            self.assertTrue(_quarantine_blocks_restart("manual", liveness_failure=False))
+            self.assertTrue(_quarantine_blocks_restart("compliance-auto", liveness_failure=True))
+            self.assertTrue(_quarantine_blocks_restart("compliance-auto", liveness_failure=False))
+            # end to end through _restart_eligible: a bare compliance flag
+            # lets a liveness-failure restart through, an actual pause never does.
+            svc = {"name": "A", "restart": "auto_heal", "container": "a"}
+            now = dt.datetime(2026, 8, 14, 12, 0, tzinfo=dt.timezone.utc)
+            self.assertTrue(_restart_eligible(svc, now, {"quarantined": {}}, compliance={"A": ["r"]},
+                                              liveness_failure=True))
+            self.assertFalse(_restart_eligible(svc, now, {"quarantined": {}}, compliance={"A": ["r"]},
+                                               liveness_failure=False))
+            self.assertFalse(_restart_eligible(svc, now, {"quarantined": {"A": {"reason": "manual"}}},
+                                               compliance={"A": ["r"]}, liveness_failure=True))
+
+        def test_reconcile_quarantine(self):
+            # FIXED 2026-08-18: a manual quarantine flag with no way to
+            # notice the container became reachable again through some other
+            # path (a proxy call whose response was lost, a manual `docker
+            # unpause` outside the dashboard) stayed stuck forever.
+            state = {"quarantined": {"A": {"reason": "manual", "ts": "x"}}}
+
+            # not yet reachable: no change, no streak yet
+            self.assertFalse(_reconcile_quarantine(state, "A", up=False))
+            self.assertIn("A", state["quarantined"])
+
+            # ONE reachable cycle is not enough -- avoids clearing a real
+            # quarantine on a single flaky liveness probe
+            self.assertFalse(_reconcile_quarantine(state, "A", up=True))
+            self.assertIn("A", state["quarantined"])
+
+            # a cycle back to unreachable resets the streak
+            self.assertFalse(_reconcile_quarantine(state, "A", up=False))
+            self.assertFalse(_reconcile_quarantine(state, "A", up=True))
+            self.assertIn("A", state["quarantined"], "streak should have reset, not carried over")
+
+            # TWO consecutive reachable cycles clears it and logs why
+            self.assertTrue(_reconcile_quarantine(state, "A", up=True))
+            self.assertNotIn("A", state["quarantined"])
+            self.assertEqual(state["incidents"][-1]["event"], "quarantine-reconciled")
+
+            # a policy-driven pause is NEVER auto-reconciled -- answering
+            # again isn't proof the compliance issue itself is resolved
+            state = {"quarantined": {"A": {"reason": "compliance-auto", "ts": "x"}}}
+            self.assertFalse(_reconcile_quarantine(state, "A", up=True))
+            self.assertFalse(_reconcile_quarantine(state, "A", up=True))
+            self.assertIn("A", state["quarantined"])
+
+            # nothing quarantined: no-op, no crash
+            self.assertFalse(_reconcile_quarantine({}, "A", up=True))
+
+        def test_passcode_attempt(self):
+            # ADDED 2026-08-17: manual Quarantine/Resume previously required
+            # no authentication at all on a dashboard the open internet can
+            # reach. This exercises the pure decision logic directly, no
+            # state file involved -- see check_quarantine_passcode() for the
+            # file-backed wrapper.
+            global _ACTION_PASSCODE
+            import unittest.mock as mock
+            now = dt.datetime(2026, 8, 17, 12, 0, tzinfo=dt.timezone.utc)
+
+            # correct passcode: allowed, nothing recorded as a failure
+            state = {}
+            allowed, reason = _passcode_attempt(state, "A", _ACTION_PASSCODE, now)
+            self.assertTrue(allowed)
+            self.assertEqual(reason, "")
+            self.assertNotIn("A", state.get("auth_failures", {}))
+
+            # wrong passcode: rejected, one failure recorded, one incident logged
+            state = {}
+            allowed, reason = _passcode_attempt(state, "A", "wrong", now)
+            self.assertFalse(allowed)
+            self.assertEqual(reason, "wrong passcode")
+            self.assertEqual(len(state["auth_failures"]["A"]), 1)
+            self.assertEqual(state["incidents"][-1]["event"], "quarantine-auth-failed")
+
+            # already locked: rejected before the passcode is even checked --
+            # a CORRECT passcode against a locked agent still fails.
+            state = {"auth_locks": {"A": now.isoformat()}}
+            allowed, reason = _passcode_attempt(state, "A", _ACTION_PASSCODE, now)
+            self.assertFalse(allowed)
+            self.assertIn("locked out", reason)
+
+            # unconfigured passcode fails closed, even for what would
+            # otherwise be the right value. Direct global reassignment, not
+            # mock.patch("noc._ACTION_PASSCODE", ...) -- running this file as
+            # `python noc.py` makes it __main__, and mock.patch("noc...")
+            # would import a SEPARATE second copy of this module and patch
+            # that one's global, leaving the one _passcode_attempt actually
+            # reads untouched (httpx is fine to patch this way instead,
+            # elsewhere, since it's a shared third-party module singleton
+            # cached in sys.modules either way -- this plain string constant
+            # is not).
+            saved_passcode = _ACTION_PASSCODE
+            _ACTION_PASSCODE = ""
+            try:
+                state = {}
+                allowed, reason = _passcode_attempt(state, "A", "anything", now)
+                self.assertFalse(allowed)
+                self.assertIn("not configured", reason)
+            finally:
+                _ACTION_PASSCODE = saved_passcode
+
+            # 5th consecutive failure locks the agent out and pages Telegram --
+            # mock send_telegram so this never sends a real message.
+            state = {"auth_failures": {"A": [now.timestamp()] * 4}}
+            with mock.patch("noc.alerts.send_telegram", return_value=True) as sent:
+                allowed, reason = _passcode_attempt(state, "A", "still-wrong", now)
+            self.assertFalse(allowed)
+            self.assertIn("A", state["auth_locks"])
+            sent.assert_called_once()
+            self.assertEqual(state["incidents"][-1]["event"], "auth-locked")
+
+            # failures outside the window don't count toward the lockout
+            old = now - dt.timedelta(seconds=_AUTH_FAIL_WINDOW_SEC + 60)
+            state = {"auth_failures": {"A": [old.timestamp()] * 4}}
+            with mock.patch("noc.alerts.send_telegram", return_value=True) as sent:
+                allowed, reason = _passcode_attempt(state, "A", "still-wrong", now)
+            self.assertNotIn("A", state.get("auth_locks", {}))
+            sent.assert_not_called()
 
         def test_staleness_restart_gating(self):
             # enforced-cadence agent: stale readiness warrants a restart
@@ -847,15 +1296,60 @@ def _selftest() -> None:
 
         def test_idle_counts_healthy_for_uptime(self):
             # usage-driven agent (Study Platform) stale = idle: the agent is
-            # fine, just unused -- counts healthy, never restart-warranted.
-            usage = {"restart_on_staleness": False}
-            enforced = {"restart_on_staleness": True}
+            # fine, just unused -- counts healthy. Keyed off enforced_cadence,
+            # not restart_on_staleness (both happen to be False here too, but
+            # enforced_cadence is the one _check_healthy actually reads).
+            usage = {"restart_on_staleness": False, "enforced_cadence": False}
+            enforced = {"restart_on_staleness": True, "enforced_cadence": True}
             self.assertTrue(_check_healthy(usage, up=True, readiness="stale"))
             self.assertFalse(_check_healthy(enforced, up=True, readiness="stale"))
             self.assertFalse(_check_healthy(usage, up=False, readiness="stale"))
             self.assertTrue(_check_healthy(usage, up=True, readiness="ok"))
             self.assertTrue(_check_healthy(usage, up=True, readiness="skipped"))
             self.assertTrue(_check_healthy(usage, up=True, readiness="n/a"))
+
+        def test_enforced_cadence_diverges_from_restart_on_staleness(self):
+            # ADDED 2026-08-17: Quant Live's actual shape -- a real enforced
+            # cadence (staleness IS a fault, counts against uptime) but never
+            # auto-heal-eligible. Proves the two fields are read independently,
+            # not that one derives from the other.
+            quant_live = {"restart_on_staleness": False, "enforced_cadence": True}
+            # display/uptime: staleness is a real fault (enforced_cadence=True)
+            self.assertFalse(_check_healthy(quant_live, up=True, readiness="stale"))
+            # restart authority: never warranted (restart_on_staleness=False),
+            # even though enforced_cadence says this staleness is a real fault
+            self.assertFalse(_restart_warranted(quant_live, up=True, readiness="stale"))
+            # a liveness failure is unaffected by either field
+            self.assertTrue(_restart_warranted(quant_live, up=False, readiness="ok"))
+
+        def test_environment_scoped_freshness_lookup(self):
+            # ADDED 2026-08-17: Paper and Live share project_tag "quant" --
+            # environment_tag must additionally scope the Supabase query, or
+            # monitoring both lets each one's freshness leak into the other's.
+            paper = {"project_tag": "quant", "environment_tag": "paper"}
+            live = {"project_tag": "quant", "environment_tag": "live"}
+            neither = {"project_tag": "quant"}
+            captured = {}
+
+            class _FakeResp:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return []
+
+            def _fake_get(url, params, headers, timeout):
+                captured["params"] = params
+                return _FakeResp()
+
+            import unittest.mock as mock
+            with mock.patch("noc.httpx.get", side_effect=_fake_get):
+                _latest_write(paper)
+                self.assertEqual(captured["params"].get("environment"), "eq.paper")
+                _latest_write(live)
+                self.assertEqual(captured["params"].get("environment"), "eq.live")
+                _latest_write(neither)
+                self.assertNotIn("environment", captured["params"])
 
         def test_uptime(self):
             state = {}

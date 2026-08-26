@@ -5,6 +5,8 @@ __pycache__/
 .env
 .git/
 .nicegui/
-alert_state.json
-alert_settings.json
-noc_state.json
+
+# runtime state files -- ADDED 2026-08-18: moved under state/, a named Docker
+# volume in production (see docker-compose.yml); never bake stale local state
+# into the built image.
+state/

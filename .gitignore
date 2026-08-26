@@ -4,10 +4,13 @@ __pycache__/
 .venv/
 venv/
 .nicegui/
-alert_state.json
-alert_settings.json
 
-# runtime state files (never commit)
+# runtime state files (never commit) -- ADDED 2026-08-18: moved under state/,
+# a named Docker volume in production (see docker-compose.yml), but a bare
+# directory locally too -- ignore the whole thing rather than the individual
+# filenames it used to be. Root-level entries kept too, defensively, in case
+# a stray local run ever writes to the old pre-migration path again.
+state/
 noc_state.json
 alert_state.json
 alert_settings.json

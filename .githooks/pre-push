@@ -5,14 +5,37 @@
 # TRACKED in git (unlike .git/hooks/, which is per-clone and never version-
 # controlled) -- after cloning, run once: git config core.hooksPath .githooks
 #
-# NON-BLOCKING ON PURPOSE: git push must never wait on a Docker rebuild (can
-# take 10s-3min). `Start-Process ...` (no -Wait) hands the deploy to a
+# AUTOMATED TEST GATE (BLOCKING, ADDED 2026-08-26): the unit + render-path
+# suites must pass before anything else happens -- a failed run aborts the
+# push and the deploy is never triggered. The render suite drives a real
+# websocket client against live Supabase data, so it needs network + .env;
+# expect ~2-4 min. Skip deliberately with SKIP_TESTS=1 git push (not for
+# routine use -- an untested push is how regressions reach the live deck).
+#
+# NON-BLOCKING DEPLOY ON PURPOSE: git push must never wait on a Docker rebuild
+# (can take 10s-3min). `Start-Process ...` (no -Wait) hands the deploy to a
 # genuinely independent OS process -- not a backgrounded bash job, which on
 # Git-Bash's MSYS process model isn't reliably safe from being torn down when
 # this short-lived hook script exits a moment later -- then this hook exits
 # immediately. Check ~/llm-usage-dashboard-deploy.log (inside WSL2) for the
 # result; a failed deploy does NOT fail the push -- these are deliberately
 # independent concerns (can I save my code vs did the redeploy go cleanly).
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [ -z "$SKIP_TESTS" ]; then
+    PY="$REPO_ROOT/.venv/Scripts/python.exe"
+    [ -x "$PY" ] || PY="python"
+    echo "pre-push: running automated tests (SKIP_TESTS=1 to bypass)..."
+    if ! "$PY" -m pytest test_features.py test_render_smoke.py \
+            -q --tb=short -o asyncio_mode=auto -p no:cacheprovider; then
+        echo "" >&2
+        echo "pre-push: TESTS FAILED -- push aborted, deploy NOT triggered." >&2
+        echo "pre-push: fix or bypass consciously with: SKIP_TESTS=1 git push ..." >&2
+        exit 1
+    fi
+    echo "pre-push: tests passed."
+fi
 
 while read -r local_ref local_sha remote_ref remote_sha; do
     if [ "$remote_ref" = "refs/heads/main" ]; then

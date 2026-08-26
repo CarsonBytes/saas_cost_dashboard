@@ -78,9 +78,32 @@ python app.py                                          # http://localhost:8095
 
 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` are optional — the alert banner still works without them, just no push notification.
 
+## Deployment & CI — Docker inside WSL2
+
+The production implementation runs as Docker containers **inside WSL2 (Ubuntu)**, not on Windows directly — the native Windows Task Scheduler launcher was decommissioned 2026-08-13 in favor of this setup (Docker's `restart:` policy replaces the hand-rolled PowerShell restart loop). The stack lives at `/home/cap/llm-usage-dashboard/` inside WSL2 and is served on port 8095, which Windows sees on `localhost:8095` through WSL's localhost forwarding (`wslrelay`) — that loopback port belongs to the deployed container, so run any local dev instance on a different port (e.g. `$env:PORT=8097`).
+
+**The deploy pipeline is push-triggered**, wired through the tracked git hooks (`.githooks/pre-push`, active after a fresh clone via `git config core.hooksPath .githooks`):
+
+1. **Test gate (blocking)** — every push first runs the automated suites: `test_features.py` (fast pure-function units) + `test_render_smoke.py` (real-websocket render/interaction tests against live Supabase data, ~2–4 min). A failure aborts the push and nothing deploys. Deliberate bypass: `SKIP_TESTS=1 git push …`.
+2. **Deploy trigger (non-blocking)** — for pushes to `main`, the hook hands off to [`scripts/wsl2-docker-deploy.sh`](scripts/wsl2-docker-deploy.sh) as an independent OS process, so `git push` returns immediately while the rebuild runs.
+3. **Redeploy sequence** — the script rsyncs the repo from `/mnt/d/llm-usage-dashboard/` into `/home/cap/llm-usage-dashboard/` (excluding `.env`, state files, `.venv`), runs `docker compose build` (digest-pinned base images + `uv sync --frozen`: same commit ⇒ same image), then `docker compose up -d`, then health-checks `http://localhost:8095` for ~30s before declaring success.
+
+Results land in `~/llm-usage-dashboard-deploy.log` (inside WSL2); a failed deploy leaves the previous container running untouched and does **not** fail the push. To redeploy without a push: `wsl -d Ubuntu -- bash /mnt/d/llm-usage-dashboard/scripts/wsl2-docker-deploy.sh manual`.
+
 ## Changelog
 
 Newest first. Each entry is what shipped plus the reasoning behind it — not just a diff summary.
+
+### 2026-08-26 (Phase 4) — drill-down, KPI deltas, budget, uptime strips, custom range, UI polish, push-gated tests
+- **Per-project drill-down (A1)**: a filter icon on each agent card (Quant Paper/Live → quant, Event Radar, Study Platform) filters every KPI, chart, table and CSV to that project's ledger rows; an active filter shows as a chip above the tab strip. The alert check deliberately stays global (unfiltered rows) so a project filter can't change what the daily threshold means.
+- **KPI deltas (A2)**: Total calls / cost / tokens now show `↑ N% vs prev Nd` against a disjoint preceding window (`ledger.fetch_rows_and_previous`); cost deltas are colored good/bad, counts stay neutral.
+- **Configurable monthly budget (A3)**: first-class setting persisted next to the threshold — with a read-modify-write settings file so neither setting can clobber the other (the original whole-file overwrite would have). Unset falls back to threshold × 30, labelled "(implied)" on the KPI.
+- **Uptime strips (A4)**: each monitored agent card renders its trailing week as 28 six-hour slots (green/mixed/red/grey with hover detail), from new bounded `check_slots` state folded by the health cycle — WHEN an agent was down is information a single percentage loses.
+- **Cost-spike markers (A5)**: days costing >2× the trailing-7-day mean get an amber dot + "Nx avg" label on the daily chart. Deterministic math, no LLM; hourly view skips it.
+- **CSV everywhere (A6)**: model-usage and latency tables gained exports via one shared `_download_csv` helper (call-types was the only export before).
+- **UI polish (B1–B6)**: dark mode persists across reloads via `app.storage.user` (initial icon reflects restored state); "Last refreshed" turns amber past 2× the alert interval instead of silently reading live; custom HKT date range beside the presets (Apply/clear, presets restore); search inputs filter the incident log and audit trail (nested refreshables so typing never loses focus — and using the dedicated `on_change=` rather than raw `.on("update:model-value")`, whose event carries `.args` not `.value` and made the first cut of the filters silently no-op); Enter saves the threshold/budget inputs; KPI cards moved to a responsive grid that doesn't wrap unevenly at 375px.
+- **Push-gated automated tests**: `.githooks/pre-push` now runs both suites BEFORE anything else — `test_features.py` (10 network-free units: spikes, totals, deltas, budget coexistence, slot alignment/colors, HKT boundary) + `test_render_smoke.py` (11 real-websocket tests driving the actual page: tabs, drill-down chip, filters, custom range apply/clear, dark-mode persistence, Enter-to-save, staleness, uptime strips, CSVs). Red push = aborted push = no deploy. Found en route: the PostgREST window query was getting percent-encoded into a single param (400), fixed with repeated `created_at` params.
+- **Infra documented**: production is Docker-in-WSL2, deploy is push-triggered (see the new Deployment & CI section).
 
 ### 2026-08-16 (Phase 3) — governance narrative engine + hourly Today + tab renames + auto_action
 - **Task 1**: the Today (1-day) range chart now buckets by **hour** (`hourly_by_project`) instead of collapsing into one calendar-day bar — the intraday cost shape is visible again.

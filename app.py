@@ -51,7 +51,13 @@ import noc
 import services
 
 STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch": None,
-               "alert": None}
+               "alert": None,
+               # ADDED 2026-08-26 (Phase 4): per-project drill-down filter
+               # ("quant"/"events"/"study"/...; None = all projects), the
+               # preceding equal-length window's totals for KPI deltas, and
+               # an optional custom HKT date range (start, end) overriding
+               # the trailing-days toggle.
+               "project": None, "prev": None, "custom": None, "preset_days": 7}
 
 _ALERT_CHECK_INTERVAL_SEC = int(os.environ.get("ALERT_CHECK_INTERVAL_SEC", "900"))
 _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC", "120"))
@@ -60,12 +66,55 @@ _COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
 
 _PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "(untagged)": "#6b7280"}
 
+# Agent card -> ledger project tag, for the per-project drill-down (A1):
+# which cards' costs are actually visible in the shared ledger. Quant Paper
+# and Live share project_tag "quant" (split by environment, not by project),
+# and Study Platform writes project="study" even though its freshness signal
+# comes from answer_log.
+_CARD_PROJECTS = {"Quant Trading (Paper)": "quant", "Quant Trading (Live)": "quant",
+                  "Event Radar": "events", "Study Platform": "study"}
 
-def fetch_stats(days: int) -> None:
+
+@ui.refreshable
+def project_filter_chip() -> None:
+    """Active per-project cost filter, shown just above the tab strip. Empty
+    when no filter is on."""
+    project = STATE.get("project")
+    if not project:
+        return
+    with ui.row().classes("items-center gap-2 bg-blue-50 border border-blue-200 rounded px-3 py-1"):
+        ui.icon("filter_alt", color="blue-600").classes("text-sm")
+        ui.label(f"Costs filtered to: {project}").classes("text-sm text-blue-900")
+        ui.button(icon="close", on_click=lambda: _set_project(None)) \
+            .props("dense flat round size=sm color=blue-600").tooltip("Clear filter")
+
+
+def fetch_stats(days: int | None = None) -> None:
+    """Fetch + aggregate the active window: the custom HKT date range when one
+    is set in STATE, otherwise the trailing-`days` window. Also fetches the
+    PRECEDING equal-length window for the KPI deltas -- two paginated
+    PostgREST calls instead of one; still off the event loop (callers run this
+    in a thread). The background alert loop calls this with no args and keeps
+    refreshing whatever window is currently active.
+
+    The alert check always sees the UNFILTERED rows: the daily threshold is a
+    global figure and must not change meaning while a project filter is on.
+    """
     try:
-        rows = ledger.fetch_rows(days)
-        STATE["data"] = ledger.build_stats(rows, days)
+        days = days or STATE["days"]
+        custom = STATE.get("custom")
+        if custom:
+            rows, prev_rows = ledger.fetch_rows_custom(*custom)
+            days = (dt.date.fromisoformat(custom[1])
+                    - dt.date.fromisoformat(custom[0])).days + 1
+        else:
+            rows, prev_rows = ledger.fetch_rows_and_previous(days)
+        project = STATE.get("project")
+        data_rows = [r for r in rows if r.get("project") == project] if project else rows
+        STATE["data"] = ledger.build_stats(data_rows, days)
         STATE["rows"] = rows
+        STATE["days"] = days
+        STATE["prev"] = ledger.window_totals(prev_rows)
         STATE["error"] = None
         STATE["last_fetch"] = dt.datetime.now(dt.timezone.utc)  # aware UTC; displayed in HKT
         STATE["alert"] = alerts.run_check(ledger.today_cost(rows))
@@ -73,10 +122,42 @@ def fetch_stats(days: int) -> None:
         STATE["error"] = str(e)
 
 
-def _kpi(title: str, value: str, *, warn: bool = False) -> None:
-    with ui.card().classes("min-w-[160px] grow" + (" bg-red-50" if warn else "")):
+def _set_project(project: str | None) -> None:
+    """Set/clear the per-project drill-down filter and refetch (the aggregate
+    runs on filtered rows server-side of the UI, so every chart, table, KPI
+    and CSV export follows the filter with no further plumbing)."""
+    STATE["project"] = project
+    fetch_stats()
+    refresh_all()
+
+
+def _kpi(title: str, value: str, *, warn: bool = False,
+         sub: str | None = None, sub_cls: str = "text-grey-6") -> None:
+    """One KPI card. `sub` is a small secondary line (e.g. a
+    period-over-period delta); the card itself sits in the overview tab's
+    responsive grid -- 1 col on phones, 2 on tablets, 3 on desktop -- instead
+    of the old flex row whose `min-w grow` cards wrapped unevenly at 375px."""
+    with ui.card().classes("w-full" + (" bg-red-50" if warn else "")):
         ui.label(title).classes("text-xs text-grey-6")
         ui.label(value).classes("text-xl font-bold" + (" text-red-600" if warn else ""))
+        if sub:
+            ui.label(sub).classes(f"text-xs {sub_cls}")
+
+
+def _delta_sub(current: float, previous: float | None, *, lower_is_better: bool = False) -> tuple[str, str] | None:
+    """Period-over-period delta line for a KPI: ('↑ 23% vs prev 7d', cls).
+    None when there's no prior window or a zero baseline (a percentage off
+    zero would be meaningless). Cost deltas are colored by whether they're
+    good news; call/token counts stay neutral grey."""
+    if not previous:
+        return None
+    pct = (current - previous) / previous * 100
+    arrow = "↑" if pct >= 0 else "↓"
+    label = f"{arrow} {abs(pct):.0f}% vs prev {STATE['days']}d"
+    if lower_is_better:
+        cls = "text-red-600" if pct > 0 else ("text-green-700" if pct < 0 else "text-grey-6")
+        return label, cls
+    return label, "text-grey-6"
 
 
 def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = None) -> None:
@@ -113,16 +194,38 @@ def _efficiency_table(ranked: list[dict], label_field: str) -> None:
     ui.table(columns=cols, rows=rows, row_key="label").classes("w-full").props("dense")
 
 
-def _download_call_types_csv(data: dict) -> None:
+def _download_csv(filename: str, header: list[str], rows: list[list]) -> None:
+    """One generic CSV download for every export button (call-types, model
+    usage, latency) -- previously only call-types had one."""
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["project", "call_type", "calls", "cost_usd", "cost_per_call",
-                      "prompt_tokens", "completion_tokens"])
-    for r in ledger.with_cost_per_call(data["by_call_type"]):
-        writer.writerow([r["project"], r["call_type"], r["calls"], r["cost_usd"],
-                          r["cost_per_call"], r["prompt_tokens"], r["completion_tokens"]])
-    ui.download(buf.getvalue().encode(), filename=f"llm_usage_{data['range_days']}d.csv",
-                media_type="text/csv")
+    writer.writerow(header)
+    writer.writerows(rows)
+    ui.download(buf.getvalue().encode(), filename=filename, media_type="text/csv")
+
+
+def _download_call_types_csv(data: dict) -> None:
+    rows = [[r["project"], r["call_type"], r["calls"], r["cost_usd"],
+             r["cost_per_call"], r["prompt_tokens"], r["completion_tokens"]]
+            for r in ledger.with_cost_per_call(data["by_call_type"])]
+    _download_csv(f"llm_usage_{data['range_days']}d.csv",
+                  ["project", "call_type", "calls", "cost_usd", "cost_per_call",
+                   "prompt_tokens", "completion_tokens"], rows)
+
+
+def _download_model_usage_csv(data: dict) -> None:
+    _download_csv(f"model_usage_{data['range_days']}d.csv",
+                  ["project", "call_type", "model", "calls", "cost_usd"],
+                  [[r["project"], r["call_type"], r["model"], r["calls"], r["cost_usd"]]
+                   for r in data["by_project_call_type_model"]])
+
+
+def _download_latency_csv(data: dict) -> None:
+    ranked = ledger.latency_ranking(data["by_call_type"])
+    _download_csv(f"latency_{data['range_days']}d.csv",
+                  ["project", "call_type", "avg_latency_ms", "calls"],
+                  [[r["project"], r["call_type"], r["avg_latency_ms"], r["calls"]]
+                   for r in ranked])
 
 
 @ui.refreshable
@@ -215,42 +318,109 @@ async def _proxy_action(action: str, container: str) -> bool:
         return False
 
 
+def _quarantine_targets(svc: dict) -> list[str]:
+    """Which container(s) a manual Quarantine/Resume touches -- usually just
+    `container`, but a card can represent more than one running container
+    (ADDED 2026-08-18: Event Radar's public demo runs as its own separate
+    container alongside the private instance; see services.py's
+    quarantine_containers docs)."""
+    return svc.get("quarantine_containers") or [svc["container"]]
+
+
 async def _quarantine(svc: dict) -> None:
-    """Operator-initiated quarantine: pause the container via the proxy, then
-    record it so the NOC stops auto-restarting the agent. Never automatic."""
-    ok = await _proxy_action("pause", svc["container"])
-    if ok:
+    """Operator-initiated quarantine: pause every container in this agent's
+    group via the proxy, then record it so the NOC stops auto-restarting the
+    agent. Never automatic. All-or-nothing feedback: if any container in the
+    group fails to pause, say exactly which one -- a silent partial pause
+    (e.g. the private instance paused but the public demo still running)
+    would be worse than an obvious failure."""
+    containers = _quarantine_targets(svc)
+    failed = [c for c in containers if not await _proxy_action("pause", c)]
+    if not failed:
         noc.quarantine_agent(svc["name"], reason="manual")
-        alerts.send_telegram(f"\U0001f6d1 {svc['name']} quarantined (operator pause)",
-                             tag="NOC", emoji="\U0001f6d1")
+        alerts.send_telegram(f"\U0001f6d1 {svc['name']} quarantined (operator pause): "
+                             f"{', '.join(containers)}", tag="NOC", emoji="\U0001f6d1")
         ui.notify(f"{svc['name']} paused + quarantined", type="warning")
     else:
-        ui.notify("Pause failed (proxy unreachable?)", type="negative")
+        ui.notify(f"Pause failed for: {', '.join(failed)} (proxy unreachable?)", type="negative")
     services_row.refresh()
 
 
 async def _resume(svc: dict) -> None:
-    """Lift a manual quarantine: unpause the container and clear the state."""
-    ok = await _proxy_action("unpause", svc["container"])
-    if ok:
+    """Lift a manual quarantine: unpause every container in the group and
+    clear the state. Same all-or-nothing container-level feedback as
+    _quarantine() -- naming which container failed (FIXED 2026-08-18: this
+    used to just say "proxy unreachable?" with no indication of which
+    container, or even whether the underlying pause/unpause itself failed
+    versus the response merely not making it back)."""
+    containers = _quarantine_targets(svc)
+    failed = [c for c in containers if not await _proxy_action("unpause", c)]
+    if not failed:
         noc.unquarantine_agent(svc["name"])
         ui.notify(f"{svc['name']} resumed", type="positive")
     else:
-        ui.notify("Resume failed (proxy unreachable?)", type="negative")
+        ui.notify(f"Resume failed for: {', '.join(failed)} (proxy unreachable? "
+                  f"if it recovers on its own shortly, the card will catch up "
+                  f"automatically)", type="negative")
     services_row.refresh()
 
 
-def _confirm_quarantine(svc: dict) -> None:
-    """Confirmation dialog before pausing a container (disruptive, manual)."""
+def _passcode_dialog(svc: dict, *, action: str) -> None:
+    """Shared confirm+passcode dialog for both manual container actions
+    (FIXED 2026-08-17: neither Quarantine nor Resume required anything
+    beyond a confirm-dialog click, on a dashboard the open internet can
+    reach -- anyone could pause or resume a live trading agent's container.
+    Every attempt, right or wrong, is checked and logged server-side via
+    noc.check_quarantine_passcode(); the passcode itself is never compared
+    client-side."""
+    is_quarantine = action == "quarantine"
+    verb = "Quarantine (pause)" if is_quarantine else "Resume"
     with ui.dialog() as dialog, ui.card():
-        ui.label(f"Quarantine {svc['name']}?").classes("font-bold")
-        ui.label("The container will be PAUSED until you resume it manually. "
-                 "Auto-restart is suppressed while quarantined.").classes("text-sm")
+        ui.label(f"{verb} {svc['name']}?").classes("font-bold")
+        if is_quarantine:
+            ui.label("The container will be PAUSED until you resume it manually. "
+                     "Auto-restart is suppressed while quarantined.").classes("text-sm")
+        else:
+            ui.label("The container will be UNPAUSED and normal monitoring "
+                     "resumes.").classes("text-sm")
+        passcode_input = ui.input("Passcode", password=True, password_toggle_button=True) \
+            .props("dense outlined autofocus").classes("w-full mt-2")
+        error_label = ui.label("").classes("text-xs text-red-600 mt-1")
+
+        async def _submit() -> None:
+            allowed, reason = noc.check_quarantine_passcode(svc["name"], passcode_input.value)
+            if not allowed:
+                # FIXED 2026-08-17 (found during verification): this used to
+                # also call services_row.refresh() here to reflect a fresh
+                # lockout immediately -- but this dialog is rendered inside
+                # that same refreshable's tree, so refreshing it while the
+                # dialog is still open destroyed the dialog along with it,
+                # taking the error message with it before the operator could
+                # read it or retry. The card's auth-locked state still shows
+                # up on the next natural refresh (background health loop, or
+                # closing this dialog); staying open with the error visible
+                # matters more than that state being instantly reflected.
+                error_label.text = reason
+                passcode_input.value = ""
+                return
+            dialog.close()
+            await (_quarantine(svc) if is_quarantine else _resume(svc))
+            # _quarantine()/_resume() each already call services_row.refresh()
+            # at the end -- no need to duplicate it here.
+
+        passcode_input.on("keydown.enter", _submit)
         with ui.row().classes("justify-end gap-2 mt-2"):
             ui.button("Cancel", on_click=dialog.close).props("flat")
-            ui.button("Quarantine", on_click=lambda: (dialog.close(), _quarantine(svc)))\
-                .props("color=red")
+            ui.button(verb, on_click=_submit).props("color=red" if is_quarantine else "color=positive")
     dialog.open()
+
+
+def _confirm_quarantine(svc: dict) -> None:
+    _passcode_dialog(svc, action="quarantine")
+
+
+def _confirm_resume(svc: dict) -> None:
+    _passcode_dialog(svc, action="resume")
 
 
 @ui.refreshable
@@ -389,11 +559,20 @@ def governance_view() -> None:
     ui.table(columns=wcols, rows=wrows, row_key="agent").classes("w-full").props("dense")
 
     # --- Section C: Audit Trail ----------------------------------------------
+    # Filter input lives OUTSIDE the nested refreshable table for the same
+    # focus-loss reason as the incident log's.
     ui.label("Audit trail").classes("text-sm font-bold mt-4")
     audit = governance.get_audit_log()
-    if not audit:
-        ui.label("(no audit entries yet)").classes("text-sm text-grey")
-    else:
+
+    def _render_audit(q: str) -> None:
+        q = q.lower()
+        entries = [a for a in audit
+                   if not q or q in a.get("rule_name", "").lower()
+                   or q in a["action_taken"].lower() or q in a.get("actor", "").lower()]
+        if not entries:
+            ui.label("(no matching audit entries)" if q else "(no audit entries yet)") \
+                .classes("text-sm text-grey")
+            return
         acols = [
             {"name": "ts", "label": "Time (HKT)", "field": "ts", "sortable": True},
             {"name": "rule", "label": "Rule", "field": "rule", "sortable": True},
@@ -402,18 +581,43 @@ def governance_view() -> None:
         ]
         arows = [{"ts": ledger.to_hkt(a["created_at"]).strftime("%Y-%m-%d %H:%M:%S"),
                   "rule": a.get("rule_name", "—"), "action": a["action_taken"],
-                  "actor": a.get("actor", "system")} for a in audit]
+                  "actor": a.get("actor", "system")} for a in entries]
         ui.table(columns=acols, rows=arows, row_key="ts").classes("w-full").props(
             "dense max-height=240px")
+
+    @ui.refreshable
+    def _audit_table() -> None:
+        _render_audit(_AUDIT_FILTER["q"])
+
+    def _on_audit_filter(e) -> None:
+        _AUDIT_FILTER["q"] = e.value or ""
+        _audit_table.refresh()
+
+    # on_change= (not .on("update:model-value")): only the dedicated value-
+    # change event carries e.value -- a raw .on() event has .args instead, and
+    # reading e.value on it raised, so the filter silently did nothing.
+    ui.input(placeholder="Filter rule / action / actor…", on_change=_on_audit_filter) \
+        .props("dense outlined clearable").classes("w-64").mark("audit-filter")
+    if not audit:
+        ui.label("(no audit entries yet)").classes("text-sm text-grey")
+    else:
+        _audit_table()
 
 
 @ui.refreshable
 def last_refreshed_label() -> None:
     """Header line under the description (layout request 2026-08-16): the
     data-staleness stamp lives with the page identity, not inside the tab
-    area. Refreshable so it updates on refresh_all without a page reload."""
-    ui.label(f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT)"
-             if STATE["last_fetch"] else "").classes("text-xs text-grey-6")
+    area. Refreshable so it updates on refresh_all without a page reload.
+    Turns amber past 2x the alert-check interval -- silent staleness would
+    otherwise read as live data (B2)."""
+    if not STATE["last_fetch"]:
+        return
+    age = (dt.datetime.now(dt.timezone.utc) - STATE["last_fetch"]).total_seconds()
+    stale = age > 2 * _ALERT_CHECK_INTERVAL_SEC
+    stamp = f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT)"
+    ui.label(stamp + (" -- stale, retrying…" if stale else "")).classes(
+        "text-xs " + ("text-amber-600" if stale else "text-grey-6"))
 
 
 @ui.refreshable
@@ -453,8 +657,12 @@ def services_row() -> None:
                             # stale means different things depending on the
                             # agent class: enforced-cadence -> a real fault
                             # (amber); usage-driven (Study Platform) -> just
-                            # idle, neutral tone, nothing wrong.
-                            dot_color = "bg-amber-500" if svc.get("restart_on_staleness") \
+                            # idle, neutral tone, nothing wrong. Keyed off
+                            # enforced_cadence, not restart_on_staleness --
+                            # Quant Live is a real fault when stale but must
+                            # never auto-restart, so the two fields diverge
+                            # for it (ADDED 2026-08-17).
+                            dot_color = "bg-amber-500" if svc.get("enforced_cadence") \
                                 else "bg-grey-6"
                         else:
                             dot_color = "bg-green-500"      # healthy
@@ -462,6 +670,12 @@ def services_row() -> None:
                             f"w-2.5 h-2.5 rounded-full {dot_color} shrink-0")
                     ui.label(svc["name"]).classes("font-bold")
                     _impact_badge(svc.get("business_impact"))
+                    if svc["name"] in _CARD_PROJECTS:
+                        # Per-project drill-down (A1): jump the cost tabs to
+                        # just this agent's ledger rows.
+                        ui.button(icon="filter_alt", on_click=lambda p=_CARD_PROJECTS[svc["name"]]: _set_project(p)) \
+                            .props("dense flat round size=sm color=grey-6") \
+                            .tooltip(f"Show only {svc['name']}'s costs")
                     if status and status.get("locked"):
                         ui.label("Locked").classes(
                             "text-xs bg-red-100 text-red-700 rounded px-1")
@@ -488,7 +702,7 @@ def services_row() -> None:
                         if status["up"] is False:
                             ui.label("down").classes("text-xs text-red-600")
                         elif status["readiness"] == "stale":
-                            if svc.get("restart_on_staleness"):
+                            if svc.get("enforced_cadence"):
                                 ui.label(f"degraded -- {status['readiness_detail'] or 'stale data'}")\
                                     .classes("text-xs text-amber-600")
                             else:
@@ -498,33 +712,76 @@ def services_row() -> None:
                             ui.label("blocked by: " + ", ".join(status["blocked_by"])).classes(
                                 "text-xs text-amber-700 bg-amber-50 rounded px-1 mt-1")
                         if status.get("uptime_7d") is not None:
-                            ui.label(f"7d uptime: {status['uptime_7d']:.1f}%").classes(
-                                "text-xs text-grey-6 mt-1")
+                            # Uptime strip (A4): the trailing week as 28
+                            # six-hour slots -- WHEN in the week an agent was
+                            # down is information a single percentage loses.
+                            with ui.row().classes("w-full items-center gap-2 mt-1"):
+                                ui.label(f"7d uptime: {status['uptime_7d']:.1f}%").classes(
+                                    "text-xs text-grey-6")
+                                slots = noc.uptime_slots(svc["name"])
+                                slot_cls = {"ok": "bg-green-500", "mixed": "bg-amber-400",
+                                            "fail": "bg-red-500", "none": "bg-grey-3"}
+                                with ui.row().classes("items-center gap-[2px]"):
+                                    for i, s in enumerate(slots):
+                                        hours_ago = (len(slots) - 1 - i) * 6
+                                        ui.element("div").classes(
+                                            f"w-1.5 h-3 rounded-sm {slot_cls[s]}") \
+                                            .tooltip(f"{hours_ago}h-{hours_ago + 6}h ago: {s}")
                         if overdue:
                             ui.label("⚠ compliance overdue: " + ", ".join(overdue)).classes(
                                 "text-xs text-red-600 mt-1")
-                        if status.get("quarantined"):
+                        auth_locked = noc.is_auth_locked(svc["name"])
+                        if auth_locked:
+                            # Repeated failed passcode attempts against this
+                            # agent (ADDED 2026-08-17) -- outranks the normal
+                            # quarantine/resume buttons: no further manual
+                            # action attempts until this is cleared.
+                            ui.label("passcode locked -- too many failed attempts").classes(
+                                "text-xs bg-red-100 text-red-700 rounded px-1 mt-1")
+                            ui.button("Clear passcode lock", on_click=lambda s=svc: (
+                                noc.clear_auth_lock(s["name"]), services_row.refresh())) \
+                                .props("dense flat color=red")
+                        elif status.get("quarantined"):
                             reason = status["quarantined"]
                             ui.label("auto-quarantined (paused)" if reason == "compliance-auto"
                                      else "quarantined (paused)").classes(
                                 "text-xs bg-red-100 text-red-700 rounded px-1 mt-1")
-                            ui.button("Resume", on_click=lambda s=svc: _resume(s)) \
+                            ui.button("Resume", on_click=lambda s=svc: _confirm_resume(s)) \
                                 .props("dense flat color=positive")
                         elif svc.get("quarantinable") and svc.get("container"):
-                            ui.button("Quarantine (pause)", on_click=lambda s=svc: _confirm_quarantine(s)) \
-                                .props("dense flat color=red")
+                            if noc.passcode_configured():
+                                ui.button("Quarantine (pause)",
+                                         on_click=lambda s=svc: _confirm_quarantine(s)) \
+                                    .props("dense flat color=red")
+                            else:
+                                # Fails closed (ADDED 2026-08-17): no passcode
+                                # configured means the action stays disabled
+                                # rather than silently working unauthenticated.
+                                ui.label("quarantine disabled -- passcode not configured").classes(
+                                    "text-xs text-grey-6 mt-1")
                         if svc["restart"] == "auto_heal" and status.get("locked"):
                             ui.button("Clear lock", on_click=lambda s=svc: (
                                 noc.clear_lock(s["name"]), services_row.refresh())) \
                                 .props("dense flat color=red")
 
 
+_INCIDENT_FILTER = {"q": ""}
+_AUDIT_FILTER = {"q": ""}
+
+
 @ui.refreshable
-def incident_log() -> None:
-    incidents = noc.get_incidents()
+def _incident_log_table() -> None:
+    """The table body alone is refreshable so typing in the filter box (which
+    lives OUTSIDE this refreshable) can't destroy the input mid-keystroke --
+    the same focus-loss trap as the passcode dialog's services_row.refresh()."""
+    q = _INCIDENT_FILTER["q"].lower()
+    incidents = [i for i in noc.get_incidents()
+                 if not q or q in i["agent"].lower() or q in i["event"].lower()
+                 or q in i.get("outcome", "").lower() or q in i.get("detail", "").lower()]
     if not incidents:
+        ui.label("(no matching incidents)" if q else "(no incidents logged yet)") \
+            .classes("text-sm text-grey")
         return
-    ui.label("Incident log").classes("text-sm font-bold mt-4")
     cols = [
         {"name": "ts", "label": "Time (HKT)", "field": "ts", "sortable": True},
         {"name": "agent", "label": "Agent", "field": "agent", "sortable": True},
@@ -539,11 +796,29 @@ def incident_log() -> None:
         "dense max-height=240px")
 
 
+def incident_log() -> None:
+    with ui.row().classes("w-full items-center justify-between mt-4 flex-wrap gap-2"):
+        ui.label("Incident log").classes("text-sm font-bold")
+
+        def _apply_filter(e) -> None:
+            _INCIDENT_FILTER["q"] = e.value or ""
+            _incident_log_table.refresh()
+
+        # on_change= (not .on("update:model-value")): only the dedicated
+        # value-change event carries e.value -- a raw .on() event has .args
+        # instead, and reading e.value on it raised, so the filter silently
+        # did nothing.
+        ui.input(placeholder="Filter agent / event / outcome…",
+                 value=_INCIDENT_FILTER["q"], on_change=_apply_filter) \
+            .props("dense outlined clearable").classes("w-64").mark("incident-filter")
+    _incident_log_table()
+
+
 @ui.refreshable
 def dashboard_body() -> None:
     if STATE["error"]:
         ui.label(f"⚠ {STATE['error']}").classes("text-red-600 font-bold")
-        ui.button("Retry", on_click=lambda: (fetch_stats(STATE["days"]), refresh_all())) \
+        ui.button("Retry", on_click=lambda: (fetch_stats(), refresh_all())) \
             .classes("mt-2")
         return
     data = STATE["data"]
@@ -569,16 +844,28 @@ def dashboard_body() -> None:
 
 def _overview_tab(data: dict) -> None:
     avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
-    monthly_budget = alerts.ALERT_DAILY_COST_USD * 30
+    monthly_budget = alerts.effective_monthly_budget()
+    budget_is_implied = not alerts.MONTHLY_BUDGET_USD
     projected_monthly = avg_daily * 30
     attribution = ledger.attribution_quality(data)
+    prev = STATE.get("prev")
 
-    with ui.row().classes("w-full flex-wrap gap-3 mt-2"):
-        _kpi("Total calls", f"{data['total_calls']:,}")
-        _kpi("Total cost", f"${data['total_cost_usd']:.4f}")
-        _kpi("Prompt tokens", f"{data['total_prompt_tokens']:,}")
-        _kpi("Completion tokens", f"{data['total_completion_tokens']:,}")
-        _kpi("Projected monthly cost", f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget",
+    with ui.grid().classes("w-full gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 mt-2"):
+        d_calls = _delta_sub(data["total_calls"], prev and prev["calls"])
+        d_cost = _delta_sub(data["total_cost_usd"], prev and prev["cost_usd"], lower_is_better=True)
+        d_ptok = _delta_sub(data["total_prompt_tokens"], prev and prev["prompt_tokens"])
+        d_ctok = _delta_sub(data["total_completion_tokens"], prev and prev["completion_tokens"])
+        _kpi("Total calls", f"{data['total_calls']:,}", sub=d_calls and d_calls[0],
+             sub_cls=d_calls and d_calls[1])
+        _kpi("Total cost", f"${data['total_cost_usd']:.4f}", sub=d_cost and d_cost[0],
+             sub_cls=d_cost and d_cost[1])
+        _kpi("Prompt tokens", f"{data['total_prompt_tokens']:,}", sub=d_ptok and d_ptok[0],
+             sub_cls=d_ptok and d_ptok[1])
+        _kpi("Completion tokens", f"{data['total_completion_tokens']:,}",
+             sub=d_ctok and d_ctok[0], sub_cls=d_ctok and d_ctok[1])
+        _kpi("Projected monthly cost",
+             f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget"
+             + (" (implied)" if budget_is_implied else ""),
              warn=projected_monthly > monthly_budget)
         _kpi("Cost attribution quality", f"{attribution['cost_tagged_pct']:.0f}% tagged by provider",
              warn=attribution["cost_tagged_pct"] < 50)
@@ -605,16 +892,33 @@ def _overview_tab(data: dict) -> None:
              "itemStyle": {"color": _PROJECT_COLORS.get(s["project"], "#6b7280")}}
             for s in dbp["series"]
         ]
+        series = project_series + [
+            {"type": "line", "name": "alert threshold",
+             "data": [alerts.ALERT_DAILY_COST_USD] * len(dbp["dates"]),
+             "lineStyle": {"type": "dashed", "color": "#dc2626", "width": 1}, "symbol": "none"},
+        ]
+        if data["range_days"] != 1 and data.get("daily_series"):
+            # Spike markers (A5): a day costing >2x the trailing 7-day mean
+            # gets an amber dot -- deterministic math, no LLM. Hourly view
+            # skips it (the baseline is daily).
+            totals = {r["date"]: r["cost_usd"] for r in data["daily_series"]}
+            spikes = ledger.cost_spike_dates(data["daily_series"])
+            if spikes:
+                series.append({
+                    "type": "scatter", "name": "spike (>2x avg)",
+                    "symbolSize": 11, "z": 10,
+                    "itemStyle": {"color": "#f59e0b"},
+                    "data": [{"value": [dbp["dates"].index(d), totals[d]],
+                              "label": {"show": True, "position": "top", "fontSize": 9,
+                                        "formatter": f"{m}x avg"}}
+                             for d, m in spikes.items() if d in totals],
+                })
         ui.echart({
             "tooltip": {"trigger": "axis"},
             "legend": {"top": 0, "textStyle": {"fontSize": 10}},
             "xAxis": {"type": "category", "data": dbp["dates"]},
             "yAxis": {"type": "value", "name": "cost (USD)"},
-            "series": project_series + [
-                {"type": "line", "name": "alert threshold",
-                 "data": [alerts.ALERT_DAILY_COST_USD] * len(dbp["dates"]),
-                 "lineStyle": {"type": "dashed", "color": "#dc2626", "width": 1}, "symbol": "none"},
-            ],
+            "series": series,
             "grid": {"left": 50, "right": 20, "top": 40, "bottom": 30},
         }).classes("w-full h-64")
 
@@ -636,7 +940,10 @@ def _cost_tab(data: dict) -> None:
             ui.label("By project & environment").classes("text-sm font-bold")
             _bar_chart(data["by_environment"], "project", ["environment"])
 
-    ui.label("Model usage by project & call type").classes("text-sm font-bold mt-4")
+    with ui.row().classes("w-full items-center justify-between mt-4 flex-wrap gap-2"):
+        ui.label("Model usage by project & call type").classes("text-sm font-bold")
+        ui.button("Download CSV", icon="download",
+                  on_click=lambda: _download_model_usage_csv(data)).props("flat dense")
     model_cols = [
         {"name": "project", "label": "Project", "field": "project", "sortable": True},
         {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
@@ -685,7 +992,11 @@ def _cost_tab(data: dict) -> None:
 
 
 def _reliability_tab(data: dict) -> None:
-    ui.label("Slowest call types (avg latency)").classes("text-sm font-bold")
+    with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
+        ui.label("Slowest call types (avg latency)").classes("text-sm font-bold")
+        if ledger.latency_ranking(data["by_call_type"]):
+            ui.button("Download CSV", icon="download",
+                      on_click=lambda: _download_latency_csv(data)).props("flat dense")
     latency_ranked = ledger.latency_ranking(data["by_call_type"])
     if latency_ranked:
         lat_cols = [
@@ -718,7 +1029,8 @@ def refresh_all() -> None:
     alert_banner.refresh()
     noc_banner.refresh()
     services_row.refresh()
-    incident_log.refresh()
+    project_filter_chip.refresh()
+    _incident_log_table.refresh()
     dashboard_body.refresh()
     last_refreshed_label.refresh()
 
@@ -749,14 +1061,14 @@ async def _alert_check_loop() -> None:
     fetch_stats are sync, so run them off the event loop thread."""
     while True:
         await asyncio.sleep(_ALERT_CHECK_INTERVAL_SEC)
-        await asyncio.to_thread(fetch_stats, STATE["days"])
+        await asyncio.to_thread(fetch_stats)  # re-fetches the active window
         _refresh_safely(alert_banner)
 
 
 async def _services_check_loop() -> None:
     while True:
         await asyncio.to_thread(noc.refresh_health)
-        _refresh_safely(noc_banner, services_row, incident_log)
+        _refresh_safely(noc_banner, services_row, _incident_log_table)
         await asyncio.sleep(_SERVICES_CHECK_INTERVAL_SEC)
 
 
@@ -782,24 +1094,35 @@ async def _compliance_loop() -> None:
 
 
 @ui.page("/")
-def main_page() -> None:
-    dark_mode = ui.dark_mode()
+async def main_page() -> None:
+    # Dark mode persists via app.storage.user (server-side, keyed to the
+    # browser-id cookie NiceGUI already sets) -- previously the toggle reset
+    # to light on every reload. storage.user works after the response is
+    # sent, unlike a browser-cookie write which only lands during page build.
+    stored_dark = bool(app.storage.user.get("dark_mode", False))
+    dark_mode = ui.dark_mode(value=stored_dark)
 
     def _toggle_dark() -> None:
         dark_mode.value = not dark_mode.value
+        app.storage.user["dark_mode"] = dark_mode.value
         dark_toggle.props(f"icon={'light_mode' if dark_mode.value else 'dark_mode'}")
 
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4"):
         with ui.row().classes("items-center justify-between w-full flex-wrap gap-2"):
             ui.label("Command Deck").classes("text-2xl font-bold")
             with ui.row().classes("items-center gap-2"):
-                dark_toggle = ui.button(icon="dark_mode", on_click=_toggle_dark).props("flat round")
+                # Initial icon must reflect the RESTORED state -- hardcoding
+                # "dark_mode" made the button lie about an already-dark page.
+                dark_toggle = ui.button(
+                    icon="light_mode" if stored_dark else "dark_mode",
+                    on_click=_toggle_dark).props("flat round").mark("dark-toggle")
                 ui.button("Refresh", icon="refresh",
-                          on_click=lambda: (fetch_stats(STATE["days"]), refresh_all())) \
+                          on_click=lambda: (fetch_stats(), refresh_all())) \
                     .props("color=primary")
-        ui.label("AI Governance Professional (AIGP) class -- cross-project usage: "
-                 "quant (paper + live) + study + event-radar, reading directly from "
-                 "the shared Supabase llm_calls ledger.").classes("text-sm text-grey-6")
+        ui.label("What my agents cost, and whether they're up -- LLM spend across "
+                 "quant, study, and event-radar from the shared usage ledger, plus "
+                 "live health, auto-heal, and an incident log for every monitored "
+                 "agent.").classes("text-sm text-grey-6")
         last_refreshed_label()  # under the description (layout request 2026-08-16)
 
         alert_banner()
@@ -808,32 +1131,81 @@ def main_page() -> None:
 
         def _set_range(e) -> None:
             STATE["days"] = e.value
+            STATE["preset_days"] = e.value
+            STATE["custom"] = None
             fetch_stats(STATE["days"])
+            refresh_all()
+
+        def _apply_custom() -> None:
+            start, end = start_date.value, end_date.value
+            if not (start and end):
+                ui.notify("Pick both a start and end date", type="warning")
+                return
+            if start > end:
+                ui.notify("Start date must be on or before the end date", type="negative")
+                return
+            STATE["custom"] = (start, end)
+            fetch_stats()
+            refresh_all()
+
+        def _clear_custom() -> None:
+            # Back to the last preset the operator had chosen.
+            start_date.set_value(None)
+            end_date.set_value(None)
+            STATE["custom"] = None
+            STATE["days"] = STATE.get("preset_days", 7)
+            fetch_stats(STATE["days"])
+            refresh_all()
+
+        def _save_settings() -> None:
+            alerts.set_daily_threshold(threshold_input.value)
+            alerts.set_monthly_budget(budget_input.value)
+            ui.notify(f"Alert threshold set to ${threshold_input.value:.2f}/day"
+                      + (f", monthly budget ${budget_input.value:.2f}" if budget_input.value
+                         else ", monthly budget cleared (implied from threshold)"),
+                      type="positive")
             refresh_all()
 
         ui.separator().classes("my-1")
         # Range + alert-threshold sit JUST ABOVE the tab strip (layout request
         # 2026-08-16): the cards are the identity, the controls tune the
         # charts below, and the tab strip is where those charts live.
-        with ui.row().classes("items-center gap-2 mt-1"):
+        project_filter_chip()
+        with ui.row().classes("items-center gap-2 mt-1 flex-wrap"):
             ui.label("Range:").classes("text-sm")
             ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
                       on_change=_set_range).props("dense")
+            ui.label("Custom:").classes("text-sm text-grey-6")
+            start_date = ui.input(placeholder="Start YYYY-MM-DD") \
+                .props("dense outlined style='max-width:130px'").mark("range-start")
+            ui.label("→").classes("text-xs text-grey-6")
+            end_date = ui.input(placeholder="End YYYY-MM-DD") \
+                .props("dense outlined style='max-width:130px'").mark("range-end")
+            ui.button("Apply", on_click=_apply_custom).props("dense flat").mark("apply-custom")
+            ui.button(icon="close", on_click=_clear_custom).props("dense flat round size=sm") \
+                .tooltip("Back to preset range").mark("clear-custom")
 
-        with ui.row().classes("items-center gap-2"):
+        with ui.row().classes("items-center gap-2 flex-wrap"):
             ui.label("Alert threshold ($/day):").classes("text-sm")
             threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
-                                        format="%.2f").props("dense outlined").classes("w-24")
+                                        format="%.2f").props("dense outlined").classes("w-24") \
+                .mark("threshold-input")
 
-            def _save_threshold() -> None:
-                alerts.set_daily_threshold(threshold_input.value)
-                ui.notify(f"Alert threshold set to ${threshold_input.value:.2f}", type="positive")
-                refresh_all()
+            budget_label = ("Monthly budget ($/mo):" if alerts.MONTHLY_BUDGET_USD
+                            else f"Budget (implied ${alerts.effective_monthly_budget():.2f}/mo):")
+            ui.label(budget_label).classes("text-sm text-grey-6")
+            budget_input = ui.number(value=alerts.MONTHLY_BUDGET_USD, min=0, step=5,
+                                     format="%.2f").props("dense outlined").classes("w-28") \
+                .mark("budget-input")
 
-            ui.button("Save", on_click=_save_threshold).props("dense flat")
+            # Enter-to-save on both inputs (B5): a number field's natural
+            # commit gesture shouldn't dead-end.
+            threshold_input.on("keydown.enter", _save_settings)
+            budget_input.on("keydown.enter", _save_settings)
+            ui.button("Save", on_click=_save_settings).props("dense flat")
         dashboard_body()  # controls sit just above the tab strip
 
-    fetch_stats(STATE["days"])
+    fetch_stats()
     refresh_all()
 
 
@@ -842,4 +1214,11 @@ app.on_startup(lambda: asyncio.create_task(_services_check_loop()))
 app.on_startup(lambda: asyncio.create_task(_risk_ledger_loop()))
 app.on_startup(lambda: asyncio.create_task(_compliance_loop()))
 
-ui.run(title="Command Deck", favicon="💰", port=int(os.environ.get("PORT", "8095")), reload=False, show=False)
+# storage_secret enables app.storage.user -- used to persist the dark-mode
+# toggle across reloads. Any non-empty string; not a user-facing secret.
+# The standard NiceGUI guard: lets the render-path smoke test (and any future
+# pytest suite) `import app` without starting the server.
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(title="Command Deck", favicon="💰", port=int(os.environ.get("PORT", "8095")),
+           reload=False, show=False, storage_secret=os.environ.get("NICEGUI_STORAGE_SECRET",
+                                                                   "command-deck-storage"))

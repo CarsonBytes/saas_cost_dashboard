@@ -46,11 +46,61 @@ Per-entry fields:
                                  scan loop, Event Radar's ingest schedule) get
                                  True: restarting can genuinely fix a broken
                                  loop there. Usage-driven agents (Study
-                                 Platform) stay False -- staleness there just
-                                 means "nobody has used it", which a container
-                                 restart cannot fix, so it degrades the card
-                                 but never restarts on its own. Default False.
+                                 Platform) and agents that are monitored but
+                                 never auto-restarted (Quant Live) stay False.
+                                 Restart-authority ONLY -- does not drive the
+                                 card's display (see enforced_cadence below).
+                                 Default False.
+  enforced_cadence             -- whether staleness here represents a REAL
+                                 FAULT for display purposes (amber "degraded"
+                                 + an alert) vs normal idle behavior (grey
+                                 "idle", nothing wrong). Deliberately separate
+                                 from restart_on_staleness (ADDED 2026-08-17):
+                                 Quant Live has a real enforced write cadence
+                                 (its staleness IS a fault worth showing and
+                                 alerting on) but must never auto-restart, so
+                                 the two fields diverge for it -- True/False --
+                                 where every other monitored agent so far had
+                                 them match. Default False.
+  environment_tag              -- optional narrowing of project_tag's freshness
+                                 lookup to one `environment` value in the
+                                 shared llm_calls ledger (ADDED 2026-08-17).
+                                 Needed the moment two agents share a
+                                 project_tag: Quant Paper and Quant Live both
+                                 write project="quant", split only by
+                                 environment="paper"/"live" -- without this,
+                                 monitoring both at once would let each one's
+                                 freshness leak into the other's.
+  market_hours_only            -- whether this agent's readiness check (and,
+                                 for auto_heal agents, its staleness-triggered
+                                 restart eligibility and auto-quarantine)
+                                 should be skipped outside the real NYSE
+                                 session (ADDED 2026-08-17, replacing a
+                                 hardcoded "is this literally Quant Paper by
+                                 name" check in noc.py -- Quant Live trades the
+                                 same session and needed the same exception
+                                 without noc.py growing a second hardcoded
+                                 name). Default False.
   container                   -- Docker container name to restart (auto_heal).
+                                 Also the manual pause target UNLESS
+                                 quarantine_containers overrides it. A
+                                 monitored agent that's alert_only may still
+                                 set this purely so the manual pause action
+                                 works.
+  quarantine_containers        -- optional list overriding which container(s)
+                                 the manual Quarantine/Resume action pauses
+                                 (ADDED 2026-08-18). Defaults to [container]
+                                 when absent. Needed when one card represents
+                                 more than one running container -- Event
+                                 Radar's public demo (events-demo.carsonng.com)
+                                 runs as its own separate container alongside
+                                 the private instance, and quarantining
+                                 "Event Radar" while leaving the public demo
+                                 serving traffic defeats the point, especially
+                                 for a compliance/policy-driven quarantine.
+                                 Auto-heal is UNAFFECTED by this -- it always
+                                 targets `container` only, since the demo has
+                                 no readiness signal of its own.
   quarantinable               -- whether the UI offers a manual "Quarantine
                                  (pause)" action for this agent (operator
                                  decision, never automatic). Only agents with
@@ -76,28 +126,42 @@ SERVICES = [
         "monitor": True,
         "restart": "auto_heal",
         "project_tag": "quant",
+        "environment_tag": "paper",     # shares project_tag "quant" with Live -- split by environment
         "freshness_sec": 900,          # writes every ~1min during market hours
+        "market_hours_only": True,     # no new scans expected outside the NYSE session
         "restart_on_staleness": True,  # enforced scan loop -- a stalled loop is a real fault
+        "enforced_cadence": True,      # matches restart_on_staleness here -- display + restart agree
         "container": "quant-dashboard-docker",
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
-        # Splitting the old combined Quant Trading card: Live runs as a native
-        # Windows deployment with its own separately-tuned watchdog, and this
-        # dashboard must not monitor, probe, or restart it -- that's deliberate
-        # (see the round's scope notes), not an oversight.
+        # MIGRATED to Docker 2026-08-17 (quant-dashboard-live-docker, its own
+        # quant-ibgateway-live-docker sidecar, restart:unless-stopped in
+        # D:\quant\docker-compose.live.yml -- confirmed live before writing
+        # this). Monitored like every other agent now that it's containerized,
+        # but deliberately kept off auto-heal: this dashboard's restart logic
+        # doesn't understand IBKR's reconciliation state well enough to safely
+        # bounce a live trading agent on an automated staleness inference, and
+        # Docker's own restart:unless-stopped already covers a genuine crash.
+        # alert_only gives full visibility (liveness, readiness, uptime,
+        # blocked-by) without ever taking automated action on real money.
         "name": "Quant Trading (Live)",
         "business_impact": "high",   # live 17-ETF trading
-        "desc": "Live 17-ETF trading, native deployment with own watchdog",
+        "desc": "Live 17-ETF trading, Docker deployment",
         "icon": "show_chart",
         # Access-gated like the other Private links, so the card labels it
         # Private (the generic renderer adds the lock icon off the label).
         "links": [("Private", "https://quant-live.carsonng.com")],
-        "monitor": False,
-        "restart": "none",
-        "project_tag": None,
-        "freshness_sec": None,
-        "container": None,
+        "monitor": True,
+        "restart": "alert_only",
+        "project_tag": "quant",
+        "environment_tag": "live",      # shares project_tag "quant" with Paper -- split by environment
+        "freshness_sec": 900,           # same board_scan cadence as Paper
+        "market_hours_only": True,      # no new scans expected outside the NYSE session
+        "restart_on_staleness": False,  # alert_only -- never auto-restarts, regardless
+        "enforced_cadence": True,       # staleness here IS a real fault (unlike Study Platform's idle)
+        "container": "quant-dashboard-live-docker",  # not for auto-heal -- enables manual pause only
+        "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
         "name": "Event Radar",
@@ -112,7 +176,19 @@ SERVICES = [
         "project_tag": "events",
         "freshness_sec": 86400,        # ingest runs every 24h
         "restart_on_staleness": True,  # enforced ingest schedule -- a missed run is a real fault
-        "container": "event-radar",
+        "enforced_cadence": True,      # matches restart_on_staleness here -- display + restart agree
+        "container": "event-radar",    # auto-heal target only -- readiness/freshness tracks this one
+        # ADDED 2026-08-18: "Event Radar" presents as one card but runs as TWO
+        # containers -- event-radar (private) and event-radar-demo (public,
+        # events-demo.carsonng.com). Quarantining the card now pauses both
+        # together; leaving the public demo running while "Event Radar" shows
+        # quarantined was found live to be actively misleading -- confirmed
+        # via docker ps that the demo kept serving traffic throughout. A
+        # compliance- or policy-driven quarantine in particular needs the
+        # PUBLIC instance paused at least as much as the private one. Does
+        # NOT affect auto-heal, which stays scoped to `container` above --
+        # the demo has no readiness signal of its own to justify restarting it.
+        "quarantine_containers": ["event-radar", "event-radar-demo"],
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
@@ -135,6 +211,7 @@ SERVICES = [
         # only a genuine liveness failure may restart this agent (FIXED 2026-08-15:
         # was auto-restarting every ~6min while idle and lock/re-lock cycling).
         "restart_on_staleness": False,
+        "enforced_cadence": False,     # matches restart_on_staleness here -- idle, not a fault
         "container": "study-app",
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },

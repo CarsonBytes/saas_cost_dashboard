@@ -27,7 +27,26 @@ load_dotenv(Path(__file__).parent / ".env")
 
 log = logging.getLogger(__name__)
 
-_SETTINGS_FILE = Path(__file__).parent / "alert_settings.json"
+# ADDED 2026-08-18: lives under state/, a named Docker volume (see
+# docker-compose.yml) shared with noc.py's state file -- previously this sat
+# in the container's writable layer with nothing mounted, so every redeploy
+# silently reset the alert-dedup history and any dashboard-set threshold back
+# to the .env default. mkdir here so local (non-Docker) runs and the very
+# first container start both just work, before _load_threshold() below reads it.
+_STATE_DIR = Path(__file__).parent / "state"
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
+_SETTINGS_FILE = _STATE_DIR / "alert_settings.json"
+
+
+def _load_settings() -> dict:
+    try:
+        return json.loads(_SETTINGS_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_settings(settings: dict) -> None:
+    _SETTINGS_FILE.write_text(json.dumps(settings))
 
 
 def _load_threshold() -> float:
@@ -45,14 +64,51 @@ ALERT_DAILY_COST_USD = _load_threshold()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-_STATE_FILE = Path(__file__).parent / "alert_state.json"
+_STATE_FILE = _STATE_DIR / "alert_state.json"
 _HISTORY_LIMIT = 50
 
 
 def set_daily_threshold(value: float) -> None:
     global ALERT_DAILY_COST_USD
     ALERT_DAILY_COST_USD = value
-    _SETTINGS_FILE.write_text(json.dumps({"alert_daily_cost_usd": value}))
+    # Read-modify-write so a second dashboard-set setting (monthly budget)
+    # sharing this file survives (FIXED 2026-08-26: the original whole-file
+    # overwrite would have silently erased it).
+    settings = _load_settings()
+    settings["alert_daily_cost_usd"] = value
+    _save_settings(settings)
+
+
+# ---- configurable monthly budget --------------------------------------------
+# The projection KPI previously compared against an implied budget of
+# threshold x 30 -- a proxy, never independently set. Now a first-class,
+# separately-persisted setting; unset falls back to the old implied figure.
+
+def _load_budget() -> float | None:
+    value = _load_settings().get("monthly_budget_usd")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+MONTHLY_BUDGET_USD = _load_budget()
+
+
+def set_monthly_budget(value: float | None) -> None:
+    """None clears the override -- the KPI falls back to threshold x 30."""
+    global MONTHLY_BUDGET_USD
+    MONTHLY_BUDGET_USD = value
+    settings = _load_settings()
+    if value is None:
+        settings.pop("monthly_budget_usd", None)
+    else:
+        settings["monthly_budget_usd"] = value
+    _save_settings(settings)
+
+
+def effective_monthly_budget() -> float:
+    return MONTHLY_BUDGET_USD if MONTHLY_BUDGET_USD else ALERT_DAILY_COST_USD * 30
 
 
 def _today() -> str:

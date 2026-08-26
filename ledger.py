@@ -93,8 +93,8 @@ def _fill_fallback(row: dict) -> dict:
     return row
 
 
-def fetch_rows(days: int) -> list[dict]:
-    """Raw rows for the trailing `days` days (HKT day boundary), most recent first.
+def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = None) -> list[dict]:
+    """Raw rows from `start_utc` (inclusive) to `end_utc` (exclusive; None = open-ended).
 
     PAGINATES (FIXED 2026-08-15): PostgREST caps any single response at 1,000
     rows regardless of the requested limit, so an unpaginated fetch silently
@@ -103,24 +103,28 @@ def fetch_rows(days: int) -> list[dict]:
     at a time, until a batch comes back shorter than the page size."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set -- see .env.example")
-    since = _hkt_today_start_utc() - dt.timedelta(days=days - 1)
+    # Repeated `created_at` params (gte + optional lt): PostgREST ANDs them,
+    # and httpx preserves duplicates in a tuple list -- embedding "&and=(...)"
+    # inside ONE param value would get percent-encoded and 400.
+    params_base: list[tuple[str, str]] = [
+        ("select", _SELECT),
+        ("created_at", f"gte.{start_utc.isoformat()}"),
+    ]
+    if end_utc is not None:
+        params_base.append(("created_at", f"lt.{end_utc.isoformat()}"))
+    params_base += [("order", "created_at.desc")]
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
     page_size = 1000
     rows: list[dict] = []
     offset = 0
     while True:
         resp = httpx.get(
             f"{SUPABASE_URL}/rest/v1/llm_calls",
-            params={
-                "select": _SELECT,
-                "created_at": f"gte.{since.isoformat()}",
-                "order": "created_at.desc",
-                "limit": str(page_size),
-                "offset": str(offset),
-            },
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            },
+            params=params_base + [("limit", str(page_size)), ("offset", str(offset))],
+            headers=headers,
             timeout=15,
         )
         resp.raise_for_status()
@@ -130,6 +134,68 @@ def fetch_rows(days: int) -> list[dict]:
             break
         offset += len(batch)
     return [_fill_fallback(r) for r in rows]
+
+
+def fetch_rows(days: int) -> list[dict]:
+    """Raw rows for the trailing `days` days (HKT day boundary), most recent first."""
+    since = _hkt_today_start_utc() - dt.timedelta(days=days - 1)
+    return _fetch_rows_window(since)
+
+
+def fetch_rows_and_previous(days: int) -> tuple[list[dict], list[dict]]:
+    """Rows for the trailing `days` HKT days PLUS the immediately preceding
+    equal-length window (disjoint, so period-over-period KPI deltas compare
+    like with like). The upper bound is tomorrow's HKT midnight so a row can't
+    land in both windows."""
+    today = _hkt_today_start_utc()
+    cur_start = today - dt.timedelta(days=days - 1)
+    cur_end = today + dt.timedelta(days=1)
+    current = _fetch_rows_window(cur_start, cur_end)
+    previous = _fetch_rows_window(cur_start - dt.timedelta(days=days), cur_start)
+    return current, previous
+
+
+def _hkt_day_start_utc(date_str: str) -> dt.datetime:
+    """UTC instant of HKT midnight for a YYYY-MM-DD calendar date."""
+    d = dt.date.fromisoformat(date_str)
+    return dt.datetime(d.year, d.month, d.day, tzinfo=_HKT).astimezone(dt.timezone.utc)
+
+
+def fetch_rows_custom(start_date: str, end_date: str) -> tuple[list[dict], list[dict]]:
+    """Rows for an explicit inclusive HKT date range (custom range picker),
+    plus the preceding same-length window for the KPI deltas."""
+    start = _hkt_day_start_utc(start_date)
+    end = _hkt_day_start_utc(end_date) + dt.timedelta(days=1)
+    n_days = max((end - start).days, 1)
+    previous = _fetch_rows_window(start - dt.timedelta(days=n_days), start)
+    return _fetch_rows_window(start, end), previous
+
+
+def window_totals(rows: list[dict]) -> dict:
+    """Headline totals for one window -- the comparison half of a
+    period-over-period KPI delta."""
+    return {
+        "calls": len(rows),
+        "cost_usd": round(sum(r.get("cost_usd") or 0 for r in rows), 6),
+        "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in rows),
+        "completion_tokens": sum(r.get("completion_tokens") or 0 for r in rows),
+    }
+
+
+def cost_spike_dates(daily_series: list[dict], lookback: int = 7, factor: float = 2.0) -> dict[str, float]:
+    """Days whose cost exceeded `factor`x the mean of the preceding `lookback`
+    days -> {date: multiple}. Deterministic, no LLM. Needs a positive baseline
+    (a spike off zero is just normal usage starting) and at least one prior day.
+    Pure -- testable without network."""
+    spikes: dict[str, float] = {}
+    for i, row in enumerate(daily_series):
+        window = [r["cost_usd"] for r in daily_series[max(0, i - lookback):i]]
+        if not window:
+            continue
+        base = sum(window) / len(window)
+        if base > 0 and row["cost_usd"] > base * factor:
+            spikes[row["date"]] = round(row["cost_usd"] / base, 1)
+    return spikes
 
 
 # Missing-value label per field: most fields fall back to the generic
