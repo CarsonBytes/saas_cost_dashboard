@@ -1343,11 +1343,13 @@ async def main_page() -> None:
 
         services_row()
 
-        # Sticky controls: only the filter chip + range/budget stay pinned — the deck
-        # scrolls away so it doesn't cover the tab content (fixed preview 2026-08-26).
-        with ui.element("div").classes("sticky top-0 z-20 bg-white border-b border-zinc-200 shadow-sm -mx-4 px-4 py-3 w-[calc(100%+32px)]"):
+    # Full-width sticky controls: deck scrolls away, this bar stays pinned and
+    # spans the entire viewport width (not just the max-w column) so it reads
+    # as a proper app chrome. Content inside stays centered at max-w.
+    with ui.element("div").classes("sticky top-0 z-20 bg-white border-b border-zinc-200 shadow-sm w-screen ml-[calc(-50vw+50%)]"):
+        with ui.column().classes("max-w-[1100px] mx-auto px-4 py-3 gap-2"):
             project_filter_chip()
-            with ui.row().classes("items-center gap-2 mt-1 flex-wrap"):
+            with ui.row().classes("items-center gap-2 flex-wrap"):
                 ui.label("Range:").classes("text-sm")
                 ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
                           on_change=lambda e: (_set_range(e))).props("dense")
@@ -1379,7 +1381,9 @@ async def main_page() -> None:
             threshold_input.on("keydown.enter", _save_settings)
             budget_input.on("keydown.enter", _save_settings)
             ui.button("Save", on_click=_save_settings).props("dense flat")
-        dashboard_body()  # controls sit just above the tab strip
+
+    with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4 pt-2"):
+        dashboard_body()  # stays centered, scrolls under the full-width sticky bar
 
     fetch_stats()
     refresh_all()
