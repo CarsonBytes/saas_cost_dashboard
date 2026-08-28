@@ -1350,38 +1350,107 @@ async def main_page() -> None:
         with ui.element("div").classes("max-w-[1100px] mx-auto px-4 py-2 flex flex-wrap items-center gap-3 gap-y-2"):
             with ui.element("div").classes("shrink-0"):
                 project_filter_chip()
-            with ui.element("div").classes("flex flex-wrap items-center gap-2 grow min-w-[380px] basis-[420px]"):
+            with ui.element("div").classes("flex flex-wrap items-center gap-2 grow basis-[260px]"):
                 ui.label("Range:").classes("text-sm shrink-0")
                 ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
                           on_change=lambda e: (_set_range(e))).props("dense").classes("shrink-0")
+                custom_btn = ui.button("Custom", icon="calendar_month").props("dense flat").classes("shrink-0").mark("custom-toggle")
+
+            # Threshold / budget — compact 1-line by default, click to edit (stays 1 line even on mobile)
+            def _compact_text() -> str:
+                thr = alerts.ALERT_DAILY_COST_USD
+                bud = alerts.MONTHLY_BUDGET_USD
+                if bud:
+                    return f"${thr:.2f}/d · ${bud:.0f}/mo"
+                return f"${thr:.2f}/d · ~${alerts.effective_monthly_budget():.0f}/mo"
+
+            with ui.element("div").classes("flex flex-nowrap items-center gap-2 shrink-0 ml-auto min-w-0 overflow-hidden"):
+                compact_row = ui.element("div").classes("flex items-center gap-1.5")
+                with compact_row:
+                    compact_label = ui.label(_compact_text()).classes("text-sm whitespace-nowrap truncate")
+                    edit_btn = ui.button(icon="edit").props("flat dense round size=sm").classes("shrink-0").tooltip("Edit thresholds")
+
+                edit_row = ui.element("div").classes("hidden flex flex-nowrap items-center gap-1.5")
+                with edit_row:
+                    ui.label("$").classes("text-sm shrink-0")
+                    threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
+                                                format="%.2f").props("dense outlined").classes("w-[72px] shrink-0 flex-none") \
+                        .mark("threshold-input")
+                    ui.label("/d").classes("text-xs text-grey-6 shrink-0")
+                    ui.label("· $").classes("text-sm shrink-0")
+                    budget_input = ui.number(value=alerts.MONTHLY_BUDGET_USD, min=0, step=5,
+                                             format="%.2f").props("dense outlined").classes("w-[80px] shrink-0 flex-none") \
+                    .mark("budget-input")
+                    ui.label("/mo").classes("text-xs text-grey-6 shrink-0")
+
+                def _toggle_threshold_edit() -> None:
+                    if "hidden" in edit_row.classes:
+                        edit_row.classes(remove="hidden")
+                        compact_row.classes(add="hidden")
+                    else:
+                        edit_row.classes(add="hidden")
+                        compact_row.classes(remove="hidden")
+
+                def _do_save() -> None:
+                    _save_settings()
+                    compact_label.set_text(_compact_text())
+                    edit_row.classes(add="hidden")
+                    compact_row.classes(remove="hidden")
+
+                # Enter-to-save in edit mode; Save button commits; edit icon toggles
+                threshold_input.on("keydown.enter", _do_save)
+                budget_input.on("keydown.enter", _do_save)
+                with edit_row:
+                    ui.button("Save", on_click=_do_save).props("dense flat").classes("shrink-0")
+                    ui.button(icon="close", on_click=_toggle_threshold_edit).props("dense flat round size=sm").classes("shrink-0").tooltip("Cancel")
+                edit_btn.on_click(_toggle_threshold_edit)
+
+            # Custom range picker — collapsed by default, expands below the main row (w-full)
+            picker_row = ui.element("div").classes("hidden w-full flex flex-wrap items-center gap-2 pt-2 mt-1 border-t border-zinc-100")
+            with picker_row:
                 ui.label("Custom:").classes("text-sm text-grey-6 shrink-0")
+
                 start_date = ui.input(placeholder="Start YYYY-MM-DD") \
-                    .props("dense outlined style='max-width:130px'").classes("shrink-0").mark("range-start")
+                    .props("dense outlined").classes("w-[150px] shrink-0").mark("range-start")
+                with start_date.add_slot("append"):
+                    ui.icon("event").classes("cursor-pointer").on("click", lambda: start_menu.open())
+                with ui.menu().props("no-parent-event") as start_menu:
+                    # q-date calendar — picking a date writes YYYY-MM-DD into the input
+                    ui.date(on_change=lambda e: start_date.set_value(e.value or "")).props("minimal mask=YYYY-MM-DD")
+
                 ui.label("→").classes("text-xs text-grey-6 shrink-0")
+
                 end_date = ui.input(placeholder="End YYYY-MM-DD") \
-                    .props("dense outlined style='max-width:130px'").classes("shrink-0").mark("range-end")
-                ui.button("Apply", on_click=lambda: _apply_custom()).props("dense flat").classes("shrink-0").mark("apply-custom")
-                ui.button(icon="close", on_click=lambda: _clear_custom()).props("dense flat round size=sm").classes("shrink-0") \
-                    .tooltip("Back to preset range").mark("clear-custom")
+                    .props("dense outlined").classes("w-[150px] shrink-0").mark("range-end")
+                with end_date.add_slot("append"):
+                    ui.icon("event").classes("cursor-pointer").on("click", lambda: end_menu.open())
+                with ui.menu().props("no-parent-event") as end_menu:
+                    ui.date(on_change=lambda e: end_date.set_value(e.value or "")).props("minimal mask=YYYY-MM-DD")
 
-            with ui.element("div").classes("flex flex-wrap items-center gap-2 shrink-0 ml-auto"):
-                ui.label("Alert threshold ($/day):").classes("text-sm shrink-0")
-                threshold_input = ui.number(value=alerts.ALERT_DAILY_COST_USD, min=0, step=0.05,
-                                            format="%.2f").props("dense outlined").classes("w-[88px] sm:w-24 shrink-0") \
-                    .mark("threshold-input")
+                def _do_apply() -> None:
+                    _apply_custom()
+                    if "hidden" not in picker_row.classes:
+                        picker_row.classes(add="hidden")
+                        custom_btn.props("icon=calendar_month")
 
-                budget_label = ("Monthly budget ($/mo):" if alerts.MONTHLY_BUDGET_USD
-                                else f"Budget (implied ${alerts.effective_monthly_budget():.2f}/mo):")
-                ui.label(budget_label).classes("text-sm text-grey-6 shrink-0")
-                budget_input = ui.number(value=alerts.MONTHLY_BUDGET_USD, min=0, step=5,
-                                         format="%.2f").props("dense outlined").classes("w-[96px] sm:w-28 shrink-0") \
-                .mark("budget-input")
+                def _do_cancel() -> None:
+                    _clear_custom()
+                    if "hidden" not in picker_row.classes:
+                        picker_row.classes(add="hidden")
+                        custom_btn.props("icon=calendar_month")
 
-                # Enter-to-save on both inputs (B5): a number field's natural
-                # commit gesture shouldn't dead-end.
-                threshold_input.on("keydown.enter", _save_settings)
-                budget_input.on("keydown.enter", _save_settings)
-                ui.button("Save", on_click=_save_settings).props("dense flat").classes("shrink-0")
+                ui.button("Apply", on_click=_do_apply).props("dense flat").classes("shrink-0").mark("apply-custom")
+                ui.button("Cancel", on_click=_do_cancel).props("dense flat").classes("shrink-0").mark("clear-custom")
+
+            def _toggle_custom() -> None:
+                if "hidden" in picker_row.classes:
+                    picker_row.classes(remove="hidden")
+                    custom_btn.props("icon=close")
+                else:
+                    picker_row.classes(add="hidden")
+                    custom_btn.props("icon=calendar_month")
+
+            custom_btn.on_click(_toggle_custom)
 
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4 pt-2"):
         dashboard_body()  # stays centered, scrolls under the full-width sticky bar
