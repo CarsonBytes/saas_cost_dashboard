@@ -61,7 +61,8 @@ STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch
                # preceding equal-length window's totals for KPI deltas, and
                # an optional custom HKT date range (start, end) overriding
                # the trailing-days toggle.
-               "project": None, "prev": None, "custom": None, "preset_days": 7}
+               "project": None, "prev": None, "custom": None, "preset_days": 7,
+               "active_tab": "Overview"}
 
 _ALERT_CHECK_INTERVAL_SEC = int(os.environ.get("ALERT_CHECK_INTERVAL_SEC", "900"))
 _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC", "120"))
@@ -959,19 +960,22 @@ def dashboard_body() -> None:
         ui.label("Loading…").classes("text-sm text-grey")
         return
 
+    tab_names = ["Overview", "Cost & Usage", "Reliability & Incidents", "Governance"]
     with ui.tabs().classes("w-full") as tabs:
-        overview_tab = ui.tab("Overview")
-        cost_tab = ui.tab("Cost & Usage")
-        reliability_tab = ui.tab("Reliability & Incidents")
-        governance_tab = ui.tab("Governance")
-    with ui.tab_panels(tabs, value=overview_tab).classes("w-full"):
-        with ui.tab_panel(overview_tab):
+        tab_objs = {}
+        for name in tab_names:
+            tab_objs[name] = ui.tab(name)
+    initial_tab = tab_objs.get(STATE["active_tab"], tab_objs["Overview"])
+    with ui.tab_panels(tabs, value=initial_tab).classes("w-full") as panels:
+        panels.on("update:model-value",
+                  lambda e: STATE.__setitem__("active_tab", str(e.value)))
+        with ui.tab_panel(tab_objs["Overview"]):
             _overview_tab(data)
-        with ui.tab_panel(cost_tab):
+        with ui.tab_panel(tab_objs["Cost & Usage"]):
             _cost_tab(data)
-        with ui.tab_panel(reliability_tab):
+        with ui.tab_panel(tab_objs["Reliability & Incidents"]):
             _reliability_tab(data)
-        with ui.tab_panel(governance_tab):
+        with ui.tab_panel(tab_objs["Governance"]):
             governance_view()
 
 
