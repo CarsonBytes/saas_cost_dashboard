@@ -31,7 +31,7 @@ PORT = int(os.environ.get("RESTART_PROXY_PORT", "8096"))
 ALLOWED = {c.strip() for c in os.environ.get(
     "ALLOWED_CONTAINERS",
     "quant-dashboard-docker,event-radar,study-app,quant-dashboard-live-docker,"
-    "event-radar-demo"
+    "event-radar-demo,study-demo"
 ).split(",") if c.strip()}
 
 _SOCKET = "/var/run/docker.sock"

@@ -196,7 +196,11 @@ SERVICES = [
         "business_impact": "low",    # internal tool
         "desc": "Supabase + pgvector RAG exam-prep",
         "icon": "school",
-        "links": [("Private", "https://study.carsonng.com")],
+        # ADDED 2026-08-29: study-demo (container, port 8092, study-demo.carsonng.com)
+        # -- same split as Event Radar's Demo/Private pair. Verified live before
+        # wiring up: both localhost:8092 and the public hostname return 200.
+        "links": [("Demo", "https://study-demo.carsonng.com"),
+                  ("Private", "https://study.carsonng.com")],
         "monitor": True,
         "restart": "auto_heal",
         # Freshness reads Study's own `answer_log` usage table, NOT the shared
@@ -212,7 +216,11 @@ SERVICES = [
         # was auto-restarting every ~6min while idle and lock/re-lock cycling).
         "restart_on_staleness": False,
         "enforced_cadence": False,     # matches restart_on_staleness here -- idle, not a fault
-        "container": "study-app",
+        "container": "study-app",      # auto-heal target only -- readiness tracks this one
+        # Same reasoning as Event Radar's pairing (2026-08-18): quarantining
+        # "Study Platform" should pause the public demo too, not just the
+        # private instance -- auto-heal stays scoped to `container` above.
+        "quarantine_containers": ["study-app", "study-demo"],
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {

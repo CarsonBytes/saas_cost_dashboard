@@ -51,7 +51,7 @@ services:
     command: ["python", "restart_proxy.py"]
     environment:
       - RESTART_PROXY_PORT=8096
-      - ALLOWED_CONTAINERS=quant-dashboard-docker,event-radar,study-app,quant-dashboard-live-docker,event-radar-demo
+      - ALLOWED_CONTAINERS=quant-dashboard-docker,event-radar,study-app,quant-dashboard-live-docker,event-radar-demo,study-demo
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     dns:
