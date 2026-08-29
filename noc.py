@@ -207,7 +207,23 @@ def _probe(url: str) -> bool:
 
 
 def _liveness(svc: dict) -> bool:
-    return all(_probe(url) for _, url in svc["links"])
+    """FIXED 2026-08-29: probed each of a service's own links sequentially
+    (Python's all() over a generator), so a service with 2 Access-gated
+    links paid the full redirect-chain latency of BOTH, one after another --
+    harmless with 4 services, but LinkedIn's addition (2 gated links, ~1.6s +
+    ~1.0s) made it the single slowest entry in the outer pool.map across
+    services, stretching refresh_health()'s per-cycle duration enough to
+    starve the shared asyncio default thread pool that fetch_stats's own
+    to_thread call also draws from -- confirmed live via timing
+    instrumentation, not assumed: intermittent 500s ('not ready after 3.0
+    seconds') on unrelated tests appeared only after this service was added.
+    A service's own links now probe concurrently, same pattern already used
+    across services in refresh_health()."""
+    urls = [url for _, url in svc["links"]]
+    if len(urls) <= 1:
+        return all(_probe(url) for url in urls)
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        return all(pool.map(_probe, urls))
 
 
 def _dependency_probe_results() -> dict[str, bool]:

@@ -224,6 +224,33 @@ SERVICES = [
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },
     {
+        # ADDED 2026-08-29. Two containers: linked-content-engine (dashboard,
+        # port 8096) and linked-content-engine-scheduler (the actual
+        # auto-poster loop, no published port). Deliberately NO project_tag/
+        # freshness_table -- this agent doesn't write to Supabase or the LLM
+        # ledger at all yet (post_generator.py is template-based, confirmed by
+        # reading it -- no LLM calls), so a freshness check here would be
+        # checking a dependency that doesn't exist, the same false-check
+        # pattern already correctly avoided for Portfolio/AI Regulation Radar
+        # below. Liveness-only: readiness reads "n/a", auto_heal still fires
+        # on a genuine liveness failure alone (unhealthy = not up, independent
+        # of readiness). Revisit if/when cost tracking gets built into the
+        # LinkedIn engine itself (TODO, not done).
+        "name": "LinkedIn Content Engine",
+        "business_impact": "medium", # posts to LinkedIn under the real identity
+        "desc": "Milestone tracker + auto-poster for LinkedIn",
+        "icon": "campaign",
+        "links": [("Private", "https://linkedin.carsonng.com"),
+                  ("GitHub", "https://github.com/CarsonBytes/linkedin_content_system")],
+        "monitor": True,
+        "restart": "auto_heal",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": "linked-content-engine",  # matches the probed dashboard link
+        "quarantine_containers": ["linked-content-engine", "linked-content-engine-scheduler"],
+        "quarantinable": True,  # manual pause is an operator call, never automatic
+    },
+    {
         "name": "Portfolio",
         "business_impact": "medium", # public-facing site
         "desc": "carsonng.com -- AI governance leadership positioning",
