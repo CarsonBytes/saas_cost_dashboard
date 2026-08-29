@@ -150,12 +150,19 @@ def fetch_stats(days: int | None = None) -> None:
         STATE["error"] = str(e)
 
 
-def _set_project(project: str | None) -> None:
+async def _set_project(project: str | None) -> None:
     """Set/clear the per-project drill-down filter and refetch (the aggregate
     runs on filtered rows server-side of the UI, so every chart, table, KPI
-    and CSV export follows the filter with no further plumbing)."""
+    and CSV export follows the filter with no further plumbing).
+
+    FIXED 2026-08-30: fetch_stats() does two paginated Supabase round-trips
+    and its own docstring says plainly "callers run this in a thread" --
+    this (and five other call sites) called it directly instead, which
+    blocks NiceGUI's single shared event loop, freezing the app for EVERY
+    connected browser tab, not just the one that clicked, for however long
+    those two round-trips take."""
     STATE["project"] = project
-    fetch_stats()
+    await asyncio.to_thread(fetch_stats)
     refresh_all()
 
 
@@ -948,38 +955,67 @@ def incident_log() -> None:
     _incident_log_table()
 
 
-@ui.refreshable
-def dashboard_body() -> None:
-    if STATE["error"]:
-        ui.label(f"⚠ {STATE['error']}").classes("text-red-600 font-bold")
-        ui.button("Retry", on_click=lambda: (fetch_stats(), refresh_all())) \
-            .classes("mt-2")
-        return
-    data = STATE["data"]
-    if not data:
-        ui.label("Loading…").classes("text-sm text-grey")
-        return
+async def _do_retry() -> None:
+    await asyncio.to_thread(fetch_stats)
+    refresh_all()
 
+
+@ui.refreshable
+def _data_status() -> None:
+    """Error/Retry banner, shown above the tabs -- deliberately its OWN small
+    refreshable, separate from the tabs/tab_panels chrome below (FIXED
+    2026-08-30). Previously this gate and the tabs lived in the same
+    refreshable (the old dashboard_body), so every refresh_all() call --
+    including ones with nothing to do with cost data -- tore down and
+    rebuilt ui.tabs()/ui.tab_panels() from scratch. That's also what caused
+    the active tab to revert to Overview on every refresh: a fresh
+    ui.tab_panels(tabs, value=initial_tab) is built from whatever STATE
+    happened to hold at that exact moment, and the persistence handler
+    turned out not to be reliably reaching the server in time (see
+    dashboard_body's tabs.on_value_change below for the actual fix)."""
+    if STATE["error"]:
+        with ui.row().classes("items-center gap-2"):
+            ui.label(f"⚠ {STATE['error']}").classes("text-red-600 font-bold")
+            ui.button("Retry", on_click=_do_retry).classes("mt-0")
+
+
+def dashboard_body() -> None:
+    """Tab chrome -- built exactly ONCE per page load, NOT a refreshable
+    (FIXED 2026-08-30, see _data_status's docstring for why). Each tab's
+    content is its own separately-refreshable function (matching how
+    governance_view already worked), so refresh_all() can update content
+    without ever tearing down the tabs themselves -- which also means a
+    selected tab now has nothing destructive happening to it on refresh,
+    rather than relying on state-restoration timing to survive one."""
+    _data_status()
     tab_names = ["Overview", "Cost & Usage", "Reliability & Incidents", "Governance"]
     with ui.tabs().classes("w-full") as tabs:
         tab_objs = {}
         for name in tab_names:
             tab_objs[name] = ui.tab(name)
     initial_tab = tab_objs.get(STATE["active_tab"], tab_objs["Overview"])
-    with ui.tab_panels(tabs, value=initial_tab).classes("w-full") as panels:
-        panels.on("update:model-value",
-                  lambda e: STATE.__setitem__("active_tab", str(e.value)))
+
+    def _on_tab_change(e) -> None:
+        STATE["active_tab"] = str(e.value)
+
+    tabs.on_value_change(_on_tab_change)
+    with ui.tab_panels(tabs, value=initial_tab).classes("w-full"):
         with ui.tab_panel(tab_objs["Overview"]):
-            _overview_tab(data)
+            _overview_tab()
         with ui.tab_panel(tab_objs["Cost & Usage"]):
-            _cost_tab(data)
+            _cost_tab()
         with ui.tab_panel(tab_objs["Reliability & Incidents"]):
-            _reliability_tab(data)
+            _reliability_tab()
         with ui.tab_panel(tab_objs["Governance"]):
             governance_view()
 
 
-def _overview_tab(data: dict) -> None:
+@ui.refreshable
+def _overview_tab() -> None:
+    data = STATE["data"]
+    if not data:
+        ui.label("Loading…").classes("text-sm text-grey")
+        return
     avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
     monthly_budget = alerts.effective_monthly_budget()
     budget_is_implied = not alerts.MONTHLY_BUDGET_USD
@@ -1071,7 +1107,12 @@ def _overview_tab(data: dict) -> None:
             _bar_chart(data["by_provider"], "provider")
 
 
-def _cost_tab(data: dict) -> None:
+@ui.refreshable
+def _cost_tab() -> None:
+    data = STATE["data"]
+    if not data:
+        ui.label("Loading…").classes("text-sm text-grey")
+        return
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("By model").classes("text-sm font-bold")
@@ -1131,7 +1172,12 @@ def _cost_tab(data: dict) -> None:
     ui.table(columns=cols, rows=rows, row_key="call_type").classes("w-full").props("dense")
 
 
-def _reliability_tab(data: dict) -> None:
+@ui.refreshable
+def _reliability_tab() -> None:
+    data = STATE["data"]
+    if not data:
+        ui.label("Loading…").classes("text-sm text-grey")
+        return
     with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
         ui.label("Slowest call types (avg latency)").classes("text-sm font-bold")
         if ledger.latency_ranking(data["by_call_type"]):
@@ -1166,6 +1212,15 @@ def _reliability_tab(data: dict) -> None:
 
 
 def refresh_all() -> None:
+    """FIXED 2026-08-30: used to call dashboard_body.refresh(), which tore
+    down and rebuilt the tabs/tab_panels chrome itself on every single call
+    -- that's both the direct cause of the tab-revert bug and needless DOM
+    churn on actions that don't even touch cost data. dashboard_body is no
+    longer a refreshable (see its docstring); the three cost/data tabs are
+    refreshed directly instead, and Governance is deliberately NOT refreshed
+    here -- it reads its own independent cache (governance.py), not
+    STATE["data"], and already gets its own explicit .refresh() call from
+    the one action that actually changes it (_mark_complied)."""
     alert_banner.refresh()
     noc_banner.refresh()
     maintenance_banner.refresh()
@@ -1173,7 +1228,10 @@ def refresh_all() -> None:
     services_row.refresh()
     project_filter_chip.refresh()
     _incident_log_table.refresh()
-    dashboard_body.refresh()
+    _data_status.refresh()
+    _overview_tab.refresh()
+    _cost_tab.refresh()
+    _reliability_tab.refresh()
     last_refreshed_label.refresh()
 
 
@@ -1271,7 +1329,7 @@ async def main_page() -> None:
                     icon="light_mode" if stored_dark else "dark_mode",
                     on_click=_toggle_dark).props("flat round").mark("dark-toggle")
                 ui.button("Refresh", icon="refresh",
-                          on_click=lambda: (fetch_stats(), refresh_all())) \
+                          on_click=_do_retry) \
                     .props("color=primary")
                 ui.button("Pause monitoring", icon="build",
                           on_click=lambda: _pause_dialog()).props("dense outline color=grey-8") \
@@ -1309,14 +1367,14 @@ async def main_page() -> None:
         noc_banner()
         maintenance_banner()
 
-        def _set_range(e) -> None:
+        async def _set_range(e) -> None:
             STATE["days"] = e.value
             STATE["preset_days"] = e.value
             STATE["custom"] = None
-            fetch_stats(STATE["days"])
+            await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
-        def _apply_custom() -> None:
+        async def _apply_custom() -> None:
             start, end = start_date.value, end_date.value
             if not (start and end):
                 ui.notify("Pick both a start and end date", type="warning")
@@ -1325,15 +1383,15 @@ async def main_page() -> None:
                 ui.notify("Start date must be on or before the end date", type="negative")
                 return
             STATE["custom"] = (start, end)
-            fetch_stats()
+            await asyncio.to_thread(fetch_stats)
             refresh_all()
 
-        def _clear_custom() -> None:
+        async def _clear_custom() -> None:
             start_date.set_value(None)
             end_date.set_value(None)
             STATE["custom"] = None
             STATE["days"] = STATE.get("preset_days", 7)
-            fetch_stats(STATE["days"])
+            await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
         def _save_settings() -> None:
@@ -1431,14 +1489,14 @@ async def main_page() -> None:
                 with ui.menu().props("no-parent-event") as end_menu:
                     ui.date(on_change=lambda e: end_date.set_value(e.value or "")).props("minimal mask=YYYY-MM-DD")
 
-                def _do_apply() -> None:
-                    _apply_custom()
+                async def _do_apply() -> None:
+                    await _apply_custom()
                     if "hidden" not in picker_row.classes:
                         picker_row.classes(add="hidden")
                         custom_btn.props("icon=calendar_month")
 
-                def _do_cancel() -> None:
-                    _clear_custom()
+                async def _do_cancel() -> None:
+                    await _clear_custom()
                     if "hidden" not in picker_row.classes:
                         picker_row.classes(add="hidden")
                         custom_btn.props("icon=calendar_month")
@@ -1459,7 +1517,10 @@ async def main_page() -> None:
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4 pt-2"):
         dashboard_body()  # stays centered, scrolls under the full-width sticky bar
 
-    fetch_stats()
+    # FIXED 2026-08-30: was a direct (blocking) fetch_stats() call -- on the
+    # shared event loop, a new client's initial load used to freeze every
+    # other already-connected client too, not just itself.
+    await asyncio.to_thread(fetch_stats)
     refresh_all()
 
 
