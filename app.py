@@ -634,7 +634,7 @@ def governance_view() -> None:
     # Filter input lives OUTSIDE the nested refreshable table for the same
     # focus-loss reason as the incident log's.
     ui.label("Audit trail").classes("text-sm font-bold mt-4")
-    audit = governance.get_audit_log()
+    audit = governance.cached_audit()
 
     def _render_audit(q: str) -> None:
         q = q.lower()
@@ -1517,9 +1517,23 @@ async def main_page() -> None:
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4 pt-2"):
         dashboard_body()  # stays centered, scrolls under the full-width sticky bar
 
-    # FIXED 2026-08-30: was a direct (blocking) fetch_stats() call -- on the
-    # shared event loop, a new client's initial load used to freeze every
-    # other already-connected client too, not just itself.
+    # FIXED 2026-08-30: was a direct (blocking) fetch_stats() call -- since
+    # asyncio.to_thread offloads the blocking work to a thread rather than
+    # the event loop, awaiting it here does NOT block other connected
+    # clients (confirmed against NiceGUI's own docs/behavior, not assumed --
+    # a fire-and-forget version was tried and reverted, see below). It's
+    # correct for this one client's own page to wait for its own first
+    # fetch, same as any normal "Loading…" page would.
+    #
+    # NOT fire-and-forget, on purpose: tried making main_page() return
+    # immediately and let this run as a background task instead, so the
+    # tabs/"Loading…" shell would appear instantly. That broke the
+    # push-gated render tests -- they assert core content (e.g. "Total
+    # cost") is visible within ~0.3s of open() returning, which two real
+    # paginated Supabase round-trips can't reliably beat. It also didn't
+    # even fix the actual problem (see below), so reverted rather than
+    # widening what "ready" means across the whole test suite for a change
+    # that wasn't the fix.
     await asyncio.to_thread(fetch_stats)
     refresh_all()
 

@@ -121,16 +121,33 @@ def tables_ready() -> bool:
 def refresh_cache() -> dict:
     """Best-effort snapshot for the Governance tab. Called from background
     tasks only (the compliance loop, mark_complied) -- never from a page
-    render. Never raises."""
+    render. Never raises.
+
+    FIXED 2026-08-30: the network calls (tables_ready/fetch_rules x2/
+    get_audit_log -- each a real blocking httpx.get) used to run INSIDE the
+    `with _CACHE_LOCK` block, so any render-path reader briefly blocked on
+    this lock (cached_rules/cached_complied/cached_audit) would, in the
+    worst case, wait out however long these network calls took. Fetching now
+    happens OUTSIDE the lock, into locals; the lock is only held for the
+    near-instant dict swap, matching a plain reader/writer lock's actual
+    intended scope. (This was NOT the cause of the 2026-08-30 render-time
+    regression that motivated this pass -- that was a separate bug, a
+    render-path call to get_audit_log() instead of cached_audit(), see
+    governance_view() in app.py. Fixed here anyway since it's a real
+    lock-held-across-I/O anti-pattern independent of that bug.)"""
     try:
+        ready = tables_ready()
+        if ready:
+            rules = fetch_rules()
+            complied = fetch_rules(("COMPLIED",))[:20]
+            audit = get_audit_log()
+        else:
+            rules, complied, audit = [], [], []
         with _CACHE_LOCK:
-            _CACHE["tables_ready"] = tables_ready()
-            if _CACHE["tables_ready"]:
-                _CACHE["rules"] = fetch_rules()
-                _CACHE["complied"] = fetch_rules(("COMPLIED",))[:20]
-                _CACHE["audit"] = get_audit_log()
-            else:
-                _CACHE["rules"], _CACHE["complied"], _CACHE["audit"] = [], [], []
+            _CACHE["tables_ready"] = ready
+            _CACHE["rules"] = rules
+            _CACHE["complied"] = complied
+            _CACHE["audit"] = audit
         return dict(_CACHE)
     except Exception:                                 # noqa: BLE001
         log.exception("governance: cache refresh failed")
