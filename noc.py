@@ -364,6 +364,23 @@ def _proxy_action(action: str, name: str) -> bool:
         return False
 
 
+def _container_stats_map() -> dict[str, dict]:
+    """ADDED 2026-09-04 (memory-control spec item #4): one GET /stats call to
+    the restart-proxy, covering every allow-listed container, so a cycle
+    with N monitored agents costs one extra local Unix-socket round-trip, not
+    N. Same trust boundary as restart/pause: the dashboard never touches the
+    Docker socket itself. Best-effort -- an empty map here just means no
+    agent gets a memory reading this cycle, never a crashed cycle."""
+    try:
+        resp = httpx.get(f"{_RESTART_PROXY_URL}/stats", timeout=10)
+        if resp.status_code >= 300:
+            return {}
+        return resp.json().get("containers", {})
+    except Exception as e:                        # noqa: BLE001
+        log.warning("noc: stats fetch via proxy failed: %s", e)
+        return {}
+
+
 def _restart_warranted(svc: dict, up: bool, readiness: str,
                        deps_stable: bool = True) -> bool:
     """Whether the agent's CURRENT check results justify attempting a restart.
@@ -973,6 +990,7 @@ def _refresh_health() -> None:
         prev = {name: dict(_STATUS_CACHE.get(name, {})) for name in up_map}
         compliance = governance.compliance_health()  # agent -> OVERDUE rule names
         auto_targets = governance.auto_quarantine_targets()  # agent -> {rule, rule_id}
+        stats_map = _container_stats_map()  # container name -> {usage_bytes, limit_bytes}
 
         for svc in monitored:
             name = svc["name"]
@@ -989,6 +1007,22 @@ def _refresh_health() -> None:
             if svc.get("project_tag") or svc.get("freshness_table"):
                 readiness, detail = _readiness(svc, now, last_restart,
                                                last_write_map.get(name))
+
+            # Memory reading is opt-in per agent: only meaningful for agents
+            # with a real Docker container, and only reachable at all for
+            # ones on the restart-proxy's allow-list (ADDED 2026-09-04).
+            mem_stats = stats_map.get(svc.get("container") or "")
+            memory_mb = round(mem_stats["usage_bytes"] / 1_048_576, 1) if mem_stats else None
+            # An uncapped container's cgroup limit doesn't read back as null
+            # or a platform sentinel -- it reports the WSL2 VM's own total
+            # memory (~15.5GB here, confirmed live), since that's the
+            # effective ceiling with no per-container cgroup limit set. No
+            # real per-container cap under this spec would come anywhere
+            # near host total, so treat anything over 4GB as "no limit set"
+            # rather than display the host ceiling as if it were intentional.
+            limit_bytes = mem_stats.get("limit_bytes") if mem_stats else None
+            memory_limit_mb = (round(limit_bytes / 1_048_576, 1)
+                                if limit_bytes and limit_bytes < 4_294_967_296 else None)
 
             unhealthy = (not up) or (readiness == "stale")
             blocked_by = list(confirmed_down) if (unhealthy and confirmed_down) else []
@@ -1158,6 +1192,8 @@ def _refresh_health() -> None:
                 "last_write": last_write_map.get(name),
                 "checked_at": time.time(),
                 "uptime_7d": _uptime_7d(state, name, now),
+                "memory_mb": memory_mb,
+                "memory_limit_mb": memory_limit_mb,
                 "alerted_unhealthy": (prev.get(name, {}).get("alerted_unhealthy", False)
                                        or unhealthy) if svc["restart"] == "alert_only" else False,
             }

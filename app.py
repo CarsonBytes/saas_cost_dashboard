@@ -831,6 +831,17 @@ def services_row() -> None:
                                         ui.element("div").classes(
                                             f"w-1.5 h-3 rounded-sm {slot_cls[s]}") \
                                             .tooltip(f"{hours_ago}h-{hours_ago + 6}h ago: {s}")
+                        # ADDED 2026-09-04 (memory-control spec item #4):
+                        # visibility only at this stage -- no cap exists yet
+                        # to compare against (spec item #1), so no alert
+                        # threshold here, just the reading a future cap would
+                        # be sized from. None means "not on the restart-
+                        # proxy's allow-list" or "no reading yet", not zero.
+                        if status.get("memory_mb") is not None:
+                            mem_text = f"Memory: {status['memory_mb']:.0f} MB"
+                            if status.get("memory_limit_mb"):
+                                mem_text += f" / {status['memory_limit_mb']:.0f} MB cap"
+                            ui.label(mem_text).classes("text-xs text-grey-6")
                         if overdue:
                             ui.label("⚠ compliance overdue: " + ", ".join(overdue)).classes(
                                 "text-xs text-red-600 mt-1")

@@ -8,9 +8,10 @@ trading engine) -- an acceptable trade on a machine only its owner touches,
 but a different one once the container holding it is dashboard.carsonng.com,
 public with no auth gate. This proxy is the narrow replacement: it alone
 mounts the socket, and it accepts exactly a few actions -- POST /restart,
-POST /pause, POST /unpause -- each for a container name on an explicit
-allow-list. A compromised dashboard can therefore only restart or
-pause/unpause the three auto-heal agents; it cannot create, delete, exec
+POST /pause, POST /unpause, GET /stats -- each for a container name on an
+explicit allow-list (GET /stats covers all of them at once, read-only). A
+compromised dashboard can therefore only restart, pause/unpause, or read
+memory stats for the allow-listed agents; it cannot create, delete, exec
 into, or otherwise touch anything else on the daemon.
 
 Only reachable on the compose-internal network (no host port is published);
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -52,7 +54,44 @@ def _docker_action(name: str, action: str) -> tuple[int, bool]:
     return resp.status_code, resp.status_code < 300
 
 
+def _container_stats(name: str) -> dict | None:
+    """ADDED 2026-09-04 (memory-control spec item #4): GET /containers/{name}
+    /stats?stream=false -- a one-shot cgroup snapshot, read-only, same
+    allow-list boundary as restart/pause. `usage` includes page cache, which
+    inflates the number vs. what a leak actually looks like -- subtract
+    `stats.cache` (cgroup v1) / `stats.inactive_file` (cgroup v2), matching
+    what `docker stats` itself shows."""
+    try:
+        transport = httpx.HTTPTransport(uds=_SOCKET)
+        with httpx.Client(transport=transport, timeout=10) as client:
+            resp = client.get(f"http://localhost/containers/{name}/stats",
+                              params={"stream": "false"})
+        if resp.status_code >= 300:
+            return None
+        mem = resp.json().get("memory_stats", {})
+        usage = mem.get("usage")
+        if usage is None:
+            return None
+        cache = mem.get("stats", {}).get("cache", mem.get("stats", {}).get("inactive_file", 0))
+        return {"usage_bytes": max(usage - cache, 0), "limit_bytes": mem.get("limit")}
+    except Exception:                                 # noqa: BLE001
+        return None
+
+
 class Handler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path != "/stats":
+            self._reply(404, {"ok": False, "error": "unknown path"})
+            return
+        # One call per allow-listed container -- the Engine API has no bulk
+        # stats endpoint. Local Unix-socket calls, not network, so a small
+        # pool keeps this well under noc.py's per-cycle budget.
+        with ThreadPoolExecutor(max_workers=max(len(ALLOWED), 1)) as pool:
+            names = sorted(ALLOWED)
+            results = pool.map(_container_stats, names)
+            containers = {name: s for name, s in zip(names, results) if s is not None}
+        self._reply(200, {"ok": True, "containers": containers})
+
     def do_POST(self) -> None:
         action = self.path.lstrip("/")
         if action not in _ACTIONS:
