@@ -245,6 +245,28 @@ def _dependency_probe_results() -> dict[str, bool]:
 # dependency was down more often than not that whole stretch).
 _DEPS_STREAK: dict[str, int] = {}
 
+# Same flapping guard, applied per-agent to its OWN liveness probe rather than
+# a shared dependency (ADDED 2026-09-05). Found live: Quant Paper's dashboard
+# briefly loses its own IB Gateway connection every time that sidecar cycles
+# through IBKR's 2FA-timeout auto-restart (routine, especially frequent on
+# weekends -- IBKR's own weekly server reset -- see D:\quant's
+# gateway-login-watchdog.sh, which already handles the actual relogin with
+# its own escalating retry ladder). That sidecar restart makes the DASHBOARD
+# briefly unresponsive to noc's probe for one cycle, which used to restart
+# the dashboard immediately -- pointless, since the dashboard process itself
+# isn't broken, it's just waiting on a reconnect that's already in progress
+# elsewhere, and the restart interrupts that reconnect instead of helping it.
+# 24 restarts logged for Quant Paper vs 2-3 for every other agent, confirming
+# this is agent-specific, not a shared-infra issue.
+_LIVENESS_STREAK: dict[str, int] = {}
+
+
+def _update_liveness_streak(name: str, up: bool) -> int:
+    """Advance the consecutive-run counter for one agent's liveness probe."""
+    cur = _LIVENESS_STREAK.get(name, 0)
+    _LIVENESS_STREAK[name] = cur + 1 if up else (cur - 1 if cur <= 0 else -1)
+    return _LIVENESS_STREAK[name]
+
 
 def _update_dep_streak(dep: str, healthy: bool) -> int:
     """Advance the consecutive-run counter for one probe result. Returns the
@@ -382,16 +404,26 @@ def _container_stats_map() -> dict[str, dict]:
 
 
 def _restart_warranted(svc: dict, up: bool, readiness: str,
-                       deps_stable: bool = True) -> bool:
+                       deps_stable: bool = True,
+                       liveness_confirmed_down: bool = True) -> bool:
     """Whether the agent's CURRENT check results justify attempting a restart.
-    A liveness failure always does. A staleness signal only does for agents
-    with an enforced write cadence (restart_on_staleness) AND when the shared
-    dependencies are confirmed healthy across consecutive cycles -- a flapping
-    dependency masquerading as agent staleness must not restart the agent
-    (FIXED 2026-08-15: that exact pattern fired three restarts in one hour
-    and locked Quant Paper). Pure -- testable."""
+    A liveness failure only does once CONFIRMED across >=2 consecutive cycles
+    (FIXED 2026-09-05: a single missed probe used to restart immediately --
+    found live restarting Quant Paper's dashboard every time its OWN IB
+    Gateway sidecar briefly cycled through a routine 2FA-timeout relogin,
+    which makes the dashboard unresponsive for one cycle but isn't a dashboard
+    problem at all; the restart interrupted an already-in-progress reconnect
+    instead of helping). `liveness_confirmed_down` defaults True so callers
+    not tracking a streak (tests, one-off checks) keep today's behavior --
+    _refresh_health() passes the real per-agent streak result. A staleness
+    signal only warrants a restart for agents with an enforced write cadence
+    (restart_on_staleness) AND when the shared dependencies are confirmed
+    healthy across consecutive cycles -- a flapping dependency masquerading
+    as agent staleness must not restart the agent (FIXED 2026-08-15: that
+    exact pattern fired three restarts in one hour and locked Quant Paper --
+    the same agent, a different flapping signal). Pure -- testable."""
     if not up:
-        return True
+        return liveness_confirmed_down
     if readiness != "stale":
         return False
     if not svc.get("restart_on_staleness"):
@@ -972,6 +1004,15 @@ def _refresh_health() -> None:
         with ThreadPoolExecutor(max_workers=max(len(monitored), 1)) as pool:
             up_map = dict(zip([s["name"] for s in monitored], pool.map(_liveness, monitored)))
 
+        # Same flapping guard as the shared-dependency one below, applied per
+        # agent to its own liveness probe (ADDED 2026-09-05, see
+        # _LIVENESS_STREAK's docstring) -- a single missed probe no longer
+        # authorizes a restart on its own.
+        liveness_streaks = {name: _update_liveness_streak(name, up)
+                            for name, up in up_map.items()}
+        liveness_confirmed_down_map = {name: _dep_confirmed_down(s)
+                                       for name, s in liveness_streaks.items()}
+
         dep_results = _dependency_probe_results()
         dep_streaks = {dep: _update_dep_streak(dep, ok) for dep, ok in dep_results.items()}
         # confirmed down = 2+ consecutive failing cycles (flapping-proof badge);
@@ -1127,7 +1168,8 @@ def _refresh_health() -> None:
                                   detail="supervised recovery after auto-unlock")
                     locked = name in state.get("locks", {})  # re-lock would need 3 fresh restarts
 
-            if _restart_warranted(svc, up, readiness, deps_stable) \
+            if _restart_warranted(svc, up, readiness, deps_stable,
+                                  liveness_confirmed_down_map.get(name, True)) \
                     and svc["restart"] == "auto_heal":
                 if muted:
                     pass  # maintenance window: observe, don't act (A3)
@@ -1460,7 +1502,10 @@ def _selftest() -> None:
             usage = {"restart_on_staleness": False}
             self.assertTrue(_restart_warranted(enforced, up=True, readiness="stale"))
             self.assertFalse(_restart_warranted(usage, up=True, readiness="stale"))
-            # a liveness failure always warrants a restart, even for usage-driven
+            # a CONFIRMED liveness failure warrants a restart regardless of
+            # restart_on_staleness -- liveness_confirmed_down defaults True so
+            # callers not tracking a streak keep this behavior (see
+            # test_liveness_flapping_replay for the not-yet-confirmed case).
             self.assertTrue(_restart_warranted(usage, up=False, readiness="stale"))
             self.assertTrue(_restart_warranted(enforced, up=False, readiness="ok"))
             # healthy/skipped results never warrant a restart
@@ -1515,6 +1560,37 @@ def _selftest() -> None:
             self.assertTrue(_restart_warranted({"restart_on_staleness": True},
                                                up=True, readiness="stale",
                                                deps_stable=True))
+
+        def test_liveness_flapping_replay(self):
+            """Same guard as test_flapping_dependency_replay, applied to a
+            single agent's own liveness probe (ADDED 2026-09-05). Replays the
+            real pattern found live for Quant Paper: its dashboard misses one
+            probe cycle every time its own IB Gateway sidecar briefly restarts
+            for a routine 2FA-timeout relogin -- a single-cycle blip, not a
+            genuinely dead process -- then recovers on its own. 24 restarts
+            were logged for this exact pattern before this fix; none of them
+            should have fired."""
+            _LIVENESS_STREAK.clear()
+            svc = {"restart": "auto_heal", "restart_on_staleness": False}
+            # down, up, down, up: never two consecutive downs
+            pattern = [False, True, False, True, False, True]
+            fired = 0
+            for up in pattern:
+                streak = _update_liveness_streak("Quant Trading (Paper)", up)
+                confirmed_down = _dep_confirmed_down(streak)
+                if _restart_warranted(svc, up, readiness="n/a",
+                                      liveness_confirmed_down=confirmed_down):
+                    fired += 1
+            self.assertEqual(fired, 0,
+                             "a single missed probe, recovering by the next cycle, "
+                             "must never fire a restart")
+            _LIVENESS_STREAK.clear()
+            # two CONSECUTIVE misses do confirm it down -- a restart is warranted
+            _update_liveness_streak("Quant Trading (Paper)", False)
+            streak = _update_liveness_streak("Quant Trading (Paper)", False)
+            self.assertTrue(_restart_warranted(svc, up=False, readiness="n/a",
+                                               liveness_confirmed_down=_dep_confirmed_down(streak)))
+            _LIVENESS_STREAK.clear()
             _DEPS_STREAK.clear()
 
         def test_idle_counts_healthy_for_uptime(self):
