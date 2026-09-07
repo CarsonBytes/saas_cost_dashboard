@@ -69,7 +69,7 @@ _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC",
 _RISK_LEDGER_INTERVAL_SEC = int(os.environ.get("RISK_LEDGER_INTERVAL_SEC", "300"))
 _COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
 
-_PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "(untagged)": "#6b7280"}
+_PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "spendlens": "#0d9488", "(untagged)": "#6b7280"}
 
 # Agent card -> ledger project tag, for the per-project drill-down (A1):
 # which cards' costs are actually visible in the shared ledger. Quant Paper
@@ -77,7 +77,8 @@ _PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", 
 # and Study Platform writes project="study" even though its freshness signal
 # comes from answer_log.
 _CARD_PROJECTS = {"Quant Trading (Paper)": "quant", "Quant Trading (Live)": "quant",
-                  "Event Radar": "events", "Study Platform": "study"}
+                  "Event Radar": "events", "Study Platform": "study",
+                  "SpendLens": "spendlens"}
 
 
 @ui.refreshable

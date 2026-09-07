@@ -279,6 +279,29 @@ SERVICES = [
         "container": None,
     },
     {
+        # ADDED 2026-09-07: SpendLens + public demo pair (same Demo/Private
+        # split as Event Radar / Study Platform). Liveness-only + alert_only
+        # on purpose for now: container name and ledger-write cadence are not
+        # confirmed yet, so no project_tag/freshness (avoids false "stale"
+        # alerts before the first ledger write) and no auto-heal (avoids
+        # failed restarts against a container not on the restart-proxy
+        # allow-list). Cost drill-down IS wired (app.py _CARD_PROJECTS) so
+        # project="spendlens" rows light up as soon as they exist. Graduate
+        # to project_tag + auto_heal + ALLOWED_CONTAINERS once confirmed.
+        # URLs are the Demo/Private convention -- correct them if different.
+        "name": "SpendLens",
+        "business_impact": "medium", # public-facing demo
+        "desc": "Personal spend analytics",
+        "icon": "savings",
+        "links": [("Demo", "https://spendlens-demo.carsonng.com"),
+                  ("Private", "https://spendlens.carsonng.com")],
+        "monitor": True,
+        "restart": "alert_only",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
+    },
+    {
         "name": "Change Impact Assessor",
         "business_impact": "low",    # demo
         "desc": "Human-in-the-loop AI risk gate for code/infra changes",
