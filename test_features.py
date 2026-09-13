@@ -271,6 +271,80 @@ def test_meter_flushes_jsonl_and_read_totals(tmp_path):
         supabase_meter.reset()
 
 
+def test_meter_response_hook_parses_postgrest_urls():
+    import supabase_meter
+    from types import SimpleNamespace
+
+    def _resp(method, path):
+        return SimpleNamespace(request=SimpleNamespace(
+            method=method, url=SimpleNamespace(path=path)))
+
+    supabase_meter.reset()
+    try:
+        supabase_meter.response_hook(_resp("GET", "/rest/v1/llm_calls"))
+        supabase_meter.response_hook(_resp("GET", "/rest/v1/llm_calls"))
+        supabase_meter.response_hook(_resp("POST", "/rest/v1/governance_audit_log"))
+        supabase_meter.response_hook(_resp("GET", "/auth/v1/user"))  # not PostgREST: ignored
+        supabase_meter.response_hook(_resp("GET", "/rest/v1/"))      # no table: ignored
+        supabase_meter.response_hook(object())                        # garbage: never raises
+        assert supabase_meter.snapshot() == {
+            "GET llm_calls": 2, "POST governance_audit_log": 1}
+    finally:
+        supabase_meter.reset()
+
+
+def test_meter_tracks_bytes_and_filters_by_app(tmp_path):
+    import json
+    import time
+    import supabase_meter
+    target = tmp_path / "m.jsonl"
+    old_file, old_sec, old_app = (supabase_meter.FILE, supabase_meter.FLUSH_SEC,
+                                  supabase_meter.APP)
+    supabase_meter.configure(path=str(target))
+    supabase_meter.FLUSH_SEC = 3600  # no auto-flush yet: assert the live snapshot
+    try:
+        supabase_meter.reset()
+        supabase_meter.APP = "study"
+        supabase_meter.record("GET", "questions", 194000)
+        supabase_meter.record("GET", "questions", 6000)
+        assert supabase_meter.snapshot() == {"GET questions": 2}
+        assert supabase_meter.snapshot_bytes() == {"GET questions": 200000}
+        supabase_meter.reset()
+        # now flush every record (SEC=0): one JSONL line per record
+        supabase_meter.FLUSH_SEC = 0
+        supabase_meter.APP = "study"
+        supabase_meter.record("GET", "questions", 194000)
+        supabase_meter.record("GET", "questions", 6000)
+        supabase_meter.APP = "study-demo"
+        supabase_meter.record("GET", "questions", 1000)
+        lines = [json.loads(l) for l in target.read_text().splitlines()]
+        assert len(lines) == 3
+        assert lines[0]["bytes"] == {"GET questions": 194000}
+        now = time.time()
+        assert supabase_meter.read_bytes(str(target), since_ts=now - 3600) == \
+            {"GET questions": 201000}
+        assert supabase_meter.read_bytes(str(target), app="study-demo") == \
+            {"GET questions": 1000}
+        assert supabase_meter.read_totals(str(target), app="study") == \
+            {"GET questions": 2}
+    finally:
+        supabase_meter.configure(path=old_file)
+        supabase_meter.FLUSH_SEC = old_sec
+        supabase_meter.APP = old_app
+        supabase_meter.reset()
+
+
+def test_meter_response_bytes_prefers_content_length():
+    import supabase_meter
+    from types import SimpleNamespace
+
+    with_header = SimpleNamespace(headers={"content-length": "1234"}, content=b"x" * 5)
+    assert supabase_meter.response_bytes(with_header) == 1234
+    chunked = SimpleNamespace(headers={}, content=b"y" * 77)
+    assert supabase_meter.response_bytes(chunked) == 77
+    assert supabase_meter.response_bytes(object()) == 0
+
+
 def test_meter_never_raises_on_bad_file(tmp_path):
     import supabase_meter
     old_file, old_sec = supabase_meter.FILE, supabase_meter.FLUSH_SEC

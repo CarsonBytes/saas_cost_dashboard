@@ -47,6 +47,20 @@ async def test_page_renders_with_all_tabs(user: User):
     await user.should_see("Cost & Usage")
     await user.should_see("Reliability & Incidents")
     await user.should_see("Governance")
+    await user.should_see("Supabase")
+
+
+@MAIN
+async def test_supabase_tab_renders_meter_table(user: User):
+    import app as deck
+    deck.STATE["active_tab"] = "Supabase"
+    try:
+        await user.open("/")
+        await user.should_see("Supabase requests by endpoint")
+        await user.should_see("Requests (24h)")
+        await user.should_see("Avg / request")
+    finally:
+        deck.STATE["active_tab"] = "Overview"
 
 
 @MAIN

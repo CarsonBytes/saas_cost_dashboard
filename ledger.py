@@ -141,7 +141,7 @@ def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = Non
             headers=headers,
             timeout=15,
         )
-        supabase_meter.record("GET", "llm_calls")
+        supabase_meter.record("GET", "llm_calls", supabase_meter.response_bytes(resp))
         resp.raise_for_status()
         batch = resp.json()
         rows.extend(batch)
@@ -438,7 +438,7 @@ def _input_text_available() -> bool:
                              headers={"apikey": SUPABASE_SERVICE_ROLE_KEY,
                                       "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
                              timeout=8)
-            supabase_meter.record("GET", "llm_calls")
+            supabase_meter.record("GET", "llm_calls", supabase_meter.response_bytes(resp))
             _input_text_cache = resp.status_code == 200
         except Exception:                             # noqa: BLE001
             _input_text_cache = False
@@ -487,7 +487,7 @@ def _scan_high_impact_calls() -> dict:
                                      "created_at": f"gte.{since}",
                                      "order": "created_at.desc", "limit": "500"},
                              headers=headers, timeout=15)
-            supabase_meter.record("GET", "llm_calls")
+            supabase_meter.record("GET", "llm_calls", supabase_meter.response_bytes(resp))
             if resp.status_code != 200:
                 continue
             rows = resp.json()

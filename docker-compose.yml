@@ -7,6 +7,10 @@ services:
       - .env
     environment:
       - PORT=8095
+      # Self-meter label (the flush FILE is pinned in ledger.py to the
+      # noc-state volume's state/ dir, so it survives redeploys with the
+      # other state files).
+      - SUPABASE_METER_APP=dashboard
     ports:
       # Cut over 2026-08-13: was 18095:8095 during parallel testing (native
       # Windows launcher still serving 8095). Native launcher decommissioned,

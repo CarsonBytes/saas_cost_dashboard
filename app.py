@@ -51,6 +51,8 @@ import governance  # compliance radar engine (governance/engine.py)
 import ledger  # both load .env themselves on import
 import noc
 import services
+import supabase_meter  # self-meter file readout (flush target pinned in ledger.py)
+from pathlib import Path as _Path
 
 log = logging.getLogger("command-deck")
 
@@ -1000,7 +1002,7 @@ def dashboard_body() -> None:
     selected tab now has nothing destructive happening to it on refresh,
     rather than relying on state-restoration timing to survive one."""
     _data_status()
-    tab_names = ["Overview", "Cost & Usage", "Reliability & Incidents", "Governance"]
+    tab_names = ["Overview", "Cost & Usage", "Reliability & Incidents", "Governance", "Supabase"]
     with ui.tabs().classes("w-full") as tabs:
         tab_objs = {}
         for name in tab_names:
@@ -1020,6 +1022,8 @@ def dashboard_body() -> None:
             _reliability_tab()
         with ui.tab_panel(tab_objs["Governance"]):
             governance_view()
+        with ui.tab_panel(tab_objs["Supabase"]):
+            _supabase_tab()
 
 
 @ui.refreshable
@@ -1231,6 +1235,70 @@ def _reliability_tab() -> None:
         .mark("self-meter")
 
 
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+@ui.refreshable
+def _supabase_tab() -> None:
+    """Supabase egress monitor (2026-09-13): per-endpoint request counts AND
+    response sizes from this dashboard's own self-meter file
+    (state/supabase_meter.jsonl, flushed ~1/min by every Supabase call this
+    process makes) -- the per-app attribution Supabase's 1-hour edge_logs
+    window can't give. Sibling projects (quant, event-radar, study) flush
+    their own files the same way; this tab reads the dashboard's own."""
+    path = _Path(__file__).parent / "state" / "supabase_meter.jsonl"
+    ui.label("Supabase requests by endpoint").classes("text-sm font-bold")
+    ui.label("Every Supabase REST call this dashboard makes, counted with its "
+             "response size. Types = METHOD + table; sizes = response payload "
+             "bytes (what counts toward egress).").classes("text-xs text-grey-6")
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    day_ago = now - 86400
+    counts_24h = supabase_meter.read_totals(str(path), since_ts=day_ago)
+    bytes_24h = supabase_meter.read_bytes(str(path), since_ts=day_ago)
+    counts_all = supabase_meter.read_totals(str(path))
+    bytes_all = supabase_meter.read_bytes(str(path))
+    keys = sorted(set(counts_24h) | set(bytes_24h) | set(counts_all) | set(bytes_all),
+                  key=lambda k: -(bytes_24h.get(k, 0)))
+    cols = [
+        {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
+        {"name": "req24", "label": "Requests (24h)", "field": "req24", "sortable": True},
+        {"name": "bytes24", "label": "Bytes (24h)", "field": "bytes24", "sortable": True},
+        {"name": "avg", "label": "Avg / request", "field": "avg"},
+        {"name": "reqall", "label": "Requests (all)", "field": "reqall", "sortable": True},
+        {"name": "bytesall", "label": "Bytes (all)", "field": "bytesall", "sortable": True},
+    ]
+    rows = [{
+        "endpoint": k,
+        "req24": counts_24h.get(k, 0),
+        "bytes24": _fmt_bytes(bytes_24h.get(k, 0)),
+        "_bytes24": bytes_24h.get(k, 0),
+        "avg": _fmt_bytes(bytes_24h.get(k, 0) // max(counts_24h.get(k, 0), 1))
+               if counts_24h.get(k) else "—",
+        "reqall": counts_all.get(k, 0),
+        "bytesall": _fmt_bytes(bytes_all.get(k, 0)),
+        "_bytesall": bytes_all.get(k, 0),
+        "_key": k,
+    } for k in keys]
+    # Byte columns show pre-formatted strings ("1.2 MB") so they stay display-
+    # only; the request-count columns (raw ints) carry the sorting instead.
+    ui.table(columns=cols, rows=rows, row_key="_key").classes("w-full").props("dense") \
+        .mark("supabase-meter-table")
+    total_24h = sum(bytes_24h.values())
+    total_all = sum(bytes_all.values())
+    ui.label(f"24h: {sum(counts_24h.values())} requests, {_fmt_bytes(total_24h)} · "
+             f"all-time: {sum(counts_all.values())} requests, {_fmt_bytes(total_all)} · "
+             f"source: state/supabase_meter.jsonl").classes("text-xs text-grey-6 mt-2")
+    if not keys:
+        ui.label("No meter data yet -- collection started 2026-09-13 and flushes "
+                 "~1/min while the dashboard runs. Check back after some traffic.") \
+            .classes("text-sm text-grey-6 mt-2")
+
+
 def refresh_all() -> None:
     """FIXED 2026-08-30: used to call dashboard_body.refresh(), which tore
     down and rebuilt the tabs/tab_panels chrome itself on every single call
@@ -1252,6 +1320,7 @@ def refresh_all() -> None:
     _overview_tab.refresh()
     _cost_tab.refresh()
     _reliability_tab.refresh()
+    _supabase_tab.refresh()
     last_refreshed_label.refresh()
 
 
