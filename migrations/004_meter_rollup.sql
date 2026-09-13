@@ -42,7 +42,7 @@ BEGIN
             PERFORM cron.unschedule('meter-rollup-retention');
         END IF;
         PERFORM cron.schedule('meter-rollup-retention', '0 3 * * *',
-            $$DELETE FROM public.meter_rollup WHERE ts < NOW() - INTERVAL '7 days'$$);
+            $retention$DELETE FROM public.meter_rollup WHERE ts < NOW() - INTERVAL '7 days'$retention$);
     END IF;
 EXCEPTION WHEN undefined_function OR undefined_table THEN
     -- cron schema present but job table missing (half-enabled extension):
