@@ -31,7 +31,7 @@ COPY pyproject.toml uv.lock ./
 ENV UV_HTTP_TIMEOUT=120
 RUN uv sync --frozen --no-install-project
 
-COPY app.py ledger.py alerts.py services.py noc.py commands.py restart_proxy.py supabase_meter.py ./
+COPY app.py ledger.py alerts.py services.py noc.py commands.py restart_proxy.py supabase_meter.py supabase_usage.py ./
 COPY governance/ ./governance/
 
 ENV PATH="/app/.venv/bin:$PATH"

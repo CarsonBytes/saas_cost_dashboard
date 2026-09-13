@@ -23,6 +23,7 @@ Knobs (env):
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import time
@@ -33,6 +34,26 @@ try:
     FLUSH_SEC = float(os.environ.get("SUPABASE_METER_SEC", "60"))
 except ValueError:
     FLUSH_SEC = 60.0
+
+# Cross-project rollup (2026-09-13): after each file flush, also POST the same
+# per-minute batch to the `meter_rollup` Supabase table (~1 small write/min/
+# app -- negligible against the tens of thousands of reads it attributes), so
+# the dashboard can show per-app x per-endpoint attribution from ONE table
+# instead of reaching into every project's local files. Reuses the standard
+# SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY every app already has. Everything
+# here is read lazily at flush time (dotenv commonly loads after this module
+# is imported). SUPABASE_METER_ROLLUP=0 disables; otherwise a 404 (migration
+# 004 not run yet) disables for the rest of the process lifetime -- rollout
+# is not an ordered dependency.
+_rollup_disabled = False
+
+
+def _rollup_table() -> str:
+    return os.environ.get("SUPABASE_METER_ROLLUP_TABLE", "meter_rollup")
+
+
+def _rollup_force_off() -> bool:
+    return os.environ.get("SUPABASE_METER_ROLLUP", "") == "0"
 
 _counts: dict[str, int] = {}
 _bytes: dict[str, int] = {}
@@ -96,23 +117,63 @@ def response_bytes(response) -> int:
 
 def _maybe_flush() -> None:
     global _last_flush
-    if not FILE:
-        return
     now = time.time()
     if now - _last_flush < FLUSH_SEC:
         return
     _last_flush = now
     if not _counts:
         return
-    line = json.dumps({"ts": now, "app": APP,
-                       "counts": dict(_counts), "bytes": dict(_bytes)})
-    _counts.clear()
-    _bytes.clear()
+    counts, byts = dict(_counts), dict(_bytes)
+    line = json.dumps({"ts": now, "app": APP, "counts": counts, "bytes": byts})
+    took = False
+    if FILE:
+        took = True
+        try:
+            with open(FILE, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:  # noqa: BLE001 -- metering must never break the caller
+            pass
+    took = _flush_rollup(now, counts, byts) or took
+    if took:
+        # A sink took the batch -- reset the live view. With no sink at all
+        # (memory-only mode, e.g. unit tests) counts stay put so snapshot()
+        # keeps showing them instead of vanishing on the first flush tick.
+        _counts.clear()
+        _bytes.clear()
+
+
+def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> bool:
+    """Best-effort POST of one minute's per-endpoint rows to the rollup table.
+    stdlib urllib (NOT httpx) so this module stays dependency-free -- and so
+    the write itself never passes through a metered code path (no self-
+    counting). Returns True when a POST was attempted. Never raises."""
+    global _rollup_disabled
+    if _rollup_disabled or _rollup_force_off() or not counts:
+        return False
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not url or not key:
+        return False
+    import urllib.request
+    rows = [{"ts": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(),
+             "app": APP, "endpoint": ep,
+             "requests": n, "bytes": byts.get(ep, 0)}
+            for ep, n in counts.items()]
     try:
-        with open(FILE, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except Exception:  # noqa: BLE001 -- metering must never break the caller
-        pass
+        req = urllib.request.Request(
+            f"{url.rstrip('/')}/rest/v1/{_rollup_table()}",
+            data=json.dumps(rows).encode("utf-8"),
+            headers={"apikey": key, "Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 404:
+                _rollup_disabled = True  # migration 004 not run yet; stop trying
+    except Exception as e:  # noqa: BLE001 -- never break the caller; a 404
+        # (raised as HTTPError, not returned) means the same thing.
+        if "404" in str(e):
+            _rollup_disabled = True
 
 
 def response_hook(response) -> None:

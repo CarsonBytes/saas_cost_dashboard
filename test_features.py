@@ -5,9 +5,33 @@ slots. UI-level coverage lives in test_render_smoke.py."""
 import datetime as dt
 import json
 
+import pytest
+
 import alerts
 import ledger
 import noc
+
+
+@pytest.fixture
+def _meter_isolated(monkeypatch, tmp_path):
+    """Hermetic meter state: tmp file, blanked Supabase creds (so a flush can
+    never POST to the real project from unit tests), restored afterwards."""
+    import supabase_meter
+    monkeypatch.setenv("SUPABASE_URL", "")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    old = (supabase_meter.FILE, supabase_meter.FLUSH_SEC, supabase_meter.APP,
+           supabase_meter._rollup_disabled)
+    supabase_meter.configure(path=str(tmp_path / "m.jsonl"))
+    supabase_meter.FLUSH_SEC = 3600
+    supabase_meter.APP = "test"
+    supabase_meter._rollup_disabled = False
+    supabase_meter.reset()
+    yield supabase_meter
+    supabase_meter.configure(path=old[0])
+    supabase_meter.FLUSH_SEC = old[1]
+    supabase_meter.APP = old[2]
+    supabase_meter._rollup_disabled = old[3]
+    supabase_meter.reset()
 
 
 # ---- A5: cost spike detection ------------------------------------------------
@@ -239,103 +263,75 @@ def test_command_handlers(monkeypatch):
 
 # ---- Supabase self-meter (2026-09-13) -------------------------------------------------
 
-def test_meter_counts_and_snapshots():
-    import supabase_meter
-    supabase_meter.reset()
+def test_meter_counts_and_snapshots(_meter_isolated):
+    supabase_meter = _meter_isolated
     supabase_meter.record("GET", "llm_calls")
     supabase_meter.record("GET", "llm_calls")
     supabase_meter.record("POST", "governance_audit_log")
-    snap = supabase_meter.snapshot()
-    assert snap == {"GET llm_calls": 2, "POST governance_audit_log": 1}
+    assert supabase_meter.snapshot() == {"GET llm_calls": 2, "POST governance_audit_log": 1}
     supabase_meter.reset()
     assert supabase_meter.snapshot() == {}
 
 
-def test_meter_flushes_jsonl_and_read_totals(tmp_path):
-    import supabase_meter
-    target = tmp_path / "meter.jsonl"
-    old_file, old_sec = supabase_meter.FILE, supabase_meter.FLUSH_SEC
-    supabase_meter.configure(path=str(target))
+def test_meter_flushes_jsonl_and_read_totals(_meter_isolated):
+    supabase_meter = _meter_isolated
     supabase_meter.FLUSH_SEC = 0  # flush on every record in this test
-    try:
-        supabase_meter.reset()
-        supabase_meter.record("GET", "llm_calls")
-        supabase_meter.record("GET", "llm_daily_summary")
-        # flushed lines cleared the in-memory counts
-        assert supabase_meter.snapshot() == {}
-        totals = supabase_meter.read_totals(str(target))
-        assert totals == {"GET llm_calls": 1, "GET llm_daily_summary": 1}
-    finally:
-        supabase_meter.configure(path=old_file)
-        supabase_meter.FLUSH_SEC = old_sec
-        supabase_meter.reset()
+    supabase_meter.record("GET", "llm_calls")
+    supabase_meter.record("GET", "llm_daily_summary")
+    # flushed lines cleared the in-memory counts
+    assert supabase_meter.snapshot() == {}
+    totals = supabase_meter.read_totals(supabase_meter.FILE)
+    assert totals == {"GET llm_calls": 1, "GET llm_daily_summary": 1}
 
 
-def test_meter_response_hook_parses_postgrest_urls():
-    import supabase_meter
+def test_meter_response_hook_parses_postgrest_urls(_meter_isolated):
+    supabase_meter = _meter_isolated
     from types import SimpleNamespace
 
     def _resp(method, path):
         return SimpleNamespace(request=SimpleNamespace(
             method=method, url=SimpleNamespace(path=path)))
 
-    supabase_meter.reset()
-    try:
-        supabase_meter.response_hook(_resp("GET", "/rest/v1/llm_calls"))
-        supabase_meter.response_hook(_resp("GET", "/rest/v1/llm_calls"))
-        supabase_meter.response_hook(_resp("POST", "/rest/v1/governance_audit_log"))
-        supabase_meter.response_hook(_resp("GET", "/auth/v1/user"))  # not PostgREST: ignored
-        supabase_meter.response_hook(_resp("GET", "/rest/v1/"))      # no table: ignored
-        supabase_meter.response_hook(object())                        # garbage: never raises
-        assert supabase_meter.snapshot() == {
-            "GET llm_calls": 2, "POST governance_audit_log": 1}
-    finally:
-        supabase_meter.reset()
+    supabase_meter.response_hook(_resp("GET", "/rest/v1/llm_calls"))
+    supabase_meter.response_hook(_resp("GET", "/rest/v1/llm_calls"))
+    supabase_meter.response_hook(_resp("POST", "/rest/v1/governance_audit_log"))
+    supabase_meter.response_hook(_resp("GET", "/auth/v1/user"))  # not PostgREST: ignored
+    supabase_meter.response_hook(_resp("GET", "/rest/v1/"))      # no table: ignored
+    supabase_meter.response_hook(object())                        # garbage: never raises
+    assert supabase_meter.snapshot() == {
+        "GET llm_calls": 2, "POST governance_audit_log": 1}
 
 
-def test_meter_tracks_bytes_and_filters_by_app(tmp_path):
-    import json
+def test_meter_tracks_bytes_and_filters_by_app(_meter_isolated):
     import time
-    import supabase_meter
-    target = tmp_path / "m.jsonl"
-    old_file, old_sec, old_app = (supabase_meter.FILE, supabase_meter.FLUSH_SEC,
-                                  supabase_meter.APP)
-    supabase_meter.configure(path=str(target))
-    supabase_meter.FLUSH_SEC = 3600  # no auto-flush yet: assert the live snapshot
-    try:
-        supabase_meter.reset()
-        supabase_meter.APP = "study"
-        supabase_meter.record("GET", "questions", 194000)
-        supabase_meter.record("GET", "questions", 6000)
-        assert supabase_meter.snapshot() == {"GET questions": 2}
-        assert supabase_meter.snapshot_bytes() == {"GET questions": 200000}
-        supabase_meter.reset()
-        # now flush every record (SEC=0): one JSONL line per record
-        supabase_meter.FLUSH_SEC = 0
-        supabase_meter.APP = "study"
-        supabase_meter.record("GET", "questions", 194000)
-        supabase_meter.record("GET", "questions", 6000)
-        supabase_meter.APP = "study-demo"
-        supabase_meter.record("GET", "questions", 1000)
-        lines = [json.loads(l) for l in target.read_text().splitlines()]
-        assert len(lines) == 3
-        assert lines[0]["bytes"] == {"GET questions": 194000}
-        now = time.time()
-        assert supabase_meter.read_bytes(str(target), since_ts=now - 3600) == \
-            {"GET questions": 201000}
-        assert supabase_meter.read_bytes(str(target), app="study-demo") == \
-            {"GET questions": 1000}
-        assert supabase_meter.read_totals(str(target), app="study") == \
-            {"GET questions": 2}
-    finally:
-        supabase_meter.configure(path=old_file)
-        supabase_meter.FLUSH_SEC = old_sec
-        supabase_meter.APP = old_app
-        supabase_meter.reset()
+    supabase_meter = _meter_isolated
+    supabase_meter.APP = "study"
+    supabase_meter.record("GET", "questions", 194000)
+    supabase_meter.record("GET", "questions", 6000)
+    assert supabase_meter.snapshot() == {"GET questions": 2}
+    assert supabase_meter.snapshot_bytes() == {"GET questions": 200000}
+    supabase_meter.reset()
+    # now flush every record (SEC=0): one JSONL line per record
+    supabase_meter.FLUSH_SEC = 0
+    supabase_meter.record("GET", "questions", 194000)
+    supabase_meter.record("GET", "questions", 6000)
+    supabase_meter.APP = "study-demo"
+    supabase_meter.record("GET", "questions", 1000)
+    target = supabase_meter.FILE
+    lines = [json.loads(l) for l in open(target, encoding="utf-8")]
+    assert len(lines) == 3
+    assert lines[0]["bytes"] == {"GET questions": 194000}
+    now = time.time()
+    assert supabase_meter.read_bytes(target, since_ts=now - 3600) == \
+        {"GET questions": 201000}
+    assert supabase_meter.read_bytes(target, app="study-demo") == \
+        {"GET questions": 1000}
+    assert supabase_meter.read_totals(target, app="study") == \
+        {"GET questions": 2}
 
 
-def test_meter_response_bytes_prefers_content_length():
-    import supabase_meter
+def test_meter_response_bytes_prefers_content_length(_meter_isolated):
+    supabase_meter = _meter_isolated
     from types import SimpleNamespace
 
     with_header = SimpleNamespace(headers={"content-length": "1234"}, content=b"x" * 5)
@@ -345,16 +341,126 @@ def test_meter_response_bytes_prefers_content_length():
     assert supabase_meter.response_bytes(object()) == 0
 
 
-def test_meter_never_raises_on_bad_file(tmp_path):
-    import supabase_meter
-    old_file, old_sec = supabase_meter.FILE, supabase_meter.FLUSH_SEC
+def test_meter_never_raises_on_bad_file(_meter_isolated, tmp_path):
+    supabase_meter = _meter_isolated
     supabase_meter.configure(path=str(tmp_path / "no-such-dir" / "m.jsonl"))
     supabase_meter.FLUSH_SEC = 0
+    supabase_meter.record("GET", "llm_calls")  # must not raise
+    assert supabase_meter.read_totals(str(tmp_path / "missing.jsonl")) == {}
+
+
+def test_reported_usage_parses_shapes_and_caches(monkeypatch, tmp_path):
+    import supabase_usage
+    monkeypatch.setenv("SUPABASE_URL", "https://abcdef.supabase.co")
+    monkeypatch.setenv("SUPABASE_MANAGEMENT_TOKEN", "sbp_test")
+    monkeypatch.setattr(supabase_usage, "_CACHE_FILE", tmp_path / "u.json")
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, headers=None, timeout=None):
+        calls.append(url)
+        assert "abcdef" in url and url.endswith("/usage/api-counts")
+        assert headers == {"Authorization": "Bearer sbp_test"}
+        return _Resp({"data": [{"day": "2026-09-13", "count": 40000},
+                               {"day": "2026-09-12", "count": 3000}]})
+
+    monkeypatch.setattr(supabase_usage.httpx, "get", _fake_get)
+    first = supabase_usage.fetch_reported_usage()
+    assert first is not None
+    total, note = supabase_usage.reported_requests_24h(first)
+    assert total == 43000
+    second = supabase_usage.fetch_reported_usage()  # hourly cache: no 2nd call
+    assert len(calls) == 1 and second == first
+    # dict-form actions + unconfigured token
+    total2, _ = supabase_usage.reported_requests_24h(
+        {"payload": {"data": {"read": 10, "write": 5}}})
+    assert total2 == 15
+    monkeypatch.setenv("SUPABASE_MANAGEMENT_TOKEN", "")
+    monkeypatch.setattr(supabase_usage, "_CACHE_FILE", tmp_path / "empty.json")
+    assert supabase_usage.fetch_reported_usage() is None  # unconfigured, cold cache
+    assert supabase_usage.reported_requests_24h(None)[0] is None
+
+
+def test_ledger_rollup_returns_empty_without_table(monkeypatch):
+    import ledger
+
+    class _Resp:
+        status_code = 404
+
+        def raise_for_status(self):
+            raise AssertionError("must not be called on 404")
+
+        def json(self):
+            raise AssertionError("must not be called on 404")
+
+    monkeypatch.setattr(ledger.httpx, "get", lambda *a, **k: _Resp())
+    ledger._ROLLUP_CACHE.update({"ts": 0.0, "rows": []})
+    assert ledger.fetch_meter_rollup() == []
+    # cached (even empty): no second HTTP call within the window
+    ledger.fetch_meter_rollup()
+
+
+def test_meter_rollup_posts_and_disables_on_404(_meter_isolated):
+    import urllib.error
+    import urllib.request
+    supabase_meter = _meter_isolated
+    supabase_meter.FLUSH_SEC = 0
+    posted = []
+
+    class _Resp:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        posted.append((req.full_url, json.loads(req.data)))
+        return _Resp()
+
+    import os
+    old_url = os.environ.get("SUPABASE_URL", "")
+    old_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    os.environ["SUPABASE_URL"] = "https://x.supabase.co"
+    os.environ["SUPABASE_SERVICE_ROLE_KEY"] = "key"
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen
     try:
-        supabase_meter.reset()
-        supabase_meter.record("GET", "llm_calls")  # must not raise
-        assert supabase_meter.read_totals(str(tmp_path / "missing.jsonl")) == {}
+        supabase_meter.APP = "dashboard"
+        supabase_meter.record("GET", "llm_calls", 500)
+        assert len(posted) == 1
+        url, rows = posted[0]
+        assert url.endswith("/rest/v1/meter_rollup")
+        assert len(rows) == 1 and rows[0]["endpoint"] == "GET llm_calls"
+        assert (rows[0]["requests"], rows[0]["bytes"]) == (1, 500)
+        assert rows[0]["app"] == "dashboard" and "ts" in rows[0]
+
+        def _raise_404(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+        urllib.request.urlopen = _raise_404
+        supabase_meter.record("GET", "llm_calls", 1)
+        assert supabase_meter._rollup_disabled is True
+        supabase_meter.record("GET", "llm_calls", 1)
+        assert len(posted) == 1  # disabled: no further attempts
     finally:
-        supabase_meter.configure(path=old_file)
-        supabase_meter.FLUSH_SEC = old_sec
-        supabase_meter.reset()
+        urllib.request.urlopen = orig
+        if old_url:
+            os.environ["SUPABASE_URL"] = old_url
+        else:
+            os.environ.pop("SUPABASE_URL", None)
+        if old_key:
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"] = old_key
+        else:
+            os.environ.pop("SUPABASE_SERVICE_ROLE_KEY", None)

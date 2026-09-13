@@ -43,6 +43,42 @@ def supabase_meter_snapshot() -> dict[str, int]:
     """This process's unflushed per-endpoint counts (Reliability-tab readout)."""
     return supabase_meter.snapshot()
 
+
+_ROLLUP_CACHE: dict = {"ts": 0.0, "rows": []}
+_ROLLUP_CACHE_SEC = 300
+
+
+def fetch_meter_rollup() -> list[dict]:
+    """Trailing-24h rows of the cross-project meter_rollup table (one row per
+    app x endpoint x minute), 5-minute cached. Empty list when the 004
+    migration hasn't run yet or Supabase is unreachable -- never raises, so
+    the Supabase tab degrades to the local-file view instead of erroring."""
+    now = time.time()
+    if now - _ROLLUP_CACHE["ts"] < _ROLLUP_CACHE_SEC:
+        return _ROLLUP_CACHE["rows"]
+    rows: list[dict] = []
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        try:
+            since = (dt.datetime.now(dt.timezone.utc)
+                     - dt.timedelta(hours=24)).isoformat()
+            resp = httpx.get(
+                f"{SUPABASE_URL}/rest/v1/meter_rollup",
+                params={"select": "ts,app,endpoint,requests,bytes",
+                        "ts": f"gte.{since}", "order": "ts.desc", "limit": "10000"},
+                headers={"apikey": SUPABASE_SERVICE_ROLE_KEY,
+                         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+                timeout=15)
+            supabase_meter.record("GET", "meter_rollup",
+                                  supabase_meter.response_bytes(resp))
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                rows = resp.json()
+        except Exception:  # noqa: BLE001
+            rows = []
+    _ROLLUP_CACHE["ts"] = now
+    _ROLLUP_CACHE["rows"] = rows
+    return rows
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 

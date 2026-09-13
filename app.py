@@ -165,6 +165,7 @@ async def _set_project(project: str | None) -> None:
     connected browser tab, not just the one that clicked, for however long
     those two round-trips take."""
     STATE["project"] = project
+    print("DIAG call-site: _set_project", flush=True)
     await asyncio.to_thread(fetch_stats)
     refresh_all()
 
@@ -970,6 +971,7 @@ def incident_log() -> None:
 
 
 async def _do_retry() -> None:
+    print("DIAG call-site: _do_retry", flush=True)
     await asyncio.to_thread(fetch_stats)
     refresh_all()
 
@@ -1245,21 +1247,82 @@ def _fmt_bytes(n: int) -> str:
 
 @ui.refreshable
 def _supabase_tab() -> None:
-    """Supabase egress monitor (2026-09-13): per-endpoint request counts AND
-    response sizes from this dashboard's own self-meter file
-    (state/supabase_meter.jsonl, flushed ~1/min by every Supabase call this
-    process makes) -- the per-app attribution Supabase's 1-hour edge_logs
-    window can't give. Sibling projects (quant, event-radar, study) flush
-    their own files the same way; this tab reads the dashboard's own."""
+    """Supabase egress monitor (2026-09-13): reconciliation, not just
+    attribution. Section 1 compares Supabase's own reported totals against
+    what the self-meters see (the gap IS the finding -- one app's file can
+    never match the project bill). Section 2 breaks the metered traffic down
+    per app x endpoint from the shared meter_rollup table. Section 3 is this
+    dashboard's own per-endpoint detail from its local file."""
+    import supabase_usage
     path = _Path(__file__).parent / "state" / "supabase_meter.jsonl"
-    ui.label("Supabase requests by endpoint").classes("text-sm font-bold")
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    day_ago = now - 86400
+
+    # ---- 1. reconciliation -------------------------------------------------
+    ui.label("Reported vs metered (24h)").classes("text-sm font-bold")
+    usage = supabase_usage.fetch_reported_usage()
+    reported, note = supabase_usage.reported_requests_24h(usage)
+    rollup_rows = ledger.fetch_meter_rollup()
+    rollup_apps = {r.get("app") for r in rollup_rows}
+    rollup_req = sum(r.get("requests") or 0 for r in rollup_rows)
+    rollup_bytes = sum(r.get("bytes") or 0 for r in rollup_rows)
+    file_counts = supabase_meter.read_totals(str(path), since_ts=day_ago)
+    file_bytes = supabase_meter.read_bytes(str(path), since_ts=day_ago)
+    # The dashboard appears in BOTH sources once its writer posts to the
+    # rollup table -- count its file only while it's absent there.
+    metered_req = rollup_req + (0 if supabase_meter.APP in rollup_apps
+                                else sum(file_counts.values()))
+    metered_bytes = rollup_bytes + (0 if supabase_meter.APP in rollup_apps
+                                    else sum(file_bytes.values()))
+    if reported:
+        coverage = metered_req / reported if reported else 0
+        est = f"~{_fmt_bytes(int(metered_bytes / coverage))}" if coverage > 0 else "—"
+        ui.label(f"Supabase reports {reported:,} requests/24h ({note}). "
+                 f"Self-meters see {metered_req:,} ({coverage:.0%} coverage). "
+                 f"Metered payload: {_fmt_bytes(metered_bytes)} -> estimated true "
+                 f"egress {est} (assumes unmetered traffic has the same "
+                 f"bytes/request; headers/TLS/compression all live in the gap).") \
+            .classes("text-sm mt-1").mark("reconciliation-line")
+    else:
+        ui.label(f"Supabase-reported total unavailable: {note}. Metered traffic "
+                 f"below is this ecosystem's own count only.") \
+            .classes("text-sm text-grey-6 mt-1").mark("reconciliation-line")
+
+    # ---- 2. cross-project rollup -------------------------------------------
+    ui.label("Metered traffic by app x endpoint (24h)").classes("text-sm font-bold mt-4")
+    if rollup_rows:
+        agg: dict[tuple, list] = {}
+        for r in rollup_rows:
+            key = (r.get("app") or "?", r.get("endpoint") or "?")
+            cell = agg.setdefault(key, [0, 0])
+            cell[0] += r.get("requests") or 0
+            cell[1] += r.get("bytes") or 0
+        xcols = [
+            {"name": "app", "label": "App", "field": "app", "sortable": True},
+            {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
+            {"name": "req", "label": "Requests", "field": "req", "sortable": True},
+            {"name": "bytes", "label": "Bytes", "field": "bytes"},
+            {"name": "avg", "label": "Avg / request", "field": "avg"},
+        ]
+        xrows = [{
+            "app": a, "endpoint": e, "req": n,
+            "bytes": _fmt_bytes(b), "avg": _fmt_bytes(b // max(n, 1)) if n else "—",
+            "_key": f"{a} {e}",
+        } for (a, e), (n, b) in sorted(agg.items(), key=lambda kv: -kv[1][1])]
+        ui.table(columns=xcols, rows=xrows, row_key="_key").classes("w-full").props("dense") \
+            .mark("rollup-table")
+    else:
+        ui.label("No rollup rows yet -- needs migration 004 run in the SQL editor "
+                 "AND the sibling apps redeployed with their meter writers "
+                 "(each posts ~1 row/min/endpoint).").classes("text-sm text-grey-6")
+
+    # ---- 3. this dashboard's own detail --------------------------------------
+    ui.label("Supabase requests by endpoint").classes("text-sm font-bold mt-4")
     ui.label("Every Supabase REST call this dashboard makes, counted with its "
              "response size. Types = METHOD + table; sizes = response payload "
              "bytes (what counts toward egress).").classes("text-xs text-grey-6")
-    now = dt.datetime.now(dt.timezone.utc).timestamp()
-    day_ago = now - 86400
-    counts_24h = supabase_meter.read_totals(str(path), since_ts=day_ago)
-    bytes_24h = supabase_meter.read_bytes(str(path), since_ts=day_ago)
+    counts_24h = file_counts
+    bytes_24h = file_bytes
     counts_all = supabase_meter.read_totals(str(path))
     bytes_all = supabase_meter.read_bytes(str(path))
     keys = sorted(set(counts_24h) | set(bytes_24h) | set(counts_all) | set(bytes_all),
@@ -1267,21 +1330,19 @@ def _supabase_tab() -> None:
     cols = [
         {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
         {"name": "req24", "label": "Requests (24h)", "field": "req24", "sortable": True},
-        {"name": "bytes24", "label": "Bytes (24h)", "field": "bytes24", "sortable": True},
+        {"name": "bytes24", "label": "Bytes (24h)", "field": "bytes24"},
         {"name": "avg", "label": "Avg / request", "field": "avg"},
         {"name": "reqall", "label": "Requests (all)", "field": "reqall", "sortable": True},
-        {"name": "bytesall", "label": "Bytes (all)", "field": "bytesall", "sortable": True},
+        {"name": "bytesall", "label": "Bytes (all)", "field": "bytesall"},
     ]
     rows = [{
         "endpoint": k,
         "req24": counts_24h.get(k, 0),
         "bytes24": _fmt_bytes(bytes_24h.get(k, 0)),
-        "_bytes24": bytes_24h.get(k, 0),
         "avg": _fmt_bytes(bytes_24h.get(k, 0) // max(counts_24h.get(k, 0), 1))
                if counts_24h.get(k) else "—",
         "reqall": counts_all.get(k, 0),
         "bytesall": _fmt_bytes(bytes_all.get(k, 0)),
-        "_bytesall": bytes_all.get(k, 0),
         "_key": k,
     } for k in keys]
     # Byte columns show pre-formatted strings ("1.2 MB") so they stay display-
@@ -1350,6 +1411,7 @@ async def _alert_check_loop() -> None:
     fetch_stats are sync, so run them off the event loop thread."""
     while True:
         await asyncio.sleep(_ALERT_CHECK_INTERVAL_SEC)
+        print("DIAG call-site: _alert_check_loop", flush=True)
         await asyncio.to_thread(fetch_stats)  # re-fetches the active window
         _refresh_safely(alert_banner)
 
@@ -1460,6 +1522,7 @@ async def main_page() -> None:
             STATE["days"] = e.value
             STATE["preset_days"] = e.value
             STATE["custom"] = None
+            print("DIAG call-site: _set_range", flush=True)
             await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
@@ -1472,6 +1535,7 @@ async def main_page() -> None:
                 ui.notify("Start date must be on or before the end date", type="negative")
                 return
             STATE["custom"] = (start, end)
+            print("DIAG call-site: _apply_custom", flush=True)
             await asyncio.to_thread(fetch_stats)
             refresh_all()
 
@@ -1480,6 +1544,7 @@ async def main_page() -> None:
             end_date.set_value(None)
             STATE["custom"] = None
             STATE["days"] = STATE.get("preset_days", 7)
+            print("DIAG call-site: _clear_custom", flush=True)
             await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
@@ -1623,6 +1688,7 @@ async def main_page() -> None:
     # even fix the actual problem (see below), so reverted rather than
     # widening what "ready" means across the whole test suite for a change
     # that wasn't the fix.
+    print("DIAG call-site: main_page", flush=True)
     await asyncio.to_thread(fetch_stats)
     refresh_all()
 
