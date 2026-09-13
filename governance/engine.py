@@ -38,6 +38,7 @@ import httpx
 import alerts
 import ledger  # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / to_hkt
 import services  # business_impact for the report's risk overview
+import supabase_meter  # per-endpoint REST call counts (flush target set by ledger)
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ def _get(table: str, params: dict) -> list[dict] | None:
     try:
         resp = httpx.get(f"{ledger.SUPABASE_URL}/rest/v1/{table}",
                          params=params, headers=_headers(), timeout=10)
+        supabase_meter.record("GET", table)
         if resp.status_code != 200:
             return None
         return resp.json()
@@ -79,6 +81,7 @@ def _post(table: str, payload: dict) -> bool:
                           json=payload, headers={**_headers(), "Content-Type": "application/json",
                                                  "Prefer": "return=minimal"},
                           timeout=10)
+        supabase_meter.record("POST", table)
         return resp.status_code < 300
     except Exception:                              # noqa: BLE001
         return False
@@ -91,6 +94,7 @@ def _post_returning(table: str, payload: dict) -> dict | None:
                           json=payload, headers={**_headers(), "Content-Type": "application/json",
                                                  "Prefer": "return=representation"},
                           timeout=10)
+        supabase_meter.record("POST", table)
         if resp.status_code >= 300:
             return None
         rows = resp.json()
@@ -106,6 +110,7 @@ def _patch(table: str, row_id: str, payload: dict) -> bool:
                            headers={**_headers(), "Content-Type": "application/json",
                                     "Prefer": "return=minimal"},
                            timeout=10)
+        supabase_meter.record("PATCH", table)
         return resp.status_code < 300
     except Exception:                              # noqa: BLE001
         return False

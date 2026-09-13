@@ -26,8 +26,22 @@ import httpx
 from dotenv import load_dotenv
 
 import services  # business_impact / project_tag for the risk-ledger scan scope
+import supabase_meter
 
 load_dotenv(Path(__file__).parent / ".env")
+
+# Self-metering (2026-09-13): every real Supabase call this process makes is
+# counted + flushed once a minute to state/ (same dir as the other JSON state
+# files), so the next egress spike is attributable per app/table from our own
+# data instead of Supabase's 1-hour edge_logs window. Cached reads never touch
+# record() -- the meter measures network, not code paths.
+supabase_meter.configure(app="dashboard",
+                         path=str(Path(__file__).parent / "state" / "supabase_meter.jsonl"))
+
+
+def supabase_meter_snapshot() -> dict[str, int]:
+    """This process's unflushed per-endpoint counts (Reliability-tab readout)."""
+    return supabase_meter.snapshot()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -127,6 +141,7 @@ def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = Non
             headers=headers,
             timeout=15,
         )
+        supabase_meter.record("GET", "llm_calls")
         resp.raise_for_status()
         batch = resp.json()
         rows.extend(batch)
@@ -423,6 +438,7 @@ def _input_text_available() -> bool:
                              headers={"apikey": SUPABASE_SERVICE_ROLE_KEY,
                                       "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
                              timeout=8)
+            supabase_meter.record("GET", "llm_calls")
             _input_text_cache = resp.status_code == 200
         except Exception:                             # noqa: BLE001
             _input_text_cache = False
@@ -471,6 +487,7 @@ def _scan_high_impact_calls() -> dict:
                                      "created_at": f"gte.{since}",
                                      "order": "created_at.desc", "limit": "500"},
                              headers=headers, timeout=15)
+            supabase_meter.record("GET", "llm_calls")
             if resp.status_code != 200:
                 continue
             rows = resp.json()

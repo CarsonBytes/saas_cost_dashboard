@@ -1222,6 +1222,14 @@ def _reliability_tab() -> None:
                      for h in history]
         ui.table(columns=hist_cols, rows=hist_rows, row_key="fired_at").classes("w-full").props("dense")
 
+    # Self-meter (2026-09-13): this dashboard process's own Supabase REST calls
+    # since the last minute-flush -- the per-app attribution that Supabase's
+    # 1-hour edge_logs window can't give. Full history: state/supabase_meter.jsonl.
+    meter = ledger.supabase_meter_snapshot()
+    meter_line = ", ".join(f"{k}: {v}" for k, v in sorted(meter.items())) or "no calls yet this minute"
+    ui.label(f"Dashboard self-meter (this minute): {meter_line}").classes("text-xs text-grey-6 mt-4") \
+        .mark("self-meter")
+
 
 def refresh_all() -> None:
     """FIXED 2026-08-30: used to call dashboard_body.refresh(), which tore

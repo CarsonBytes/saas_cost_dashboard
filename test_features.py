@@ -235,3 +235,52 @@ def test_command_handlers(monkeypatch):
     # non-commands stay silent
     assert commands.handle_text("hello?") is None
     assert commands.handle_text("/definitely-not-a-command x") is None
+
+
+# ---- Supabase self-meter (2026-09-13) -------------------------------------------------
+
+def test_meter_counts_and_snapshots():
+    import supabase_meter
+    supabase_meter.reset()
+    supabase_meter.record("GET", "llm_calls")
+    supabase_meter.record("GET", "llm_calls")
+    supabase_meter.record("POST", "governance_audit_log")
+    snap = supabase_meter.snapshot()
+    assert snap == {"GET llm_calls": 2, "POST governance_audit_log": 1}
+    supabase_meter.reset()
+    assert supabase_meter.snapshot() == {}
+
+
+def test_meter_flushes_jsonl_and_read_totals(tmp_path):
+    import supabase_meter
+    target = tmp_path / "meter.jsonl"
+    old_file, old_sec = supabase_meter.FILE, supabase_meter.FLUSH_SEC
+    supabase_meter.configure(path=str(target))
+    supabase_meter.FLUSH_SEC = 0  # flush on every record in this test
+    try:
+        supabase_meter.reset()
+        supabase_meter.record("GET", "llm_calls")
+        supabase_meter.record("GET", "llm_daily_summary")
+        # flushed lines cleared the in-memory counts
+        assert supabase_meter.snapshot() == {}
+        totals = supabase_meter.read_totals(str(target))
+        assert totals == {"GET llm_calls": 1, "GET llm_daily_summary": 1}
+    finally:
+        supabase_meter.configure(path=old_file)
+        supabase_meter.FLUSH_SEC = old_sec
+        supabase_meter.reset()
+
+
+def test_meter_never_raises_on_bad_file(tmp_path):
+    import supabase_meter
+    old_file, old_sec = supabase_meter.FILE, supabase_meter.FLUSH_SEC
+    supabase_meter.configure(path=str(tmp_path / "no-such-dir" / "m.jsonl"))
+    supabase_meter.FLUSH_SEC = 0
+    try:
+        supabase_meter.reset()
+        supabase_meter.record("GET", "llm_calls")  # must not raise
+        assert supabase_meter.read_totals(str(tmp_path / "missing.jsonl")) == {}
+    finally:
+        supabase_meter.configure(path=old_file)
+        supabase_meter.FLUSH_SEC = old_sec
+        supabase_meter.reset()
