@@ -70,6 +70,19 @@ _ALERT_CHECK_INTERVAL_SEC = int(os.environ.get("ALERT_CHECK_INTERVAL_SEC", "900"
 _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC", "120"))
 _RISK_LEDGER_INTERVAL_SEC = int(os.environ.get("RISK_LEDGER_INTERVAL_SEC", "300"))
 _COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
+# ADDED 2026-09-13: dashboard.carsonng.com is fully public, no Cloudflare
+# Access -- found live via a labeled-call-site diagnostic that main_page()
+# was firing every ~20-35s with zero manual navigation, consistent with bot/
+# crawler traffic hitting the public page repeatedly. STATE is already one
+# shared, module-level cache (not per-client), so gating the page-load fetch
+# behind a short TTL is safe by construction: every connecting client reads
+# the same cached data, only the first hit within each window pays the real
+# Supabase cost. Estimated ~590MB/day from this one pattern before the fix
+# (~4,000 loads/day x ~150KB/fetch_stats call), closely matching the
+# originally-reported ~5xxMB/day Supabase egress. Manual refresh paths
+# (_do_retry, the header Refresh button) call fetch_stats() directly, not
+# through main_page(), so they always get real data regardless of this TTL.
+_PAGE_LOAD_FETCH_TTL_SEC = int(os.environ.get("PAGE_LOAD_FETCH_TTL_SEC", "60"))
 
 _PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "spendlens": "#0d9488", "(untagged)": "#6b7280"}
 
@@ -165,7 +178,6 @@ async def _set_project(project: str | None) -> None:
     connected browser tab, not just the one that clicked, for however long
     those two round-trips take."""
     STATE["project"] = project
-    print("DIAG call-site: _set_project", flush=True)
     await asyncio.to_thread(fetch_stats)
     refresh_all()
 
@@ -971,7 +983,6 @@ def incident_log() -> None:
 
 
 async def _do_retry() -> None:
-    print("DIAG call-site: _do_retry", flush=True)
     await asyncio.to_thread(fetch_stats)
     refresh_all()
 
@@ -1411,7 +1422,6 @@ async def _alert_check_loop() -> None:
     fetch_stats are sync, so run them off the event loop thread."""
     while True:
         await asyncio.sleep(_ALERT_CHECK_INTERVAL_SEC)
-        print("DIAG call-site: _alert_check_loop", flush=True)
         await asyncio.to_thread(fetch_stats)  # re-fetches the active window
         _refresh_safely(alert_banner)
 
@@ -1522,7 +1532,6 @@ async def main_page() -> None:
             STATE["days"] = e.value
             STATE["preset_days"] = e.value
             STATE["custom"] = None
-            print("DIAG call-site: _set_range", flush=True)
             await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
@@ -1535,7 +1544,6 @@ async def main_page() -> None:
                 ui.notify("Start date must be on or before the end date", type="negative")
                 return
             STATE["custom"] = (start, end)
-            print("DIAG call-site: _apply_custom", flush=True)
             await asyncio.to_thread(fetch_stats)
             refresh_all()
 
@@ -1544,7 +1552,6 @@ async def main_page() -> None:
             end_date.set_value(None)
             STATE["custom"] = None
             STATE["days"] = STATE.get("preset_days", 7)
-            print("DIAG call-site: _clear_custom", flush=True)
             await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
@@ -1688,8 +1695,23 @@ async def main_page() -> None:
     # even fix the actual problem (see below), so reverted rather than
     # widening what "ready" means across the whole test suite for a change
     # that wasn't the fix.
-    print("DIAG call-site: main_page", flush=True)
-    await asyncio.to_thread(fetch_stats)
+    #
+    # TTL-GATED 2026-09-13: was an unconditional fetch on every single
+    # connection -- found live (labeled-call-site diagnostic) that this was
+    # firing every ~20-35s with zero manual navigation, matching bot/crawler
+    # traffic against this fully-public page (no Cloudflare Access). STATE
+    # is already one shared, module-level cache, not per-client, so skipping
+    # a redundant refetch here is safe by construction: every connecting
+    # client already reads the same STATE regardless, and any actual filter/
+    # range change goes through its own dedicated handler (_set_range et al,
+    # see _PAGE_LOAD_FETCH_TTL_SEC's docstring), which always fetches fresh
+    # and is untouched by this gate. Estimated ~590MB/day Supabase egress
+    # from this one pattern before the fix.
+    last_fetch = STATE.get("last_fetch")
+    page_load_stale = last_fetch is None or \
+        (dt.datetime.now(dt.timezone.utc) - last_fetch).total_seconds() > _PAGE_LOAD_FETCH_TTL_SEC
+    if page_load_stale:
+        await asyncio.to_thread(fetch_stats)
     refresh_all()
 
 
