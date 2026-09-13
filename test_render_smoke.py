@@ -52,13 +52,15 @@ async def test_page_renders_with_all_tabs(user: User):
 
 @MAIN
 async def test_supabase_tab_renders_meter_table(user: User):
+    # q-table column headers aren't text-searchable, so assert the labels +
+    # the marked table element instead.
     import app as deck
     deck.STATE["active_tab"] = "Supabase"
     try:
         await user.open("/")
         await user.should_see("Supabase requests by endpoint")
-        await user.should_see("Requests (24h)")
-        await user.should_see("Avg / request")
+        await user.should_see("source: state/supabase_meter.jsonl")
+        assert _one(user, "supabase-meter-table") is not None
     finally:
         deck.STATE["active_tab"] = "Overview"
 
