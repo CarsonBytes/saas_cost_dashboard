@@ -92,7 +92,8 @@ QUANT_PAPER = "Quant Trading (Paper)"
 
 _RESTART_GRACE_SEC = 300           # 5 min warmup after a dashboard-initiated restart
 _RESTART_WINDOW_SEC = 3600         # rolling hour for the cooldown counter
-_RESTART_LOCK_COUNT = 3            # restarts within the window that trigger a lock
+RESTART_LOCK_COUNT_DEFAULT = 3     # restarts within the window that trigger a lock
+                                   # (per-agent override via svc["restart_lock_count"])
 _UPTIME_DAYS = 7
 _INCIDENT_LIMIT = 50
 
@@ -492,7 +493,8 @@ def _restart_eligible(svc: dict, now: dt.datetime, state: dict,
     return True
 
 
-def _lock_agent(state: dict, name: str, now: dt.datetime) -> None:
+def _lock_agent(state: dict, name: str, now: dt.datetime,
+                lock_count: int = RESTART_LOCK_COUNT_DEFAULT) -> None:
     state.setdefault("locks", {})[name] = now.isoformat()
     # Strike bookkeeping (Phase 5 A1): locks tied together by an AUTO-unlock
     # within 6h are the same underlying failure repeating -- strikes escalate
@@ -509,7 +511,7 @@ def _lock_agent(state: dict, name: str, now: dt.datetime) -> None:
     _add_incident(state, name, "locked",
                   outcome=f"auto-heal disabled (strike {meta['strikes']}"
                           + (", sticky" if meta["sticky"] else "") + ")")
-    if _send_lock_alert(name):
+    if _send_lock_alert(name, lock_count):
         _add_incident(state, name, "alert sent", outcome="telegram", detail="lock alert")
     else:
         # The one notification that exists to say "auto-heal just disabled
@@ -560,11 +562,11 @@ def _auto_unlock_decision(meta: dict, now: dt.datetime, deps_stable: bool) -> st
     return "unlock" if deps_stable else "wait-deps"
 
 
-def _send_lock_alert(name: str) -> bool:
+def _send_lock_alert(name: str, lock_count: int = RESTART_LOCK_COUNT_DEFAULT) -> bool:
     """Send the lock Telegram alert, retrying once after a short pause -- the
     2026-08-14 failure was a transient network blip (the next alert eight
     seconds later landed), so one immediate retry would have caught it."""
-    msg = (f"{name} locked: {_RESTART_LOCK_COUNT} restarts within the last hour "
+    msg = (f"{name} locked: {lock_count} restarts within the last hour "
            f"-- auto-unlock will be attempted after a cooldown, or clear it from "
            f"the dashboard / reply /unlock")
     if alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8"):
@@ -577,8 +579,10 @@ def _retry_pending_alerts(state: dict) -> None:
     """Best-effort resend of failed lock alerts, once per health cycle; clears
     the pending entry on success."""
     for name in list(state.get("pending_alerts", {})):
+        svc = next((s for s in services.SERVICES if s["name"] == name), {})
+        lock_count = svc.get("restart_lock_count", RESTART_LOCK_COUNT_DEFAULT)
         if alerts.send_telegram(
-                f"{name} locked: {_RESTART_LOCK_COUNT} restarts within the last hour "
+                f"{name} locked: {lock_count} restarts within the last hour "
                 f"-- clear the lock from the dashboard",
                 tag="NOC", emoji="\U0001f6a8"):
             del state["pending_alerts"][name]
@@ -1188,8 +1192,9 @@ def _refresh_health() -> None:
                     # prune the rolling window
                     window = now.timestamp() - _RESTART_WINDOW_SEC
                     state["restarts"][name] = [ts for ts in state["restarts"][name] if ts >= window]
-                    if _restart_count(state, name, now) >= _RESTART_LOCK_COUNT:
-                        _lock_agent(state, name, now)
+                    if _restart_count(state, name, now) >= svc.get("restart_lock_count", RESTART_LOCK_COUNT_DEFAULT):
+                        _lock_agent(state, name, now,
+                                    svc.get("restart_lock_count", RESTART_LOCK_COUNT_DEFAULT))
                         locked = True
             elif unhealthy and svc["restart"] == "alert_only" \
                     and not prev.get(name, {}).get("alerted_unhealthy"):

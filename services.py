@@ -131,6 +131,7 @@ SERVICES = [
         "market_hours_only": True,     # no new scans expected outside the NYSE session
         "restart_on_staleness": True,  # enforced scan loop -- a stalled loop is a real fault
         "enforced_cadence": True,      # matches restart_on_staleness here -- display + restart agree
+        "restart_lock_count": 5,       # paper's IB Gateway sidecar creates occasional blips; 3 is too tight
         "container": "quant-dashboard-docker",
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },

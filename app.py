@@ -83,6 +83,18 @@ _COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
 # (_do_retry, the header Refresh button) call fetch_stats() directly, not
 # through main_page(), so they always get real data regardless of this TTL.
 _PAGE_LOAD_FETCH_TTL_SEC = int(os.environ.get("PAGE_LOAD_FETCH_TTL_SEC", "60"))
+# FIXED 2026-09-14: the TTL check above main_page()'s fetch call is a classic
+# check-then-act race -- `await asyncio.to_thread(fetch_stats)` yields control
+# back to the event loop, so several connections arriving close together can
+# ALL read STATE["last_fetch"] as stale before any of them finishes writing
+# the new value, and all launch their own real fetch_stats() call. Confirmed
+# live: two 35-37-call/~2.1MB bursts in this app's own meter log, both right
+# around a container restart (STATE resets to last_fetch=None, and every
+# reconnecting client races the same check simultaneously). This lock makes
+# "only the first hit within each window pays the real cost" actually true --
+# a losing connection blocks briefly on the lock, then re-checks staleness
+# (now fresh) and skips its own fetch, instead of firing a redundant one.
+_page_load_fetch_lock = asyncio.Lock()
 
 _PROJECT_COLORS = {"quant": "#16a34a", "study": "#2563eb", "events": "#9333ea", "spendlens": "#0d9488", "(untagged)": "#6b7280"}
 
@@ -1266,19 +1278,33 @@ def _supabase_tab() -> None:
     dashboard's own per-endpoint detail from its local file."""
     import supabase_usage
     path = _Path(__file__).parent / "state" / "supabase_meter.jsonl"
-    now = dt.datetime.now(dt.timezone.utc).timestamp()
-    day_ago = now - 86400
+
+    # ---- effective window from STATE (same pattern as fetch_stats) ---------
+    custom = STATE.get("custom")
+    if custom:
+        _start_dt = ledger._hkt_day_start_utc(custom[0])
+        _end_dt = ledger._hkt_day_start_utc(custom[1]) + dt.timedelta(days=1)
+        window_label = f"{custom[0]} to {custom[1]}"
+    else:
+        n_days = STATE.get("days", 7)
+        _end_dt = ledger._hkt_today_start_utc() + dt.timedelta(days=1)
+        _start_dt = _end_dt - dt.timedelta(days=n_days)
+        window_label = f"{n_days}d"
+    window_start_ts = _start_dt.timestamp()
+    window_start_iso = _start_dt.isoformat()
+    window_end_iso = _end_dt.isoformat()
 
     # ---- 1. reconciliation -------------------------------------------------
-    ui.label("Reported vs metered (24h)").classes("text-sm font-bold")
-    usage = supabase_usage.fetch_reported_usage()
-    reported, note = supabase_usage.reported_requests_24h(usage)
-    rollup_rows = ledger.fetch_meter_rollup()
+    ui.label(f"Reported vs metered ({window_label})").classes("text-sm font-bold")
+    usage = supabase_usage.fetch_reported_usage(since_iso=window_start_iso,
+                                                until_iso=window_end_iso)
+    reported, note = supabase_usage.reported_requests(usage)
+    rollup_rows = ledger.fetch_meter_rollup(since_iso=window_start_iso)
     rollup_apps = {r.get("app") for r in rollup_rows}
     rollup_req = sum(r.get("requests") or 0 for r in rollup_rows)
     rollup_bytes = sum(r.get("bytes") or 0 for r in rollup_rows)
-    file_counts = supabase_meter.read_totals(str(path), since_ts=day_ago)
-    file_bytes = supabase_meter.read_bytes(str(path), since_ts=day_ago)
+    file_counts = supabase_meter.read_totals(str(path), since_ts=window_start_ts)
+    file_bytes = supabase_meter.read_bytes(str(path), since_ts=window_start_ts)
     # The dashboard appears in BOTH sources once its writer posts to the
     # rollup table -- count its file only while it's absent there.
     metered_req = rollup_req + (0 if supabase_meter.APP in rollup_apps
@@ -1288,7 +1314,7 @@ def _supabase_tab() -> None:
     if reported:
         coverage = metered_req / reported if reported else 0
         est = f"~{_fmt_bytes(int(metered_bytes / coverage))}" if coverage > 0 else "—"
-        ui.label(f"Supabase reports {reported:,} requests/24h ({note}). "
+        ui.label(f"Supabase reports {reported:,} requests/{window_label} ({note}). "
                  f"Self-meters see {metered_req:,} ({coverage:.0%} coverage). "
                  f"Metered payload: {_fmt_bytes(metered_bytes)} -> estimated true "
                  f"egress {est} (assumes unmetered traffic has the same "
@@ -1299,8 +1325,40 @@ def _supabase_tab() -> None:
                  f"below is this ecosystem's own count only.") \
             .classes("text-sm text-grey-6 mt-1").mark("reconciliation-line")
 
+    # ---- 1b. manual known-good anchor --------------------------------------
+    # ADDED 2026-09-15: there's no API for real billed egress (see
+    # supabase_usage.load_egress_anchor()'s docstring) -- this lets the
+    # operator occasionally paste in what Settings -> Usage -> Egress
+    # actually shows, so the self-metered estimate above has something real
+    # to be checked against instead of being trusted indefinitely. This is
+    # exactly the gap that let the num_bytes_downloaded bug (self-meter
+    # showing ~700MB/day against Supabase's own ~75MB/day) go unnoticed.
+    anchor = supabase_usage.load_egress_anchor()
+    if anchor:
+        ui.label(f"Last confirmed real egress: {anchor['mb']:.0f} MB on {anchor['date']}"
+                 + (f" ({anchor['note']})" if anchor.get("note") else "")) \
+            .classes("text-xs text-grey-6 mt-1").mark("egress-anchor-line")
+    with ui.row().classes("items-center gap-2 mt-1"):
+        anchor_mb = ui.number(label="Real egress (MB)", min=0, format="%.0f") \
+            .classes("w-32").props("dense outlined")
+        anchor_note = ui.input(label="Note (optional)").classes("w-48").props("dense outlined")
+
+        def _save_anchor():
+            if anchor_mb.value is None:
+                ui.notify("Enter the MB figure from Supabase's Usage page first.", type="warning")
+                return
+            supabase_usage.save_egress_anchor(
+                float(anchor_mb.value), dt.date.today().isoformat(), anchor_note.value or "")
+            anchor_mb.value = None
+            anchor_note.value = ""
+            ui.notify("Saved.", type="positive")
+            _supabase_tab.refresh()
+
+        ui.button("Save today's real egress", icon="fact_check", on_click=_save_anchor) \
+            .props("dense outline").mark("save-egress-anchor")
+
     # ---- 2. cross-project rollup -------------------------------------------
-    ui.label("Metered traffic by app x endpoint (24h)").classes("text-sm font-bold mt-4")
+    ui.label(f"Metered traffic by app x endpoint ({window_label})").classes("text-sm font-bold mt-4")
     if rollup_rows:
         agg: dict[tuple, list] = {}
         for r in rollup_rows:
@@ -1308,6 +1366,17 @@ def _supabase_tab() -> None:
             cell = agg.setdefault(key, [0, 0])
             cell[0] += r.get("requests") or 0
             cell[1] += r.get("bytes") or 0
+        # --- bar chart: aggregate by app for visual comparison ---
+        app_agg: dict[str, int] = {}
+        app_bytes: dict[str, int] = {}
+        for (a, _e), (n, b) in agg.items():
+            app_agg[a] = app_agg.get(a, 0) + n
+            app_bytes[a] = app_bytes.get(a, 0) + b
+        if app_agg:
+            chart_rows = [{"app": a, "calls": n} for a, n in
+                          sorted(app_agg.items(), key=lambda kv: -kv[1])]
+            _bar_chart(chart_rows, "app")
+        # --- detail table ---
         xcols = [
             {"name": "app", "label": "App", "field": "app", "sortable": True},
             {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
@@ -1332,26 +1401,26 @@ def _supabase_tab() -> None:
     ui.label("Every Supabase REST call this dashboard makes, counted with its "
              "response size. Types = METHOD + table; sizes = response payload "
              "bytes (what counts toward egress).").classes("text-xs text-grey-6")
-    counts_24h = file_counts
-    bytes_24h = file_bytes
+    counts_window = file_counts
+    bytes_window = file_bytes
     counts_all = supabase_meter.read_totals(str(path))
     bytes_all = supabase_meter.read_bytes(str(path))
-    keys = sorted(set(counts_24h) | set(bytes_24h) | set(counts_all) | set(bytes_all),
-                  key=lambda k: -(bytes_24h.get(k, 0)))
+    keys = sorted(set(counts_window) | set(bytes_window) | set(counts_all) | set(bytes_all),
+                  key=lambda k: -(bytes_window.get(k, 0)))
     cols = [
         {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
-        {"name": "req24", "label": "Requests (24h)", "field": "req24", "sortable": True},
-        {"name": "bytes24", "label": "Bytes (24h)", "field": "bytes24"},
+        {"name": "reqwin", "label": f"Requests ({window_label})", "field": "reqwin", "sortable": True},
+        {"name": "byteswin", "label": f"Bytes ({window_label})", "field": "byteswin"},
         {"name": "avg", "label": "Avg / request", "field": "avg"},
         {"name": "reqall", "label": "Requests (all)", "field": "reqall", "sortable": True},
         {"name": "bytesall", "label": "Bytes (all)", "field": "bytesall"},
     ]
     rows = [{
         "endpoint": k,
-        "req24": counts_24h.get(k, 0),
-        "bytes24": _fmt_bytes(bytes_24h.get(k, 0)),
-        "avg": _fmt_bytes(bytes_24h.get(k, 0) // max(counts_24h.get(k, 0), 1))
-               if counts_24h.get(k) else "—",
+        "reqwin": counts_window.get(k, 0),
+        "byteswin": _fmt_bytes(bytes_window.get(k, 0)),
+        "avg": _fmt_bytes(bytes_window.get(k, 0) // max(counts_window.get(k, 0), 1))
+               if counts_window.get(k) else "—",
         "reqall": counts_all.get(k, 0),
         "bytesall": _fmt_bytes(bytes_all.get(k, 0)),
         "_key": k,
@@ -1360,9 +1429,9 @@ def _supabase_tab() -> None:
     # only; the request-count columns (raw ints) carry the sorting instead.
     ui.table(columns=cols, rows=rows, row_key="_key").classes("w-full").props("dense") \
         .mark("supabase-meter-table")
-    total_24h = sum(bytes_24h.values())
+    total_window = sum(bytes_window.values())
     total_all = sum(bytes_all.values())
-    ui.label(f"24h: {sum(counts_24h.values())} requests, {_fmt_bytes(total_24h)} · "
+    ui.label(f"{window_label}: {sum(counts_window.values())} requests, {_fmt_bytes(total_window)} · "
              f"all-time: {sum(counts_all.values())} requests, {_fmt_bytes(total_all)} · "
              f"source: state/supabase_meter.jsonl").classes("text-xs text-grey-6 mt-2")
     if not keys:
@@ -1707,11 +1776,12 @@ async def main_page() -> None:
     # see _PAGE_LOAD_FETCH_TTL_SEC's docstring), which always fetches fresh
     # and is untouched by this gate. Estimated ~590MB/day Supabase egress
     # from this one pattern before the fix.
-    last_fetch = STATE.get("last_fetch")
-    page_load_stale = last_fetch is None or \
-        (dt.datetime.now(dt.timezone.utc) - last_fetch).total_seconds() > _PAGE_LOAD_FETCH_TTL_SEC
-    if page_load_stale:
-        await asyncio.to_thread(fetch_stats)
+    async with _page_load_fetch_lock:
+        last_fetch = STATE.get("last_fetch")
+        page_load_stale = last_fetch is None or \
+            (dt.datetime.now(dt.timezone.utc) - last_fetch).total_seconds() > _PAGE_LOAD_FETCH_TTL_SEC
+        if page_load_stale:
+            await asyncio.to_thread(fetch_stats)
     refresh_all()
 
 

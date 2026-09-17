@@ -183,7 +183,7 @@ def test_second_strike_is_sticky_and_doubles_cooldown():
 
 
 def test_lock_strikes_escalate_within_window_reset_outside(monkeypatch):
-    monkeypatch.setattr(noc, "_send_lock_alert", lambda name: True)
+    monkeypatch.setattr(noc, "_send_lock_alert", lambda name, lock_count=3: True)
     now = dt.datetime.now(dt.timezone.utc)
     state = {}
     noc._lock_agent(state, "X", now)          # fresh problem -> strike 1
@@ -366,28 +366,36 @@ def test_reported_usage_parses_shapes_and_caches(monkeypatch, tmp_path):
         def json(self):
             return self._payload
 
-    def _fake_get(url, headers=None, timeout=None):
+    def _fake_get(url, params=None, headers=None, timeout=None):
         calls.append(url)
-        assert "abcdef" in url and url.endswith("/usage/api-counts")
+        assert "abcdef" in url and url.endswith("/analytics/endpoints/usage.api-counts")
+        assert params == {"interval": "1day"}
         assert headers == {"Authorization": "Bearer sbp_test"}
-        return _Resp({"data": [{"day": "2026-09-13", "count": 40000},
-                               {"day": "2026-09-12", "count": 3000}]})
+        # Real shape verified live 2026-09-13: hourly buckets, only
+        # total_rest_requests matters (matches what the self-meters count).
+        return _Resp({"result": [
+            {"timestamp": "2026-09-13T13:00:00", "total_rest_requests": 40000,
+             "total_auth_requests": 0, "total_realtime_requests": 0, "total_storage_requests": 0},
+            {"timestamp": "2026-09-12T13:00:00", "total_rest_requests": 3000,
+             "total_auth_requests": 0, "total_realtime_requests": 0, "total_storage_requests": 0},
+        ]})
 
     monkeypatch.setattr(supabase_usage.httpx, "get", _fake_get)
     first = supabase_usage.fetch_reported_usage()
     assert first is not None
-    total, note = supabase_usage.reported_requests_24h(first)
+    total, note = supabase_usage.reported_requests(first)
     assert total == 43000
+    assert "total_rest_requests" in note
     second = supabase_usage.fetch_reported_usage()  # hourly cache: no 2nd call
     assert len(calls) == 1 and second == first
     # dict-form actions + unconfigured token
-    total2, _ = supabase_usage.reported_requests_24h(
+    total2, _ = supabase_usage.reported_requests(
         {"payload": {"data": {"read": 10, "write": 5}}})
     assert total2 == 15
     monkeypatch.setenv("SUPABASE_MANAGEMENT_TOKEN", "")
     monkeypatch.setattr(supabase_usage, "_CACHE_FILE", tmp_path / "empty.json")
     assert supabase_usage.fetch_reported_usage() is None  # unconfigured, cold cache
-    assert supabase_usage.reported_requests_24h(None)[0] is None
+    assert supabase_usage.reported_requests(None)[0] is None
 
 
 def test_ledger_rollup_returns_empty_without_table(monkeypatch):
@@ -454,6 +462,70 @@ def test_meter_rollup_posts_and_disables_on_404(_meter_isolated):
         assert supabase_meter._rollup_disabled is True
         supabase_meter.record("GET", "llm_calls", 1)
         assert len(posted) == 1  # disabled: no further attempts
+    finally:
+        urllib.request.urlopen = orig
+        if old_url:
+            os.environ["SUPABASE_URL"] = old_url
+        else:
+            os.environ.pop("SUPABASE_URL", None)
+        if old_key:
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"] = old_key
+        else:
+            os.environ.pop("SUPABASE_SERVICE_ROLE_KEY", None)
+
+
+def test_meter_rollup_retries_pending_batch_on_transient_failure(_meter_isolated):
+    """FIXED 2026-09-17: a rollup POST failing for any reason OTHER than 404
+    (timeout, 5xx, connection reset) must not silently drop that window's
+    data -- found live via a real ~46% undercount in meter_rollup vs the
+    local file for the same app/window. The failed batch must still be
+    included (merged) in the NEXT attempt, and only a confirmed 2xx clears
+    it."""
+    import urllib.request
+    supabase_meter = _meter_isolated
+    supabase_meter.FLUSH_SEC = 0
+    posted = []
+
+    class _Resp:
+        def __init__(self, status):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fail_then_succeed(req, timeout=None):
+        rows = json.loads(req.data)
+        posted.append(rows)
+        if len(posted) == 1:
+            raise TimeoutError("simulated transient network failure")
+        return _Resp(201)
+
+    import os
+    old_url = os.environ.get("SUPABASE_URL", "")
+    old_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    os.environ["SUPABASE_URL"] = "https://x.supabase.co"
+    os.environ["SUPABASE_SERVICE_ROLE_KEY"] = "key"
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = _fail_then_succeed
+    try:
+        supabase_meter.APP = "study"
+        supabase_meter.record("GET", "questions", 100)   # attempt 1: fails (TimeoutError)
+        assert supabase_meter._rollup_disabled is False  # non-404 must NOT disable
+        supabase_meter.record("GET", "questions", 200)   # attempt 2: succeeds
+        assert len(posted) == 2
+        # The second (successful) attempt's payload must include BOTH the
+        # first (failed, retried) batch and the second -- merged, not lost.
+        final_rows = {r["endpoint"]: r for r in posted[1]}
+        assert final_rows["GET questions"]["requests"] == 2
+        assert final_rows["GET questions"]["bytes"] == 300
+        # Pending buffer is now empty -- a third record() starts a fresh batch.
+        supabase_meter.record("GET", "questions", 50)
+        assert len(posted) == 3
+        assert posted[2] == [{"ts": posted[2][0]["ts"], "app": "study",
+                              "endpoint": "GET questions", "requests": 1, "bytes": 50}]
     finally:
         urllib.request.urlopen = orig
         if old_url:

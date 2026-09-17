@@ -28,6 +28,32 @@ load_dotenv(Path(__file__).parent / ".env")
 _CACHE_FILE = Path(__file__).parent / "state" / "supabase_usage.json"
 _CACHE_SEC = 3600
 
+# ADDED 2026-09-15: the real billed-egress number lives only on Supabase's
+# own dashboard (Settings -> Usage -> Egress) -- confirmed no Management API
+# endpoint exposes it (checked usage.api-counts, billing/addons, invoice/
+# subscription/cost/meter/consumption paths in the full OpenAPI spec: none
+# return a bytes/egress figure). Self-metered bytes are a real-time estimate,
+# not ground truth, and were themselves found wrong by ~10x once (see
+# response_bytes()'s num_bytes_downloaded fix) -- this lets the operator
+# paste in what the Supabase UI actually shows once in a while, so future
+# drift between the estimate and reality is caught by inspection instead of
+# silently trusted for weeks.
+_ANCHOR_FILE = Path(__file__).parent / "state" / "egress_anchor.json"
+
+
+def load_egress_anchor() -> dict | None:
+    """{"mb": float, "date": "YYYY-MM-DD", "note": str} last saved by the
+    operator, or None if never set."""
+    try:
+        return json.loads(_ANCHOR_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def save_egress_anchor(mb: float, date: str, note: str = "") -> None:
+    _ANCHOR_FILE.write_text(
+        json.dumps({"mb": mb, "date": date, "note": note}), encoding="utf-8")
+
 
 def _mgmt_token() -> str:
     # Read lazily (not at import): the operator adds the token to .env long
@@ -46,25 +72,41 @@ def configured() -> bool:
     return bool(_mgmt_token() and _project_ref())
 
 
-def fetch_reported_usage() -> dict | None:
+def fetch_reported_usage(since_iso: str | None = None,
+                         until_iso: str | None = None) -> dict | None:
     """Hourly-cached Management API payload (or None when unconfigured /
-    unreachable -- never raises). Shape: {"fetched_at": epoch, "payload": ...}."""
+    unreachable -- never raises). Shape: {"fetched_at": epoch, "payload": ...}.
+    When since_iso/until_iso are provided, uses iso_timestamp_start/end params
+    instead of the interval param (Management API supports both)."""
     now = time.time()
+    cache_key = f"{since_iso or ''}|{until_iso or ''}"
     try:
         cached = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
-        if now - cached.get("fetched_at", 0) < _CACHE_SEC and cached.get("payload"):
+        if (now - cached.get("fetched_at", 0) < _CACHE_SEC
+                and cached.get("payload")
+                and cached.get("cache_key") == cache_key):
             return cached
     except (FileNotFoundError, ValueError):
         pass
     if not configured():
         return None
     try:
+        params: dict = {}
+        if since_iso or until_iso:
+            if since_iso:
+                params["iso_timestamp_start"] = since_iso
+            if until_iso:
+                params["iso_timestamp_end"] = until_iso
+        else:
+            params["interval"] = "1day"
         resp = httpx.get(
-            f"https://api.supabase.com/v1/projects/{_project_ref()}/usage/api-counts",
+            f"https://api.supabase.com/v1/projects/{_project_ref()}/analytics/endpoints/usage.api-counts",
+            params=params,
             headers={"Authorization": f"Bearer {_mgmt_token()}"},
             timeout=15)
         resp.raise_for_status()
-        result = {"fetched_at": now, "payload": resp.json()}
+        result = {"fetched_at": now, "payload": resp.json(),
+                  "cache_key": cache_key}
     except Exception:  # noqa: BLE001 -- reconciliation is informational, never fatal
         return None
     try:
@@ -74,14 +116,25 @@ def fetch_reported_usage() -> dict | None:
     return result
 
 
-def reported_requests_24h(cached: dict | None) -> tuple[int | None, str]:
-    """(trailing-24h-ish request total, note). The api-counts shape isn't
-    contractual -- parse defensively across the shapes seen in the wild and
-    say which one matched, so a silent API change reads as 'unknown shape'
-    rather than a confident wrong number."""
+def reported_requests(cached: dict | None) -> tuple[int | None, str]:
+    """(REST request total for the selected window, note). The real (verified
+    live 2026-09-13) usage.api-counts shape is
+    {"result": [{"timestamp", "total_rest_requests", "total_auth_requests",
+    "total_realtime_requests", "total_storage_requests"}, ...]} -- hourly
+    buckets. Only total_rest_requests is summed: the self-meters this gets
+    compared against count REST calls only (supabase-py/httpx to /rest/v1/*),
+    so auth/realtime/storage would inflate the reported side without a matching
+    metered side. Falls back to defensive generic parsing if the shape ever
+    changes, so a future API change reads as 'unrecognized shape' rather than
+    a silently wrong number."""
     if not cached:
         return None, "management API not configured (SUPABASE_MANAGEMENT_TOKEN)"
     payload = cached.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("result"), list):
+        buckets = payload["result"]
+        if buckets and all(isinstance(b, dict) and "total_rest_requests" in b for b in buckets):
+            total = sum(b.get("total_rest_requests") or 0 for b in buckets)
+            return int(total), f"summed total_rest_requests across {len(buckets)} hourly buckets"
     entries: list | dict = []
     if isinstance(payload, dict):
         data = payload.get("data", payload)
