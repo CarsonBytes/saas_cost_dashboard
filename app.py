@@ -1295,9 +1295,13 @@ def _supabase_tab() -> None:
     window_end_iso = _end_dt.isoformat()
 
     # ---- 1. reconciliation -------------------------------------------------
+    # Management API only supports predefined interval buckets (1day, 3day,
+    # 7day), not arbitrary date ranges. Select the coarsest bucket that covers
+    # the user's window so the reported figure is comparable to the metered.
+    n_window_days = max((_end_dt - _start_dt).days, 1)
+    mgmt_interval = supabase_usage.best_interval_for_days(n_window_days)
     ui.label(f"Reported vs metered ({window_label})").classes("text-sm font-bold")
-    usage = supabase_usage.fetch_reported_usage(since_iso=window_start_iso,
-                                                until_iso=window_end_iso)
+    usage = supabase_usage.fetch_reported_usage(interval=mgmt_interval)
     reported, note = supabase_usage.reported_requests(usage)
     rollup_rows = ledger.fetch_meter_rollup(since_iso=window_start_iso)
     rollup_apps = {r.get("app") for r in rollup_rows}

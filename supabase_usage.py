@@ -72,41 +72,32 @@ def configured() -> bool:
     return bool(_mgmt_token() and _project_ref())
 
 
-def fetch_reported_usage(since_iso: str | None = None,
-                         until_iso: str | None = None) -> dict | None:
+def fetch_reported_usage(interval: str = "1day") -> dict | None:
     """Hourly-cached Management API payload (or None when unconfigured /
     unreachable -- never raises). Shape: {"fetched_at": epoch, "payload": ...}.
-    When since_iso/until_iso are provided, uses iso_timestamp_start/end params
-    instead of the interval param (Management API supports both)."""
+    The Management API only supports predefined interval buckets (15min, 30min,
+    1hr, 3hr, 1day, 3day, 7day) -- no custom date ranges. We select the
+    coarsest bucket that covers the user's selected window."""
     now = time.time()
-    cache_key = f"{since_iso or ''}|{until_iso or ''}"
     try:
         cached = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
         if (now - cached.get("fetched_at", 0) < _CACHE_SEC
                 and cached.get("payload")
-                and cached.get("cache_key") == cache_key):
+                and cached.get("interval") == interval):
             return cached
     except (FileNotFoundError, ValueError):
         pass
     if not configured():
         return None
     try:
-        params: dict = {}
-        if since_iso or until_iso:
-            if since_iso:
-                params["iso_timestamp_start"] = since_iso
-            if until_iso:
-                params["iso_timestamp_end"] = until_iso
-        else:
-            params["interval"] = "1day"
         resp = httpx.get(
             f"https://api.supabase.com/v1/projects/{_project_ref()}/analytics/endpoints/usage.api-counts",
-            params=params,
+            params={"interval": interval},
             headers={"Authorization": f"Bearer {_mgmt_token()}"},
             timeout=15)
         resp.raise_for_status()
         result = {"fetched_at": now, "payload": resp.json(),
-                  "cache_key": cache_key}
+                  "interval": interval}
     except Exception:  # noqa: BLE001 -- reconciliation is informational, never fatal
         return None
     try:
@@ -116,25 +107,41 @@ def fetch_reported_usage(since_iso: str | None = None,
     return result
 
 
+# Management API interval buckets in ascending order -- used to select the
+# coarsest bucket that covers the user's selected window.
+_INTERVAL_BUCKETS = ["15min", "30min", "1hr", "3hr", "1day", "3day", "7day"]
+
+
+def best_interval_for_days(n_days: int) -> str:
+    """Pick the coarsest interval bucket that covers n_days."""
+    if n_days <= 1:
+        return "1day"
+    if n_days <= 3:
+        return "3day"
+    return "7day"
+
+
 def reported_requests(cached: dict | None) -> tuple[int | None, str]:
     """(REST request total for the selected window, note). The real (verified
     live 2026-09-13) usage.api-counts shape is
     {"result": [{"timestamp", "total_rest_requests", "total_auth_requests",
-    "total_realtime_requests", "total_storage_requests"}, ...]} -- hourly
-    buckets. Only total_rest_requests is summed: the self-meters this gets
-    compared against count REST calls only (supabase-py/httpx to /rest/v1/*),
-    so auth/realtime/storage would inflate the reported side without a matching
-    metered side. Falls back to defensive generic parsing if the shape ever
-    changes, so a future API change reads as 'unrecognized shape' rather than
-    a silently wrong number."""
+    "total_realtime_requests", "total_storage_requests"}, ...]} -- buckets
+    whose granularity depends on the interval param (hourly for 1day, daily
+    for 3day/7day). Only total_rest_requests is summed: the self-meters this
+    gets compared against count REST calls only (supabase-py/httpx to
+    /rest/v1/*), so auth/realtime/storage would inflate the reported side
+    without a matching metered side. Falls back to defensive generic parsing
+    if the shape ever changes, so a future API change reads as 'unrecognized
+    shape' rather than a silently wrong number."""
     if not cached:
         return None, "management API not configured (SUPABASE_MANAGEMENT_TOKEN)"
+    interval = cached.get("interval", "1day")
     payload = cached.get("payload")
     if isinstance(payload, dict) and isinstance(payload.get("result"), list):
         buckets = payload["result"]
         if buckets and all(isinstance(b, dict) and "total_rest_requests" in b for b in buckets):
             total = sum(b.get("total_rest_requests") or 0 for b in buckets)
-            return int(total), f"summed total_rest_requests across {len(buckets)} hourly buckets"
+            return int(total), f"summed total_rest_requests across {len(buckets)} {interval} buckets"
     entries: list | dict = []
     if isinstance(payload, dict):
         data = payload.get("data", payload)
