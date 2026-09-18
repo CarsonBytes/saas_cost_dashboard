@@ -69,7 +69,7 @@ def fetch_meter_rollup(since_iso: str | None = None) -> list[dict]:
             resp = httpx.get(
                 f"{SUPABASE_URL}/rest/v1/meter_rollup",
                 params={"select": "ts,app,endpoint,requests,bytes",
-                        "ts": f"gte.{since_iso}", "order": "ts.desc", "limit": "10000"},
+                        "ts": f"gte.{since_iso}", "order": "ts.desc"},
                 headers={"apikey": SUPABASE_SERVICE_ROLE_KEY,
                          "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
                 timeout=15)
