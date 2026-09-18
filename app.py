@@ -1280,6 +1280,8 @@ def _supabase_tab() -> None:
     path = _Path(__file__).parent / "state" / "supabase_meter.jsonl"
 
     # ---- effective window from STATE (same pattern as fetch_stats) ---------
+    import sys
+    print(f"[DEBUG _supabase_tab] STATE days={STATE.get('days')} custom={STATE.get('custom')}", file=sys.stderr)
     custom = STATE.get("custom")
     if custom:
         _start_dt = ledger._hkt_day_start_utc(custom[0])
@@ -1293,6 +1295,7 @@ def _supabase_tab() -> None:
     window_start_ts = _start_dt.timestamp()
     window_start_iso = _start_dt.isoformat()
     window_end_iso = _end_dt.isoformat()
+    print(f"[DEBUG _supabase_tab] window_label={window_label} since_iso={window_start_iso}", file=sys.stderr)
 
     # ---- 1. reconciliation -------------------------------------------------
     # Management API only supports predefined interval buckets (1day, 3day,
