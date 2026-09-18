@@ -1605,9 +1605,11 @@ async def main_page() -> None:
         maintenance_banner()
 
         async def _set_range(e) -> None:
+            print(f"[DEBUG _set_range] e.value={e.value} BEFORE STATE days={STATE.get('days')}", file=sys.stderr)
             STATE["days"] = e.value
             STATE["preset_days"] = e.value
             STATE["custom"] = None
+            print(f"[DEBUG _set_range] AFTER STATE days={STATE.get('days')}", file=sys.stderr)
             await asyncio.to_thread(fetch_stats, STATE["days"])
             refresh_all()
 
