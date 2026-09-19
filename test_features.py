@@ -692,3 +692,22 @@ def test_meter_rollup_post_is_throttled_but_loses_nothing(_meter_isolated, monke
     m.record("GET", "t", 400)
     assert len(posted) == 2
     assert posted[1][0]["requests"] == 3 and posted[1][0]["bytes"] == 900  # the two held batches + this one
+
+
+def test_egress_series_buckets_by_app_and_fills_gaps():
+    import app as deck
+    utc = dt.timezone.utc
+    start = dt.datetime(2026, 9, 16, 16, tzinfo=utc)   # HKT midnight 09-17
+    end = start + dt.timedelta(days=1)
+    rows = [
+        {"ts": "2026-09-16T16:30:00+00:00", "app": "a", "requests": 5, "bytes": 2_000_000},
+        {"ts": "2026-09-16T16:45:00+00:00", "app": "a", "requests": 1, "bytes": 1_000_000},
+        {"ts": "2026-09-16T19:00:00+00:00", "app": "b", "requests": 7, "bytes": 500_000},
+    ]
+    out = deck._egress_series(rows, start, end, now=end)
+    assert out["labels"][0] == "09-17 00:00" and len(out["labels"]) == 24  # hourly, empty hours kept
+    assert out["apps"]["a"]["req"][0] == 6 and out["apps"]["a"]["mb"][0] == 3.0
+    assert out["apps"]["b"]["req"][3] == 7 and out["apps"]["b"]["req"][1] == 0
+    week = deck._egress_series(rows, start, start + dt.timedelta(days=7), now=start + dt.timedelta(days=7))
+    assert len(week["labels"]) == 7 and week["labels"][0] == "09-17"      # daily beyond 2 days
+    assert week["apps"]["a"]["req"][0] == 6

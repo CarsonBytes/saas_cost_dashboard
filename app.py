@@ -298,6 +298,79 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
     }).classes("w-full h-56")
 
 
+_APP_COLORS = {"dashboard": "#7c3aed", "study": "#2563eb", "study-demo": "#60a5fa",
+               "study-native": "#93c5fd", "event-radar": "#9333ea", "quant": "#16a34a",
+               "spendlens": "#0d9488", "unknown": "#6b7280"}
+_APP_FALLBACK = ["#f59e0b", "#dc2626", "#db2777", "#0891b2"]
+
+
+def _app_color(app_name: str, n: int) -> str:
+    return _APP_COLORS.get(app_name) or _APP_FALLBACK[n % len(_APP_FALLBACK)]
+
+
+def _egress_series(rows: list[dict], start: dt.datetime, end: dt.datetime,
+                   now: dt.datetime | None = None) -> dict:
+    """Bucket meter_rollup rows into HKT hours (windows up to 2 days) or HKT
+    days, per app: {"labels", "apps": {app: {"req": [...], "mb": [...]}}}.
+    Empty buckets are kept so gaps in traffic show as gaps, not as joins."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    hourly = (end - start) <= dt.timedelta(days=2)
+    step = dt.timedelta(hours=1) if hourly else dt.timedelta(days=1)
+    fmt = "%m-%d %H:00" if hourly else "%m-%d"
+    stop = min(end, now + step)
+    buckets, t = [], start
+    while t < stop:
+        buckets.append(t.astimezone(ledger._HKT).strftime(fmt))
+        t += step
+    index = {b_: i for i, b_ in enumerate(buckets)}
+    apps: dict[str, dict] = {}
+    for r in rows:
+        key = ledger._utc(r["ts"]).astimezone(ledger._HKT).strftime(fmt)
+        i = index.get(key)
+        if i is None:
+            continue
+        a_ = apps.setdefault(r.get("app") or "?", {"req": [0] * len(buckets), "mb": [0.0] * len(buckets)})
+        a_["req"][i] += r.get("requests") or 0
+        a_["mb"][i] += (r.get("bytes") or 0) / 1e6
+    for a_ in apps.values():
+        a_["mb"] = [round(v, 2) for v in a_["mb"]]
+    return {"labels": buckets, "apps": apps}
+
+
+def _egress_totals(rows: list[dict]) -> dict[str, tuple[int, int]]:
+    """{app: (requests, bytes)} over a set of rollup rows."""
+    out: dict[str, list[int]] = {}
+    for r in rows:
+        cell = out.setdefault(r.get("app") or "?", [0, 0])
+        cell[0] += r.get("requests") or 0
+        cell[1] += r.get("bytes") or 0
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def _egress_chart(series: dict, field: str, title: str, unit: str, *, height: str = "h-64") -> None:
+    """Stacked smooth-area chart (same look as the Overview cost-by-project
+    chart) of one field ("req" | "mb") per app over time."""
+    order = sorted(series["apps"], key=lambda a_: -sum(series["apps"][a_][field]))
+    ui.label(title).classes("text-sm font-bold")
+    ui.echart({
+        "tooltip": {"trigger": "axis"},
+        "legend": {"top": 0, "textStyle": {"fontSize": 10}},
+        "xAxis": {"type": "category", "data": series["labels"],
+                  "axisLabel": {"fontSize": 10, "hideOverlap": True}},
+        "yAxis": {"type": "value", "name": unit},
+        "series": [{"type": "line", "name": a_, "stack": "total", "smooth": True,
+                    "areaStyle": {}, "lineStyle": {"width": 1}, "symbol": "none",
+                    "data": series["apps"][a_][field],
+                    "itemStyle": {"color": _app_color(a_, n)}}
+                   for n, a_ in enumerate(order)],
+        "grid": {"left": 50, "right": 20, "top": 40, "bottom": 30},
+    }).classes(f"w-full {height}").mark(f"egress-chart-{field}")
+
+
+def _pct_delta(cur: float, prev: float) -> str:
+    return f"{(cur - prev) / prev:+.0%}" if prev else "-"
+
+
 def _efficiency_table(ranked: list[dict], label_field: str) -> None:
     if not ranked:
         ui.label("(no priced calls in this range)").classes("text-sm text-grey")
@@ -1041,7 +1114,7 @@ def incident_log() -> None:
 
 async def _do_retry() -> None:
     await asyncio.to_thread(fetch_stats, None, True)
-    if STATE.get("active_tab") == "Supabase":
+    if STATE.get("active_tab") in ("Supabase", "Overview"):
         await asyncio.to_thread(_prewarm_supabase)
     refresh_all()
 
@@ -1091,7 +1164,7 @@ def dashboard_body() -> None:
         if fn is None:
             return
         if name not in built:
-            if name == "Supabase":
+            if name in ("Supabase", "Overview"):
                 STATE["loading"] = True
                 try:
                     await asyncio.to_thread(_prewarm_supabase)
@@ -1103,7 +1176,7 @@ def dashboard_body() -> None:
             STATE["dirty"].discard(name)
         elif name in STATE["dirty"]:
             STATE["dirty"].discard(name)
-            if name == "Supabase":
+            if name in ("Supabase", "Overview"):
                 STATE["loading"] = True
                 try:
                     await asyncio.to_thread(_prewarm_supabase)
@@ -1127,6 +1200,33 @@ def dashboard_body() -> None:
                     built.add(name)
 
 
+def _overview_egress() -> dict | None:
+    """Brief Supabase egress summary for the Overview cards/chart, over the
+    same window as the rest of the tab. Reads the hourly-stored rollup (no
+    extra requests once warm); None when there is no metered data."""
+    try:
+        start, end, _label = _supabase_window()
+        rows = ledger.fetch_meter_rollup(since_iso=start.isoformat(), until_iso=end.isoformat())
+        if not rows:
+            return None
+        prev_rows = ledger.fetch_meter_rollup(since_iso=(start - (end - start)).isoformat(),
+                                              until_iso=start.isoformat())
+        series = _egress_series(rows, start, end)
+        req = sum(r.get("requests") or 0 for r in rows)
+        byts = sum(r.get("bytes") or 0 for r in rows)
+        prev_req = sum(r.get("requests") or 0 for r in prev_rows)
+        prev_b = sum(r.get("bytes") or 0 for r in prev_rows)
+        tot = lambda f: [sum(v[i] for v in (a_[f] for a_ in series["apps"].values()))  # noqa: E731
+                         for i in range(len(series["labels"]))]
+        return {"req": req, "mb": byts / 1e6, "series": series,
+                "d_req": _delta_sub(req, prev_req, lower_is_better=True),
+                "d_mb": _delta_sub(byts, prev_b, lower_is_better=True),
+                "spark_req": tot("req"), "spark_mb": tot("mb")}
+    except Exception:  # noqa: BLE001
+        log.exception("overview egress summary failed")
+        return None
+
+
 @ui.refreshable
 def _overview_tab() -> None:
     data = STATE["data"]
@@ -1143,6 +1243,7 @@ def _overview_tab() -> None:
     calls_spark = [d["calls"] for d in data.get("daily_series", [])]
     cost_spark = [d["cost_usd"] for d in data.get("daily_series", [])]
 
+    eg = _overview_egress()
     with ui.grid().classes("w-full gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 mt-2"):
         d_calls = _delta_sub(data["total_calls"], prev and prev["calls"])
         d_cost = _delta_sub(data["total_cost_usd"], prev and prev["cost_usd"], lower_is_better=True)
@@ -1162,6 +1263,11 @@ def _overview_tab() -> None:
              warn=projected_monthly > monthly_budget, spark=cost_spark)
         _kpi("Cost attribution quality", f"{attribution['cost_tagged_pct']:.0f}% tagged by provider",
              warn=attribution["cost_tagged_pct"] < 50)
+        if eg:
+            _kpi("Supabase requests", f"{eg['req']:,}", sub=eg["d_req"] and eg["d_req"][0],
+                 sub_cls=eg["d_req"] and eg["d_req"][1], spark=eg["spark_req"])
+            _kpi("Supabase egress (metered)", f"{eg['mb']:.1f} MB", sub=eg["d_mb"] and eg["d_mb"][0],
+                 sub_cls=eg["d_mb"] and eg["d_mb"][1], spark=eg["spark_mb"])
 
     insight = ledger.top_spender_insight(data)
     if insight:
@@ -1214,6 +1320,12 @@ def _overview_tab() -> None:
             "series": series,
             "grid": {"left": 50, "right": 20, "top": 40, "bottom": 30},
         }).classes("w-full h-64")
+
+    eg_series = eg["series"] if eg else None
+    if eg_series and eg_series["apps"]:
+        with ui.column().classes("w-full mt-4 gap-1"):
+            _egress_chart(eg_series, "mb", "Supabase egress by app (MB, metered) -- details in the Supabase tab",
+                          "MB", height="h-44")
 
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
@@ -1418,37 +1530,40 @@ def _supabase_tab() -> None:
                  f"below is this ecosystem's own count only.") \
             .classes("text-sm text-grey-6 mt-1").mark("reconciliation-line")
 
-    # ---- 1b. manual known-good anchor --------------------------------------
-    # ADDED 2026-09-15: there's no API for real billed egress (see
-    # supabase_usage.load_egress_anchor()'s docstring) -- this lets the
-    # operator occasionally paste in what Settings -> Usage -> Egress
-    # actually shows, so the self-metered estimate above has something real
-    # to be checked against instead of being trusted indefinitely. This is
-    # exactly the gap that let the num_bytes_downloaded bug (self-meter
-    # showing ~700MB/day against Supabase's own ~75MB/day) go unnoticed.
-    anchor = supabase_usage.load_egress_anchor()
-    if anchor:
-        ui.label(f"Last confirmed real egress: {anchor['mb']:.0f} MB on {anchor['date']}"
-                 + (f" ({anchor['note']})" if anchor.get("note") else "")) \
-            .classes("text-xs text-grey-6 mt-1").mark("egress-anchor-line")
-    with ui.row().classes("items-center gap-2 mt-1"):
-        anchor_mb = ui.number(label="Real egress (MB)", min=0, format="%.0f") \
-            .classes("w-32").props("dense outlined")
-        anchor_note = ui.input(label="Note (optional)").classes("w-48").props("dense outlined")
-
-        def _save_anchor():
-            if anchor_mb.value is None:
-                ui.notify("Enter the MB figure from Supabase's Usage page first.", type="warning")
-                return
-            supabase_usage.save_egress_anchor(
-                float(anchor_mb.value), dt.date.today().isoformat(), anchor_note.value or "")
-            anchor_mb.value = None
-            anchor_note.value = ""
-            ui.notify("Saved.", type="positive")
-            _supabase_tab.refresh()
-
-        ui.button("Save today's real egress", icon="fact_check", on_click=_save_anchor) \
-            .props("dense outline").mark("save-egress-anchor")
+    # ---- 1b. egress over time by app, with change vs the previous window -----
+    ui.label(f"Egress over time by app ({window_label})").classes("text-sm font-bold mt-4")
+    series = _egress_series(rollup_rows, _start_dt, _end_dt)
+    if series["apps"]:
+        with ui.row().classes("w-full gap-4 flex-wrap"):
+            with ui.column().classes("grow min-w-[320px]"):
+                _egress_chart(series, "req", "Requests", "requests")
+            with ui.column().classes("grow min-w-[320px]"):
+                _egress_chart(series, "mb", "Metered egress (MB)", "MB")
+        length = _end_dt - _start_dt
+        prev_rows = ledger.fetch_meter_rollup(since_iso=(_start_dt - length).isoformat(),
+                                              until_iso=_start_dt.isoformat())
+        cur_t, prev_t = _egress_totals(rollup_rows), _egress_totals(prev_rows)
+        ui.label(f"Change vs the previous {window_label if not STATE.get('custom') else 'equal-length window'}"
+                 ).classes("text-sm font-bold mt-2")
+        cmp_cols = [
+            {"name": "app", "label": "App", "field": "app", "sortable": True},
+            {"name": "req", "label": "Requests", "field": "req", "sortable": True},
+            {"name": "preq", "label": "Prev", "field": "preq"},
+            {"name": "dreq", "label": "Change", "field": "dreq"},
+            {"name": "mb", "label": "MB", "field": "mb", "sortable": True},
+            {"name": "pmb", "label": "Prev MB", "field": "pmb"},
+            {"name": "dmb", "label": "Change", "field": "dmb"},
+        ]
+        cmp_rows = []
+        for app_name in sorted(set(cur_t) | set(prev_t), key=lambda k: -cur_t.get(k, (0, 0))[1]):
+            (cr, cb), (pr, pb) = cur_t.get(app_name, (0, 0)), prev_t.get(app_name, (0, 0))
+            cmp_rows.append({"app": app_name, "req": cr, "preq": pr, "dreq": _pct_delta(cr, pr),
+                             "mb": round(cb / 1e6, 1), "pmb": round(pb / 1e6, 1),
+                             "dmb": _pct_delta(cb, pb)})
+        ui.table(columns=cmp_cols, rows=cmp_rows, row_key="app").classes("w-full").props("dense") \
+            .mark("egress-compare-table")
+    else:
+        ui.label("(no metered traffic in this window)").classes("text-sm text-grey")
 
     # ---- 2. cross-project rollup -------------------------------------------
     ui.label(f"Metered traffic by app x endpoint ({window_label})").classes("text-sm font-bold mt-4")
@@ -1529,14 +1644,16 @@ _TAB_BUILDERS = {"Overview": _overview_tab, "Cost & Usage": _cost_tab,
 
 
 def _prewarm_supabase() -> None:
-    """Run the Supabase tab's network reads (rollup store, Management API) in
-    a worker thread so the synchronous render that follows hits warm caches
-    and doesn't block the event loop."""
+    """Run the Supabase/Overview network reads (rollup store incl. the previous
+    window, Management API) in a worker thread so the synchronous render that
+    follows hits warm caches and doesn't block the event loop."""
     import supabase_usage
     start, end = _supabase_window()[:2]
     days_back = max(math.ceil((dt.datetime.now(dt.timezone.utc) - start).total_seconds() / 86400), 1)
-    supabase_usage.fetch_reported_usage(interval=supabase_usage.best_interval_for_days(days_back))
     ledger.fetch_meter_rollup(since_iso=start.isoformat(), until_iso=end.isoformat())
+    ledger.fetch_meter_rollup(since_iso=(start - (end - start)).isoformat(), until_iso=start.isoformat())
+    if STATE.get("active_tab") == "Supabase":
+        supabase_usage.fetch_reported_usage(interval=supabase_usage.best_interval_for_days(days_back))
 
 
 def refresh_all() -> None:
@@ -1707,7 +1824,7 @@ async def main_page() -> None:
             STATE["loading"] = True
             try:
                 await asyncio.to_thread(fetch_stats, STATE["days"])
-                if STATE.get("active_tab") == "Supabase":
+                if STATE.get("active_tab") in ("Supabase", "Overview"):
                     await asyncio.to_thread(_prewarm_supabase)
                 refresh_all()
             finally:
@@ -1725,7 +1842,7 @@ async def main_page() -> None:
             STATE["loading"] = True
             try:
                 await asyncio.to_thread(fetch_stats)
-                if STATE.get("active_tab") == "Supabase":
+                if STATE.get("active_tab") in ("Supabase", "Overview"):
                     await asyncio.to_thread(_prewarm_supabase)
                 refresh_all()
             finally:
@@ -1739,7 +1856,7 @@ async def main_page() -> None:
             STATE["loading"] = True
             try:
                 await asyncio.to_thread(fetch_stats, STATE["days"])
-                if STATE.get("active_tab") == "Supabase":
+                if STATE.get("active_tab") in ("Supabase", "Overview"):
                     await asyncio.to_thread(_prewarm_supabase)
                 refresh_all()
             finally:
@@ -1907,6 +2024,8 @@ async def main_page() -> None:
             (dt.datetime.now(dt.timezone.utc) - last_fetch).total_seconds() > _PAGE_LOAD_FETCH_TTL_SEC)
         if page_load_stale:
             await asyncio.to_thread(fetch_stats)
+        if STATE.get("active_tab") in ("Supabase", "Overview"):
+            await asyncio.to_thread(_prewarm_supabase)
     refresh_all()
 
 
