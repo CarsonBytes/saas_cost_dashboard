@@ -308,3 +308,27 @@ async def test_commands_module_wired(user: User):
     import commands
     assert callable(commands.handle_text)
     assert commands.handle_text("/help").startswith("commands:")
+
+
+@MAIN
+async def test_governance_tab_loading_state_not_missing_tables_banner(user: User):
+    """Before the compliance loop has filled the cache the tab must say it is
+    loading -- the 'run the SQL' banner is only for tables known to be missing."""
+    import app as deck
+    from governance import engine
+    with engine._CACHE_LOCK:
+        saved = dict(engine._CACHE)
+        engine._CACHE.update({"loaded": False, "tables_ready": False})
+    deck.STATE["active_tab"] = "Governance"
+    try:
+        await user.open("/")
+        await user.should_see("Loading governance data")
+        await user.should_not_see("Governance tables not created yet")
+        with engine._CACHE_LOCK:
+            engine._CACHE.update({"loaded": True, "tables_ready": False})
+        deck.governance_view.refresh()
+        await user.should_see("Governance tables not created yet")
+    finally:
+        with engine._CACHE_LOCK:
+            engine._CACHE.update(saved)
+        deck.STATE["active_tab"] = "Overview"

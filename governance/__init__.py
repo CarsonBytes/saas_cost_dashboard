@@ -14,6 +14,7 @@ from governance.engine import (  # noqa: F401
     cached_audit,
     cached_complied,
     cached_rules,
+    cached_loaded,
     cached_tables_ready,
     check_pending_rules,
     compliance_health,

@@ -642,6 +642,9 @@ def governance_view() -> None:
     Render is NETWORK-FREE: it reads the snapshot cache the background
     compliance loop fills (governance.refresh_cache). Direct Supabase calls
     in render froze the event loop under rapid connections (FIXED 2026-08-15)."""
+    if not governance.cached_loaded():
+        ui.label("Loading governance data…").classes("text-sm text-grey")
+        return
     if not governance.cached_tables_ready():
         with ui.row().classes("w-full items-center gap-2 bg-amber-50 border border-amber-300 rounded p-3"):
             ui.icon("construction", color="amber-700")
@@ -1751,6 +1754,7 @@ async def _compliance_loop() -> None:
     from that cache, never from network calls."""
     while True:
         result = await asyncio.to_thread(governance.check_pending_rules)
+        _refresh_safely(governance_view)  # the tab may have been built before the cache filled
         await asyncio.sleep(_COMPLIANCE_RETRY_SEC if result.get("transient")
                             else _COMPLIANCE_INTERVAL_SEC)
 

@@ -55,7 +55,9 @@ _MATCH_CACHE: dict[str, float] = {}
 # FIXED 2026-08-15: the tab initially fetched directly during render, which
 # queued blocking calls on the loop and froze the app under rapid connections.
 _CACHE_LOCK = threading.Lock()
-_CACHE: dict = {"tables_ready": False, "rules": [], "complied": [], "audit": []}
+# "loaded" flips True once the tables' existence is KNOWN (ready or truly missing) --
+# until then the tab shows a loading note, never the "run the SQL" banner.
+_CACHE: dict = {"tables_ready": False, "loaded": False, "rules": [], "complied": [], "audit": []}
 
 
 def _headers() -> dict:
@@ -185,6 +187,7 @@ def refresh_cache(rules: list[dict] | None = None) -> dict:
             active, complied, audit = [], [], []
         with _CACHE_LOCK:
             _CACHE["tables_ready"] = ready
+            _CACHE["loaded"] = True
             _CACHE["rules"] = active
             _CACHE["complied"] = complied
             _CACHE["audit"] = audit
@@ -192,6 +195,11 @@ def refresh_cache(rules: list[dict] | None = None) -> dict:
     except Exception:                                 # noqa: BLE001
         log.exception("governance: cache refresh failed")
         return dict(_CACHE)
+
+
+def cached_loaded() -> bool:
+    with _CACHE_LOCK:
+        return _CACHE["loaded"]
 
 
 def cached_tables_ready() -> bool:
@@ -414,6 +422,8 @@ def _check_pending_rules() -> dict:
     if state != "ready":
         # "unknown" = transient (timeout/5xx): the loop retries soon instead of
         # waiting a full interval, and the cached snapshot is left untouched.
+        if state == "missing":
+            refresh_cache()  # marks the cache loaded so the tab shows the real banner
         return {"ok": False, "tables": False, "transient": state == "unknown"}
     ingested = ingest_regulatory_updates()
     now = dt.datetime.now(dt.timezone.utc)
