@@ -58,6 +58,14 @@ def _rollup_force_off() -> bool:
 _counts: dict[str, int] = {}
 _bytes: dict[str, int] = {}
 _last_flush = 0.0
+# The local file still flushes every FLUSH_SEC; the shared-table POST is
+# throttled to one per ROLLUP_POST_SEC (default 5 min) -- each POST is a
+# Supabase request, and 6 apps x 1/min was ~1,800+ requests/day for a table
+# only ever read at hour granularity. Unposted batches wait in the pending
+# buffer (same one that survives transient failures); the local file keeps
+# every minute regardless.
+ROLLUP_POST_SEC = float(os.environ.get("SUPABASE_METER_ROLLUP_SEC", "300"))
+_rollup_last_post = 0.0
 
 
 def configure(app: str | None = None, path: str | None = None) -> None:
@@ -97,12 +105,55 @@ def reset() -> None:
     """Clear in-memory counts (tests; operators reading the file don't need it)."""
     _counts.clear()
     _bytes.clear()
+    _rollup_pending_counts.clear()
+    _rollup_pending_bytes.clear()
+    global _rollup_last_post
+    _rollup_last_post = 0.0
 
 
 def response_bytes(response) -> int:
-    """Response payload size without disturbing the caller: prefers the
-    Content-Length header (no body touch), falls back to len(content).
-    Duck-typed, never raises -- 0 when unknown."""
+    """Response payload size in REAL WIRE BYTES (what Supabase actually
+    bills as egress) -- prefers response.num_bytes_downloaded, falls back to
+    the Content-Length header, then len(content). Duck-typed, never raises
+    -- 0 when unknown.
+
+    FIXED 2026-09-15: len(content)/Content-Length-as-fallback measures the
+    DEcompressed payload, not the compressed bytes actually transmitted.
+    PostgREST/Supabase responses are gzip/brotli-compressed JSON sent with
+    chunked transfer encoding (no Content-Length header at all, since
+    compressed size isn't known upfront) -- httpx auto-decompresses
+    transparently, so len(response.content) at that point is the decoded
+    size. Confirmed live: a small test response measured 291 bytes via
+    len(content) vs 225 via num_bytes_downloaded (matching the real
+    Content-Length header) -- a ~30% gap on a trivial payload, and the real
+    cause of this meter showing ~700MB/day of "egress" against Supabase's
+    own billed ~75MB/day (an ~10x gap on the far more repetitive, more
+    compressible JSON these endpoints actually return).
+    num_bytes_downloaded counts bytes read off the actual transport/socket,
+    so it reflects wire bytes regardless of compression -- this is the
+    correct metric to use everywhere in this file.
+
+    FIXED 2026-09-14 (kept below num_bytes_downloaded, still needed): study's
+    usage is via response_hook() attached to httpx's "response" event hook
+    (core/db.py's _instrument()) -- httpx fires that hook BEFORE the body is
+    read for a non-streamed request (Client.send() only calls response.read()
+    itself afterward), so num_bytes_downloaded/response.content would both
+    read as empty/raise ResponseNotRead without this. response.read() here
+    performs the real network read (populating num_bytes_downloaded
+    correctly too), and is a safe no-op if the body was already read (the
+    case for every manual httpx.get()-then-record() call site in this repo,
+    which all call this on an already-completed response outside of any
+    event hook)."""
+    try:
+        response.read()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        n = response.num_bytes_downloaded
+        if n:
+            return max(0, int(n))
+    except Exception:  # noqa: BLE001
+        pass
     try:
         cl = response.headers.get("content-length")
         if cl is not None:
@@ -142,13 +193,42 @@ def _maybe_flush() -> None:
         _bytes.clear()
 
 
+_rollup_pending_counts: dict[str, int] = {}
+_rollup_pending_bytes: dict[str, int] = {}
+
+
 def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> bool:
-    """Best-effort POST of one minute's per-endpoint rows to the rollup table.
+    """POST one minute's per-endpoint rows to the rollup table, merged with
+    any previously-failed batch so a transient error doesn't silently drop
+    data -- only a confirmed 2xx response clears the pending buffer.
+
+    FIXED 2026-09-17: the old version returned nothing on success (falsy),
+    and _maybe_flush() cleared _counts/_bytes anyway once the FILE sink
+    succeeded -- so a rollup POST that failed for any reason OTHER than 404
+    (timeout, 5xx, transient network error) silently lost that window's
+    data forever, with no retry. Found live: study-app's local JSONL file
+    had 61 requests in a 10-minute window while meter_rollup had only 33 for
+    the same app/window -- a real, variable undercount that made every
+    cross-project total this app's reconciliation tab (and every
+    "ecosystem-wide" estimate derived from it) systematically low by an
+    unpredictable amount. The pending buffer is separate from _counts/
+    _bytes (which stay exactly as before, feeding the FILE sink and
+    snapshot()) so a rollup outage never affects local per-endpoint
+    reporting, and a FILE-write failure never affects rollup delivery.
+
     stdlib urllib (NOT httpx) so this module stays dependency-free -- and so
     the write itself never passes through a metered code path (no self-
-    counting). Returns True when a POST was attempted. Never raises."""
-    global _rollup_disabled
-    if _rollup_disabled or _rollup_force_off() or not counts:
+    counting). Never raises."""
+    global _rollup_disabled, _rollup_last_post
+    if _rollup_disabled or _rollup_force_off():
+        return False
+    for ep, n in counts.items():
+        _rollup_pending_counts[ep] = _rollup_pending_counts.get(ep, 0) + n
+    for ep, n in byts.items():
+        _rollup_pending_bytes[ep] = _rollup_pending_bytes.get(ep, 0) + n
+    if not _rollup_pending_counts:
+        return False
+    if now - _rollup_last_post < ROLLUP_POST_SEC:
         return False
     url = os.environ.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -157,8 +237,8 @@ def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> b
     import urllib.request
     rows = [{"ts": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(),
              "app": APP, "endpoint": ep,
-             "requests": n, "bytes": byts.get(ep, 0)}
-            for ep, n in counts.items()]
+             "requests": n, "bytes": _rollup_pending_bytes.get(ep, 0)}
+            for ep, n in _rollup_pending_counts.items()]
     try:
         req = urllib.request.Request(
             f"{url.rstrip('/')}/rest/v1/{_rollup_table()}",
@@ -170,10 +250,25 @@ def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> b
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status == 404:
                 _rollup_disabled = True  # migration 004 not run yet; stop trying
+                _rollup_pending_counts.clear()
+                _rollup_pending_bytes.clear()
+                return False
+            if 200 <= resp.status < 300:
+                _rollup_last_post = now
+                _rollup_pending_counts.clear()
+                _rollup_pending_bytes.clear()
+                return True
+            return False  # non-2xx, non-404: leave pending, retry next tick
     except Exception as e:  # noqa: BLE001 -- never break the caller; a 404
-        # (raised as HTTPError, not returned) means the same thing.
+        # (raised as HTTPError, not returned) means the same thing. Any
+        # OTHER exception (timeout, connection reset, ...) leaves the
+        # pending buffer intact for the next flush to retry -- see this
+        # function's docstring for why that matters.
         if "404" in str(e):
             _rollup_disabled = True
+            _rollup_pending_counts.clear()
+            _rollup_pending_bytes.clear()
+        return False
 
 
 def response_hook(response) -> None:

@@ -121,7 +121,23 @@ def best_interval_for_days(n_days: int) -> str:
     return "7day"
 
 
-def reported_requests(cached: dict | None) -> tuple[int | None, str]:
+def _bucket_ts(b: dict):
+    """A usage.api-counts bucket's start as aware UTC (timestamps are naive UTC)."""
+    import datetime as dt
+    t = dt.datetime.fromisoformat(str(b.get("timestamp")).replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def reported_first_ts(cached: dict | None):
+    """Start of the earliest bucket the Management API returned (it only ever
+    covers a trailing 24h/3d/7d, never an arbitrary or older range), or None."""
+    try:
+        return min(_bucket_ts(b) for b in cached["payload"]["result"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reported_requests(cached: dict | None, since=None, until=None) -> tuple[int | None, str]:
     """(REST request total for the selected window, note). The real (verified
     live 2026-09-13) usage.api-counts shape is
     {"result": [{"timestamp", "total_rest_requests", "total_auth_requests",
@@ -139,6 +155,15 @@ def reported_requests(cached: dict | None) -> tuple[int | None, str]:
     payload = cached.get("payload")
     if isinstance(payload, dict) and isinstance(payload.get("result"), list):
         buckets = payload["result"]
+        if since is not None or until is not None:
+            try:
+                buckets = [b for b in buckets
+                           if (since is None or _bucket_ts(b) >= since)
+                           and (until is None or _bucket_ts(b) < until)]
+            except Exception:  # noqa: BLE001
+                return None, "unparseable bucket timestamps"
+            if not buckets:
+                return None, "no Supabase-reported buckets in this range (the API only covers the last 7 days)"
         if buckets and all(isinstance(b, dict) and "total_rest_requests" in b for b in buckets):
             total = sum(b.get("total_rest_requests") or 0 for b in buckets)
             return int(total), f"summed total_rest_requests across {len(buckets)} {interval} buckets"

@@ -20,8 +20,9 @@ def _meter_isolated(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPABASE_URL", "")
     monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "")
     old = (supabase_meter.FILE, supabase_meter.FLUSH_SEC, supabase_meter.APP,
-           supabase_meter._rollup_disabled)
+           supabase_meter._rollup_disabled, supabase_meter.ROLLUP_POST_SEC)
     supabase_meter.configure(path=str(tmp_path / "m.jsonl"))
+    supabase_meter.ROLLUP_POST_SEC = 0  # tests that assert per-record POSTs; throttle has its own test
     supabase_meter.FLUSH_SEC = 3600
     supabase_meter.APP = "test"
     supabase_meter._rollup_disabled = False
@@ -31,6 +32,7 @@ def _meter_isolated(monkeypatch, tmp_path):
     supabase_meter.FLUSH_SEC = old[1]
     supabase_meter.APP = old[2]
     supabase_meter._rollup_disabled = old[3]
+    supabase_meter.ROLLUP_POST_SEC = old[4]
     supabase_meter.reset()
 
 
@@ -398,8 +400,16 @@ def test_reported_usage_parses_shapes_and_caches(monkeypatch, tmp_path):
     assert supabase_usage.reported_requests(None)[0] is None
 
 
-def test_ledger_rollup_returns_empty_without_table(monkeypatch):
+def _isolated_rollup_store(monkeypatch, tmp_path):
     import ledger
+    monkeypatch.setattr(ledger, "_rollup_store", None)
+    monkeypatch.setattr(ledger, "_ROLLUP_STORE_FILE", tmp_path / "hourly.json")
+    ledger._ROLLUP_CACHE.update({"ts": 0.0, "rows": [], "key": ""})
+
+
+def test_ledger_rollup_returns_empty_without_table(monkeypatch, tmp_path):
+    import ledger
+    _isolated_rollup_store(monkeypatch, tmp_path)
 
     class _Resp:
         status_code = 404
@@ -536,3 +546,149 @@ def test_meter_rollup_retries_pending_batch_on_transient_failure(_meter_isolated
             os.environ["SUPABASE_SERVICE_ROLE_KEY"] = old_key
         else:
             os.environ.pop("SUPABASE_SERVICE_ROLE_KEY", None)
+
+
+def test_meter_rollup_pages_past_1000_rows_and_settles_history(monkeypatch, tmp_path):
+    """PostgREST caps responses at 1,000 rows: the fetch must page, fold settled
+    hours into the persistent store, and only refetch the unsettled tail."""
+    import datetime as _dt
+    import ledger
+    _isolated_rollup_store(monkeypatch, tmp_path)
+    monkeypatch.setattr(ledger, "SUPABASE_URL", "http://x")
+    monkeypatch.setattr(ledger, "SUPABASE_SERVICE_ROLE_KEY", "k")
+    now = _dt.datetime.now(_dt.timezone.utc)
+    settled_h = ledger._hour_floor(now - _dt.timedelta(seconds=ledger._ROLLUP_SETTLE_SEC))
+    old = settled_h - _dt.timedelta(hours=5)
+    data = [{"ts": (old + _dt.timedelta(seconds=i)).isoformat(), "app": "a", "endpoint": "GET t",
+             "requests": 1, "bytes": 10} for i in range(2500)]
+    data.append({"ts": (settled_h + _dt.timedelta(seconds=1)).isoformat(), "app": "a",
+                 "endpoint": "GET t", "requests": 7, "bytes": 70})
+    calls = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, rows):
+            self._rows = rows
+            self.headers = {}
+            self.content = b"[]"
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._rows
+
+    def _fake_get(url, params=None, **k):
+        p = dict(params)
+        lo = _dt.datetime.fromisoformat(p["ts"].removeprefix("gte."))
+        off = int(p["offset"])
+        calls.append(off)
+        rows = [r for r in data if _dt.datetime.fromisoformat(r["ts"]) >= lo]
+        return _Resp(rows[off:off + 1000])
+
+    monkeypatch.setattr(ledger.httpx, "get", _fake_get)
+    since = (old - _dt.timedelta(hours=1)).isoformat()
+    rows = ledger.fetch_meter_rollup(since_iso=since)
+    assert sum(r["requests"] for r in rows) == 2500 + 7  # nothing truncated at 1000
+    assert calls == [0, 1000, 2000]
+    assert (tmp_path / "hourly.json").exists()
+    # settled history is now stored: an immediate refresh over the same window
+    # is served from the 5-min tail cache with no further HTTP calls
+    calls.clear()
+    again = ledger.fetch_meter_rollup(since_iso=since)
+    assert sum(r["requests"] for r in again) == 2507 and calls == []
+    # until_iso bounds the window (a past custom range must not include "now")
+    bounded = ledger.fetch_meter_rollup(
+        since_iso=since, until_iso=(settled_h - _dt.timedelta(hours=1)).isoformat())
+    assert sum(r["requests"] for r in bounded) == 2500 and calls == []
+
+
+def test_reported_requests_filters_buckets_to_window():
+    import supabase_usage as su
+    buckets = [{"timestamp": f"2026-09-1{d}T16:00:00", "total_rest_requests": 100 * d} for d in range(1, 5)]
+    cached = {"interval": "7day", "payload": {"result": buckets}}
+    utc = dt.timezone.utc
+    assert su.reported_requests(cached)[0] == 1000
+    assert su.reported_requests(
+        cached, since=dt.datetime(2026, 9, 12, 16, tzinfo=utc),
+        until=dt.datetime(2026, 9, 14, 16, tzinfo=utc))[0] == 500  # buckets 2 and 3
+    assert su.reported_requests(cached, since=dt.datetime(2027, 1, 1, tzinfo=utc))[0] is None
+    assert su.reported_first_ts(cached) == dt.datetime(2026, 9, 11, 16, tzinfo=utc)
+
+
+def test_llm_rows_window_freezes_closed_days(monkeypatch, tmp_path):
+    """Days older than yesterday are fetched once and never again; only
+    yesterday + today hit Supabase on later loads."""
+    import datetime as _dt
+    monkeypatch.setattr(ledger, "_llm_days", None)
+    monkeypatch.setattr(ledger, "_LLM_DAYS_FILE", tmp_path / "days.json")
+    today = ledger._hkt_today_start_utc()
+    calls = []
+
+    def _fake_raw(start, end=None, select="", fill=True):
+        calls.append((start, end))
+        rows, t = [], start
+        stop = end or today + _dt.timedelta(days=1)
+        while t < stop:
+            rows.append({"created_at": (t + _dt.timedelta(hours=3)).isoformat(), "cost_usd": 1.0})
+            t += _dt.timedelta(days=1)
+        return rows
+
+    monkeypatch.setattr(ledger, "_fetch_rows_window_raw", _fake_raw)
+    start = today - _dt.timedelta(days=9)  # 10 days incl. today
+    first = ledger._fetch_rows_window(start, today + _dt.timedelta(days=1))
+    assert len(first) == 10
+    assert first == sorted(first, key=lambda r: r["created_at"], reverse=True)
+    assert len(calls) == 2  # one run of 8 frozen days + the live yesterday/today segment
+    calls.clear()
+    again = ledger._fetch_rows_window(start, today + _dt.timedelta(days=1))
+    assert len(again) == 10
+    live_from = today if _dt.datetime.now(ledger._HKT).hour >= 1 else today - _dt.timedelta(days=1)
+    assert len(calls) == 1 and calls[0][0] == live_from  # only the live segment
+    assert (tmp_path / "days.json").exists()
+
+
+def test_governance_tables_state_distinguishes_transient_from_missing(monkeypatch):
+    from governance import engine
+    monkeypatch.setattr(engine, "_TABLES_CONFIRMED", False)
+    states = iter(["ok", "error"])
+    monkeypatch.setattr(engine, "_table_state", lambda t: next(states))
+    assert engine.tables_state() == "unknown"   # timeout != "tables not created"
+    states2 = iter(["missing", "ok"])
+    monkeypatch.setattr(engine, "_table_state", lambda t: next(states2))
+    assert engine.tables_state() == "missing"
+    monkeypatch.setattr(engine, "_table_state", lambda t: "ok")
+    assert engine.tables_state() == "ready"
+    monkeypatch.setattr(engine, "_table_state", lambda t: (_ for _ in ()).throw(AssertionError("latched: no re-probe")))
+    assert engine.tables_state() == "ready"
+    monkeypatch.setattr(engine, "_TABLES_CONFIRMED", False)
+
+
+def test_meter_rollup_post_is_throttled_but_loses_nothing(_meter_isolated, monkeypatch):
+    import urllib.request
+    m = _meter_isolated
+    m.FLUSH_SEC = 0
+    m.ROLLUP_POST_SEC = 300
+    monkeypatch.setenv("SUPABASE_URL", "http://x")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    posted = []
+
+    class _Ok:
+        status = 201
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def _fake(req, timeout=None):
+        posted.append(json.loads(req.data))
+        return _Ok()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    m.record("GET", "t", 100)          # first flush posts immediately
+    m.record("GET", "t", 200)          # within 300s: held in the pending buffer
+    m.record("GET", "t", 300)
+    assert len(posted) == 1 and posted[0][0]["requests"] == 1
+    m._rollup_last_post -= 301         # 5 minutes later
+    m.record("GET", "t", 400)
+    assert len(posted) == 2
+    assert posted[1][0]["requests"] == 3 and posted[1][0]["bytes"] == 900  # the two held batches + this one

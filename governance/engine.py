@@ -116,14 +116,45 @@ def _patch(table: str, row_id: str, payload: dict) -> bool:
         return False
 
 
+_TABLES_CONFIRMED = False
+
+
+def _table_state(table: str) -> str:
+    """"ok" | "missing" (404: no such table) | "error" (timeout/5xx/etc --
+    says nothing about whether the table exists)."""
+    try:
+        resp = httpx.get(f"{ledger.SUPABASE_URL}/rest/v1/{table}",
+                         params={"select": "id", "limit": "1"}, headers=_headers(), timeout=10)
+        supabase_meter.record("GET", table, supabase_meter.response_bytes(resp))
+        if resp.status_code == 200:
+            return "ok"
+        return "missing" if resp.status_code == 404 else "error"
+    except Exception:                              # noqa: BLE001
+        return "error"
+
+
+def tables_state() -> str:
+    """"ready" | "missing" | "unknown" (transient failure). Once both tables
+    have been seen, the answer is latched -- they don't disappear, and
+    re-probing every cycle was 4 wasted reads per cycle."""
+    global _TABLES_CONFIRMED
+    if _TABLES_CONFIRMED:
+        return "ready"
+    states = [_table_state(t) for t in _TABLES]
+    if all(st == "ok" for st in states):
+        _TABLES_CONFIRMED = True
+        return "ready"
+    return "missing" if "missing" in states else "unknown"
+
+
 def tables_ready() -> bool:
     """Both governance tables exist (the user ran the Phase 0 SQL)."""
-    return all(_get(t, {"select": "id", "limit": "1"}) is not None for t in _TABLES)
+    return tables_state() == "ready"
 
 
 # ---- UI snapshot cache (background-filled, render-safe) ---------------------
 
-def refresh_cache() -> dict:
+def refresh_cache(rules: list[dict] | None = None) -> dict:
     """Best-effort snapshot for the Governance tab. Called from background
     tasks only (the compliance loop, mark_complied) -- never from a page
     render. Never raises.
@@ -141,16 +172,20 @@ def refresh_cache() -> dict:
     governance_view() in app.py. Fixed here anyway since it's a real
     lock-held-across-I/O anti-pattern independent of that bug.)"""
     try:
-        ready = tables_ready()
+        state = tables_state()
+        if state == "unknown":
+            return dict(_CACHE)  # transient failure: keep the last good snapshot
+        ready = state == "ready"
         if ready:
-            rules = fetch_rules()
-            complied = fetch_rules(("COMPLIED",))[:20]
-            audit = get_audit_log()
+            all_rules = rules if rules is not None else fetch_rules(())
+            audit = get_audit_log(rules_by_id={r["id"]: r["rule_name"] for r in all_rules})
+            active = [r for r in all_rules if r.get("status") in ("PENDING", "OVERDUE")]
+            complied = [r for r in all_rules if r.get("status") == "COMPLIED"][:20]
         else:
-            rules, complied, audit = [], [], []
+            active, complied, audit = [], [], []
         with _CACHE_LOCK:
             _CACHE["tables_ready"] = ready
-            _CACHE["rules"] = rules
+            _CACHE["rules"] = active
             _CACHE["complied"] = complied
             _CACHE["audit"] = audit
         return dict(_CACHE)
@@ -217,7 +252,7 @@ def fetch_rules(statuses: tuple[str, ...] = ("PENDING", "OVERDUE")) -> list[dict
     return _get("governance_rules", {"select": "*", "order": "enforcement_deadline.asc"}) or []
 
 
-def get_audit_log(limit: int = 50) -> list[dict]:
+def get_audit_log(limit: int = 50, rules_by_id: dict | None = None) -> list[dict]:
     """Most recent audit rows first, with the rule name resolved (we resolve
     it in Python rather than embedding via PostgREST to avoid a 400 if the FK
     relationship isn't exposed)."""
@@ -225,7 +260,8 @@ def get_audit_log(limit: int = 50) -> list[dict]:
                 {"select": "*", "order": "created_at.desc", "limit": str(limit)}) or []
     if not rows:
         return rows
-    rules = {r["id"]: r["rule_name"] for r in _get("governance_rules", {"select": "id,rule_name"}) or []}
+    rules = rules_by_id if rules_by_id is not None else {
+        r["id"]: r["rule_name"] for r in _get("governance_rules", {"select": "id,rule_name"}) or []}
     for row in rows:
         row["rule_name"] = rules.get(row.get("rule_id"), row.get("rule_id") or "—")
     return rows
@@ -374,11 +410,15 @@ def ingest_regulatory_updates() -> list[str]:
 
 
 def _check_pending_rules() -> dict:
-    if not tables_ready():
-        return {"ok": False, "tables": False}
+    state = tables_state()
+    if state != "ready":
+        # "unknown" = transient (timeout/5xx): the loop retries soon instead of
+        # waiting a full interval, and the cached snapshot is left untouched.
+        return {"ok": False, "tables": False, "transient": state == "unknown"}
     ingested = ingest_regulatory_updates()
     now = dt.datetime.now(dt.timezone.utc)
-    rules = fetch_rules()
+    all_rules = fetch_rules(())
+    rules = [r for r in all_rules if r.get("status") in ("PENDING", "OVERDUE")]
     flipped, matched = [], []
     snapshot = fetch_compliance_snapshot()
     for rule in rules:
@@ -404,7 +444,9 @@ def _check_pending_rules() -> dict:
                    {"snapshot": snapshot})
             _MATCH_CACHE[rule["id"]] = now.timestamp()
             matched.append(rule["rule_name"])
-    refresh_cache()  # keep the UI snapshot fresh (runs in this background thread)
+    # Reuse this cycle's single rules read for the UI snapshot unless the
+    # cycle itself changed rules (status flips / newly ingested rows).
+    refresh_cache(None if (flipped or ingested) else all_rules)
     return {"ok": True, "rules_checked": len(rules), "overdue": flipped,
             "matched": matched, "ingested": ingested}
 

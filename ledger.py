@@ -16,6 +16,7 @@ analyst/usage_log.py::_project_of()).
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import time
@@ -46,44 +47,149 @@ def supabase_meter_snapshot() -> dict[str, int]:
 
 _ROLLUP_CACHE: dict = {"ts": 0.0, "rows": [], "key": ""}
 _ROLLUP_CACHE_SEC = 300
+_ROLLUP_SETTLE_SEC = 300
+_ROLLUP_STORE_FILE = Path(__file__).parent / "state" / "meter_rollup_hourly.json"
+_rollup_store: dict | None = None
 
 
-def fetch_meter_rollup(since_iso: str | None = None) -> list[dict]:
-    """Rows of the cross-project meter_rollup table (one row per app x endpoint
-    x minute), 5-minute cached. When since_iso is set, only rows at or after
-    that timestamp are returned (for date-range-aware views); otherwise
-    defaults to trailing 24h. Empty list when the 004 migration hasn't run yet
-    or Supabase is unreachable -- never raises, so the Supabase tab degrades to
-    the local-file view instead of erroring."""
-    now = time.time()
-    cache_key = since_iso or ""
-    if (now - _ROLLUP_CACHE["ts"] < _ROLLUP_CACHE_SEC
-            and _ROLLUP_CACHE.get("key") == cache_key):
-        return _ROLLUP_CACHE["rows"]
-    rows: list[dict] = []
-    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+def _utc(iso: str) -> dt.datetime:
+    t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def _hour_floor(t: dt.datetime) -> dt.datetime:
+    return t.replace(minute=0, second=0, microsecond=0)
+
+
+def _load_rollup_store() -> dict:
+    """Hour-bucketed history of already-settled meter_rollup rows:
+    {"start": iso|None, "through": iso|None, "hours": {"YYYY-MM-DDTHH|app|endpoint": [requests, bytes]}}.
+    Everything in [start, through) is final and never refetched."""
+    global _rollup_store
+    if _rollup_store is None:
         try:
-            if since_iso is None:
-                since_iso = (dt.datetime.now(dt.timezone.utc)
-                             - dt.timedelta(hours=24)).isoformat()
-            resp = httpx.get(
-                f"{SUPABASE_URL}/rest/v1/meter_rollup",
-                params={"select": "ts,app,endpoint,requests,bytes",
-                        "ts": f"gte.{since_iso}", "order": "ts.desc"},
-                headers={"apikey": SUPABASE_SERVICE_ROLE_KEY,
-                         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
-                timeout=15)
-            supabase_meter.record("GET", "meter_rollup",
-                                  supabase_meter.response_bytes(resp))
-            if resp.status_code != 404:
-                resp.raise_for_status()
-                rows = resp.json()
+            _rollup_store = json.loads(_ROLLUP_STORE_FILE.read_text(encoding="utf-8"))
+            _rollup_store["hours"]
         except Exception:  # noqa: BLE001
-            rows = []
-    _ROLLUP_CACHE["ts"] = now
-    _ROLLUP_CACHE["rows"] = rows
-    _ROLLUP_CACHE["key"] = cache_key
-    return rows
+            _rollup_store = {"start": None, "through": None, "hours": {}}
+    return _rollup_store
+
+
+def _save_rollup_store() -> None:
+    try:
+        tmp = _ROLLUP_STORE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_rollup_store), encoding="utf-8")
+        os.replace(tmp, _ROLLUP_STORE_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _fold_rollup_rows(store: dict, rows: list[dict]) -> None:
+    for r in rows:
+        hour = _hour_floor(_utc(r["ts"])).strftime("%Y-%m-%dT%H")
+        cell = store["hours"].setdefault(f"{hour}|{r.get('app') or '?'}|{r.get('endpoint') or '?'}", [0, 0])
+        cell[0] += r.get("requests") or 0
+        cell[1] += r.get("bytes") or 0
+
+
+def _fetch_rollup_range(start: dt.datetime, end: dt.datetime | None = None) -> list[dict] | None:
+    """Paginated raw meter_rollup rows in [start, end). PostgREST caps every
+    response at 1,000 rows server-side (a client `limit` can't raise it), so
+    this pages by offset over a total ordering. None = failed/table missing."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return None
+    params_base: list[tuple[str, str]] = [
+        ("select", "ts,app,endpoint,requests,bytes"),
+        ("ts", f"gte.{start.isoformat()}"),
+    ]
+    if end is not None:
+        params_base.append(("ts", f"lt.{end.isoformat()}"))
+    params_base.append(("order", "ts.asc,app.asc,endpoint.asc,requests.asc,bytes.asc"))
+    headers = {"apikey": SUPABASE_SERVICE_ROLE_KEY,
+               "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}
+    rows: list[dict] = []
+    offset = 0
+    try:
+        while True:
+            resp = httpx.get(f"{SUPABASE_URL}/rest/v1/meter_rollup",
+                             params=params_base + [("limit", "1000"), ("offset", str(offset))],
+                             headers=headers, timeout=15)
+            supabase_meter.record("GET", "meter_rollup", supabase_meter.response_bytes(resp))
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            batch = resp.json()
+            rows.extend(batch)
+            if len(batch) < 1000:
+                return rows
+            offset += len(batch)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = None) -> list[dict]:
+    """Rows of the cross-project meter_rollup table for [since, until) --
+    hour-granularity for settled history, raw minute rows for the unsettled
+    tail. Default window: trailing 24h. Empty list when the 004 migration
+    hasn't run or Supabase is unreachable -- never raises.
+
+    Settled hours (older than _ROLLUP_SETTLE_SEC) are folded once into a
+    persistent hourly store (state/meter_rollup_hourly.json) and never
+    refetched, so a refresh only pulls the rows since the last settled hour
+    (typically one request per 5 min) instead of re-paging the whole window
+    (a 7-day view was ~45 requests per refresh, ~540/hour). Widening the
+    window backfills only the missing older hours, once.
+
+    Paginated because PostgREST caps each response at 1,000 rows regardless
+    of any client `limit` (a 24h window matched 4,523 rows but returned only
+    the newest 1,000 -- every range button collapsed to the same trailing
+    slice)."""
+    now = time.time()
+    now_dt = dt.datetime.fromtimestamp(now, dt.timezone.utc)
+    since = _utc(since_iso) if since_iso else now_dt - dt.timedelta(hours=24)
+    until = _utc(until_iso) if until_iso else None
+    since_h = _hour_floor(since)
+    settled = _hour_floor(now_dt - dt.timedelta(seconds=_ROLLUP_SETTLE_SEC))
+    store = _load_rollup_store()
+    changed = False
+
+    if store["through"] is None:
+        store["start"] = store["through"] = min(since_h, settled).isoformat()
+    if since_h < _utc(store["start"]):
+        older = _fetch_rollup_range(since_h, _utc(store["start"]))
+        if older is not None:
+            _fold_rollup_rows(store, older)
+            store["start"] = since_h.isoformat()
+            changed = True
+
+    through = _utc(store["through"])
+    if now - _ROLLUP_CACHE["ts"] >= _ROLLUP_CACHE_SEC:
+        fresh = _fetch_rollup_range(through)
+        tail = fresh or []
+        if fresh is not None:
+            done = [r for r in fresh if _utc(r["ts"]) < settled]
+            if done or settled > through:
+                _fold_rollup_rows(store, done)
+                store["through"] = max(settled, through).isoformat()
+                tail = [r for r in fresh if _utc(r["ts"]) >= settled]
+                changed = True
+        _ROLLUP_CACHE["ts"] = now
+        _ROLLUP_CACHE["rows"] = tail
+    if changed:
+        _save_rollup_store()
+
+    out: list[dict] = []
+    for key, (n, b) in store["hours"].items():
+        hour, app, endpoint = key.split("|", 2)
+        h = dt.datetime.strptime(hour, "%Y-%m-%dT%H").replace(tzinfo=dt.timezone.utc)
+        if h >= since_h and (until is None or h < until):
+            out.append({"ts": h.isoformat(), "app": app, "endpoint": endpoint,
+                        "requests": n, "bytes": b})
+    for r in _ROLLUP_CACHE["rows"]:
+        t = _utc(r["ts"])
+        if t >= since and (until is None or t < until):
+            out.append(r)
+    return out
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -149,7 +255,8 @@ def _fill_fallback(row: dict) -> dict:
     return row
 
 
-def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = None) -> list[dict]:
+def _fetch_rows_window_raw(start_utc: dt.datetime, end_utc: dt.datetime | None = None,
+                           select: str = "", fill: bool = True) -> list[dict]:
     """Raw rows from `start_utc` (inclusive) to `end_utc` (exclusive; None = open-ended).
 
     PAGINATES (FIXED 2026-08-15): PostgREST caps any single response at 1,000
@@ -163,7 +270,7 @@ def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = Non
     # and httpx preserves duplicates in a tuple list -- embedding "&and=(...)"
     # inside ONE param value would get percent-encoded and 400.
     params_base: list[tuple[str, str]] = [
-        ("select", _SELECT),
+        ("select", select or _SELECT),
         ("created_at", f"gte.{start_utc.isoformat()}"),
     ]
     if end_utc is not None:
@@ -190,7 +297,92 @@ def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = Non
         if len(batch) < page_size:
             break
         offset += len(batch)
-    return [_fill_fallback(r) for r in rows]
+    return [_fill_fallback(r) for r in rows] if fill else rows
+
+
+_LLM_DAYS_FILE = Path(__file__).parent / "state" / "llm_calls_days.json"
+_llm_days: dict | None = None
+
+
+def _load_llm_days() -> dict:
+    """Frozen per-HKT-day raw llm_calls rows: {"YYYY-MM-DD": [row, ...]}."""
+    global _llm_days
+    if _llm_days is None:
+        try:
+            _llm_days = json.loads(_LLM_DAYS_FILE.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            _llm_days = {}
+    return _llm_days
+
+
+def _save_llm_days() -> None:
+    try:
+        tmp = _LLM_DAYS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_llm_days), encoding="utf-8")
+        os.replace(tmp, _LLM_DAYS_FILE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _is_hkt_midnight(t: dt.datetime) -> bool:
+    h = t.astimezone(_HKT)
+    return (h.hour, h.minute, h.second, h.microsecond) == (0, 0, 0, 0)
+
+
+def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = None) -> list[dict]:
+    """Rows in [start, end), newest first. Days before yesterday (HKT; yesterday too once it is >1h old) are
+    immutable, so each is fetched from Supabase once and kept in a persistent
+    store (state/llm_calls_days.json); only yesterday + today are ever
+    refetched. A 90d view used to re-page ~4,600 rows (plus the previous
+    window) on every load; now it re-pages ~2 days of rows. Windows not
+    aligned to HKT midnight bypass the store."""
+    if not _is_hkt_midnight(start_utc) or (end_utc is not None and not _is_hkt_midnight(end_utc)):
+        return _fetch_rows_window_raw(start_utc, end_utc)
+    one_day = dt.timedelta(days=1)
+    # Yesterday is settled an hour into today (late/retried log writes have
+    # landed); before that it stays live along with today.
+    frozen_end = _hkt_today_start_utc() - (dt.timedelta(0) if dt.datetime.now(_HKT).hour >= 1 else one_day)
+    if end_utc is not None:
+        frozen_end = min(end_utc, frozen_end)
+    rows: list[dict] = []
+    live_start = start_utc
+    if start_utc < frozen_end:
+        store = _load_llm_days()
+        days, d = [], start_utc
+        while d < frozen_end:
+            days.append(d)
+            d += one_day
+        key = lambda d_: d_.astimezone(_HKT).strftime("%Y-%m-%d")  # noqa: E731
+        missing = [d_ for d_ in days if key(d_) not in store]
+        runs: list[list[dt.datetime]] = []
+        for d_ in missing:
+            if runs and d_ - runs[-1][-1] == one_day:
+                runs[-1].append(d_)
+            else:
+                runs.append([d_])
+        for run in runs:
+            got = _fetch_rows_window_raw(run[0], run[-1] + one_day)
+            by_day: dict[str, list[dict]] = {key(d_): [] for d_ in run}
+            for r in got:
+                by_day.setdefault(_hkt_date_str(r["created_at"]), []).append(r)
+            store.update(by_day)
+        if runs:
+            _save_llm_days()
+        for d_ in days:
+            rows.extend(store[key(d_)])
+        live_start = frozen_end
+    if end_utc is None or live_start < end_utc:
+        rows.extend(_fetch_rows_window_raw(live_start, end_utc))
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return rows
+
+
+def fetch_today_rows() -> list[dict]:
+    """Today's (HKT) calls with only the two columns the daily-threshold alert
+    needs -- the background alert loop used to re-download the whole active
+    window (plus the previous one) every 15 minutes for one number."""
+    return _fetch_rows_window_raw(_hkt_today_start_utc(), None,
+                                  select="cost_usd,created_at", fill=False)
 
 
 def fetch_rows(days: int) -> list[dict]:

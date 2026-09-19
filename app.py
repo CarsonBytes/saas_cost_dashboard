@@ -39,7 +39,9 @@ import csv
 import datetime as dt
 import io
 import logging
+import math
 import os
+import time
 
 from nicegui import app, run, ui
 
@@ -64,12 +66,13 @@ STATE: dict = {"data": None, "rows": None, "error": None, "days": 7, "last_fetch
                # an optional custom HKT date range (start, end) overriding
                # the trailing-days toggle.
                "project": None, "prev": None, "custom": None, "preset_days": 7,
-               "active_tab": "Overview"}
+               "active_tab": "Overview", "loading": False, "dirty": set()}
 
 _ALERT_CHECK_INTERVAL_SEC = int(os.environ.get("ALERT_CHECK_INTERVAL_SEC", "900"))
 _SERVICES_CHECK_INTERVAL_SEC = int(os.environ.get("SERVICES_CHECK_INTERVAL_SEC", "120"))
 _RISK_LEDGER_INTERVAL_SEC = int(os.environ.get("RISK_LEDGER_INTERVAL_SEC", "300"))
-_COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
+_COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "1800"))
+_COMPLIANCE_RETRY_SEC = 60  # after a transient Supabase failure (not a missing table)
 # ADDED 2026-09-13: dashboard.carsonng.com is fully public, no Cloudflare
 # Access -- found live via a labeled-call-site diagnostic that main_page()
 # was firing every ~20-35s with zero manual navigation, consistent with bot/
@@ -82,7 +85,20 @@ _COMPLIANCE_INTERVAL_SEC = int(os.environ.get("COMPLIANCE_INTERVAL_SEC", "600"))
 # originally-reported ~5xxMB/day Supabase egress. Manual refresh paths
 # (_do_retry, the header Refresh button) call fetch_stats() directly, not
 # through main_page(), so they always get real data regardless of this TTL.
-_PAGE_LOAD_FETCH_TTL_SEC = int(os.environ.get("PAGE_LOAD_FETCH_TTL_SEC", "60"))
+_PAGE_LOAD_FETCH_TTL_SEC = int(os.environ.get("PAGE_LOAD_FETCH_TTL_SEC", "300"))
+# Self-identified crawlers/scripts never trigger a refetch (they get whatever
+# STATE holds; only a cold start with nothing cached fetches for them) -- the
+# page is public, and each bot hit past the TTL used to cost live Supabase reads.
+_BOT_UA_TOKENS = ("bot", "crawl", "spider", "slurp", "curl", "wget", "python-requests",
+                  "httpx", "scrapy", "headless", "preview", "monitor", "uptime", "facebookexternalhit")
+
+
+def _is_bot_request() -> bool:
+    try:
+        ua = (ui.context.client.request.headers.get("user-agent") or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return not ua or any(t in ua for t in _BOT_UA_TOKENS)
 # FIXED 2026-09-14: the TTL check above main_page()'s fetch call is a classic
 # check-then-act race -- `await asyncio.to_thread(fetch_stats)` yields control
 # back to the event loop, so several connections arriving close together can
@@ -145,7 +161,24 @@ def burn_bar() -> None:
         ui.label("Click → Cost tab  ·  Cmd+K palette  ·  g o/c/r/g").classes("text-[11px] text-zinc-400")
 
 
-def fetch_stats(days: int | None = None) -> None:
+# Revisiting a window already loaded in the last minute (toggle 7d -> 30d -> 7d)
+# reuses the fetched rows instead of re-paging llm_calls. Keyed by the window
+# only: the project filter is applied after the fetch, so it shares entries.
+_FETCH_CACHE_SEC = 60
+_FETCH_CACHE: dict = {}
+
+
+def _check_alerts_light() -> None:
+    """Daily-threshold check for the background loop: today's cost only
+    (2 columns, ~today's rows) instead of re-fetching the whole active window.
+    The threshold is a global today figure, so nothing else is needed."""
+    try:
+        STATE["alert"] = alerts.run_check(ledger.today_cost(ledger.fetch_today_rows()))
+    except Exception:  # noqa: BLE001
+        log.exception("alert check failed")
+
+
+def fetch_stats(days: int | None = None, force: bool = False) -> None:
     """Fetch + aggregate the active window: the custom HKT date range when one
     is set in STATE, otherwise the trailing-`days` window. Also fetches the
     PRECEDING equal-length window for the KPI deltas -- two paginated
@@ -160,11 +193,23 @@ def fetch_stats(days: int | None = None) -> None:
         days = days or STATE["days"]
         custom = STATE.get("custom")
         if custom:
-            rows, prev_rows = ledger.fetch_rows_custom(*custom)
-            days = (dt.date.fromisoformat(custom[1])
-                    - dt.date.fromisoformat(custom[0])).days + 1
+            n_days = (dt.date.fromisoformat(custom[1])
+                      - dt.date.fromisoformat(custom[0])).days + 1
         else:
-            rows, prev_rows = ledger.fetch_rows_and_previous(days)
+            n_days = days
+        cache_key = ("custom", custom) if custom else ("days", days)
+        hit = _FETCH_CACHE.get(cache_key)
+        if hit and not force and time.monotonic() - hit[0] < _FETCH_CACHE_SEC:
+            rows, prev_rows = hit[1], hit[2]
+        else:
+            if custom:
+                rows, prev_rows = ledger.fetch_rows_custom(*custom)
+            else:
+                rows, prev_rows = ledger.fetch_rows_and_previous(days)
+            _FETCH_CACHE[cache_key] = (time.monotonic(), rows, prev_rows)
+            if len(_FETCH_CACHE) > 12:
+                _FETCH_CACHE.pop(min(_FETCH_CACHE, key=lambda k: _FETCH_CACHE[k][0]))
+        days = n_days
         project = STATE.get("project")
         data_rows = [r for r in rows if r.get("project") == project] if project else rows
         STATE["data"] = ledger.build_stats(data_rows, days)
@@ -960,10 +1005,10 @@ def _incident_log_table() -> None:
         {"name": "outcome", "label": "Outcome", "field": "outcome"},
         {"name": "detail", "label": "Detail", "field": "detail"},
     ]
-    rows = [{"ts": ledger.to_hkt(i["ts"]).strftime("%Y-%m-%d %H:%M:%S"), "agent": i["agent"],
+    rows = [{"_key": n, "ts": ledger.to_hkt(i["ts"]).strftime("%Y-%m-%d %H:%M:%S"), "agent": i["agent"],
              "event": i["event"], "outcome": i.get("outcome", ""),
-             "detail": i.get("detail", "")} for i in incidents]
-    ui.table(columns=cols, rows=rows, row_key="ts").classes("w-full").props(
+             "detail": i.get("detail", "")} for n, i in enumerate(incidents)]
+    ui.table(columns=cols, rows=rows, row_key="_key").classes("w-full").props(
         "dense max-height=240px")
 
 
@@ -971,14 +1016,14 @@ def incident_log() -> None:
     with ui.row().classes("w-full items-center justify-between mt-4 flex-wrap gap-2"):
         with ui.row().classes("items-center gap-2"):
             ui.label("Incident log").classes("text-sm font-bold")
-            # View toggle: table ↔ timeline
-            def _set_view(m: str) -> None:
-                _INCIDENT_VIEW["mode"] = m
+            # View toggle: table <-> timeline. A ui.toggle owns its selected
+            # state; the old pair of buttons baked 'unelevated'/'outline' into
+            # their props at build time, so the highlight never followed clicks.
+            def _set_view(e) -> None:
+                _INCIDENT_VIEW["mode"] = e.value
                 _incident_log_table.refresh()
-            ui.button("Table", on_click=lambda: _set_view("table")).props(
-                f"dense {'unelevated' if _INCIDENT_VIEW['mode']=='table' else 'outline'} size=sm").mark("incident-view-table")
-            ui.button("Timeline", on_click=lambda: _set_view("timeline")).props(
-                f"dense {'unelevated' if _INCIDENT_VIEW['mode']=='timeline' else 'outline'} size=sm").mark("incident-view-timeline")
+            ui.toggle({"table": "Table", "timeline": "Timeline"}, value=_INCIDENT_VIEW["mode"],
+                      on_change=_set_view).props("dense no-caps size=sm").mark("incident-view-toggle")
 
         def _apply_filter(e) -> None:
             _INCIDENT_FILTER["q"] = e.value or ""
@@ -995,7 +1040,9 @@ def incident_log() -> None:
 
 
 async def _do_retry() -> None:
-    await asyncio.to_thread(fetch_stats)
+    await asyncio.to_thread(fetch_stats, None, True)
+    if STATE.get("active_tab") == "Supabase":
+        await asyncio.to_thread(_prewarm_supabase)
     refresh_all()
 
 
@@ -1033,22 +1080,51 @@ def dashboard_body() -> None:
         for name in tab_names:
             tab_objs[name] = ui.tab(name)
     initial_tab = tab_objs.get(STATE["active_tab"], tab_objs["Overview"])
+    # LAZY TABS: only the selected tab's content is built/fetched. Others are
+    # built on first visit, and rebuilt on a later visit only if data changed
+    # while they were hidden (STATE["dirty"], see refresh_all()).
+    built: set[str] = set()
+    panels: dict[str, ui.element] = {}
 
-    def _on_tab_change(e) -> None:
+    async def _show_tab(name: str) -> None:
+        fn = _TAB_BUILDERS.get(name)
+        if fn is None:
+            return
+        if name not in built:
+            if name == "Supabase":
+                STATE["loading"] = True
+                try:
+                    await asyncio.to_thread(_prewarm_supabase)
+                finally:
+                    STATE["loading"] = False
+            with panels[name]:
+                fn()
+            built.add(name)
+            STATE["dirty"].discard(name)
+        elif name in STATE["dirty"]:
+            STATE["dirty"].discard(name)
+            if name == "Supabase":
+                STATE["loading"] = True
+                try:
+                    await asyncio.to_thread(_prewarm_supabase)
+                finally:
+                    STATE["loading"] = False
+            fn.refresh()
+
+    async def _on_tab_change(e) -> None:
         STATE["active_tab"] = str(e.value)
+        await _show_tab(STATE["active_tab"])
 
     tabs.on_value_change(_on_tab_change)
     with ui.tab_panels(tabs, value=initial_tab).classes("w-full"):
-        with ui.tab_panel(tab_objs["Overview"]):
-            _overview_tab()
-        with ui.tab_panel(tab_objs["Cost & Usage"]):
-            _cost_tab()
-        with ui.tab_panel(tab_objs["Reliability & Incidents"]):
-            _reliability_tab()
-        with ui.tab_panel(tab_objs["Governance"]):
-            governance_view()
-        with ui.tab_panel(tab_objs["Supabase"]):
-            _supabase_tab()
+        for name in tab_names:
+            with ui.tab_panel(tab_objs[name]) as panel:
+                panels[name] = panel
+                if name == "Governance":
+                    governance_view()
+                elif name == STATE["active_tab"] or (name == "Overview" and STATE["active_tab"] not in tab_names):
+                    _TAB_BUILDERS[name]()
+                    built.add(name)
 
 
 @ui.refreshable
@@ -1268,6 +1344,19 @@ def _fmt_bytes(n: int) -> str:
     return f"{n / (1024 * 1024):.1f} MB"
 
 
+def _supabase_window() -> tuple[dt.datetime, dt.datetime, str]:
+    """Effective (start, end, label) of the Supabase tab's window from STATE
+    (same pattern as fetch_stats)."""
+    custom = STATE.get("custom")
+    if custom:
+        return (ledger._hkt_day_start_utc(custom[0]),
+                ledger._hkt_day_start_utc(custom[1]) + dt.timedelta(days=1),
+                f"{custom[0]} to {custom[1]}")
+    n_days = STATE.get("days", 7)
+    end = ledger._hkt_today_start_utc() + dt.timedelta(days=1)
+    return end - dt.timedelta(days=n_days), end, f"{n_days}d"
+
+
 @ui.refreshable
 def _supabase_tab() -> None:
     """Supabase egress monitor (2026-09-13): reconciliation, not just
@@ -1279,34 +1368,30 @@ def _supabase_tab() -> None:
     import supabase_usage
     path = _Path(__file__).parent / "state" / "supabase_meter.jsonl"
 
-    # ---- effective window from STATE (same pattern as fetch_stats) ---------
-    import sys
-    print(f"[DEBUG _supabase_tab] STATE days={STATE.get('days')} custom={STATE.get('custom')}", file=sys.stderr)
-    custom = STATE.get("custom")
-    if custom:
-        _start_dt = ledger._hkt_day_start_utc(custom[0])
-        _end_dt = ledger._hkt_day_start_utc(custom[1]) + dt.timedelta(days=1)
-        window_label = f"{custom[0]} to {custom[1]}"
-    else:
-        n_days = STATE.get("days", 7)
-        _end_dt = ledger._hkt_today_start_utc() + dt.timedelta(days=1)
-        _start_dt = _end_dt - dt.timedelta(days=n_days)
-        window_label = f"{n_days}d"
+    _start_dt, _end_dt, window_label = _supabase_window()
     window_start_ts = _start_dt.timestamp()
     window_start_iso = _start_dt.isoformat()
     window_end_iso = _end_dt.isoformat()
-    print(f"[DEBUG _supabase_tab] window_label={window_label} since_iso={window_start_iso}", file=sys.stderr)
 
     # ---- 1. reconciliation -------------------------------------------------
     # Management API only supports predefined interval buckets (1day, 3day,
     # 7day), not arbitrary date ranges. Select the coarsest bucket that covers
     # the user's window so the reported figure is comparable to the metered.
-    n_window_days = max((_end_dt - _start_dt).days, 1)
-    mgmt_interval = supabase_usage.best_interval_for_days(n_window_days)
+    # The API's buckets are always trailing from NOW, so the interval must
+    # reach back to the window's start (not just match its length), and only
+    # buckets inside [start, end) may be summed. It never covers more than
+    # ~7 days, so reconcile only over the span it can actually see.
+    days_back = max(math.ceil((dt.datetime.now(dt.timezone.utc) - _start_dt).total_seconds() / 86400), 1)
+    mgmt_interval = supabase_usage.best_interval_for_days(days_back)
     ui.label(f"Reported vs metered ({window_label})").classes("text-sm font-bold")
     usage = supabase_usage.fetch_reported_usage(interval=mgmt_interval)
-    reported, note = supabase_usage.reported_requests(usage)
-    rollup_rows = ledger.fetch_meter_rollup(since_iso=window_start_iso)
+    _rep_first = supabase_usage.reported_first_ts(usage)
+    rec_start = max(_start_dt, _rep_first) if _rep_first else _start_dt
+    reported, note = supabase_usage.reported_requests(usage, since=rec_start, until=_end_dt)
+    rec_rows = ledger.fetch_meter_rollup(since_iso=rec_start.isoformat(), until_iso=window_end_iso)
+    rec_req = sum(r.get("requests") or 0 for r in rec_rows)
+    rec_bytes = sum(r.get("bytes") or 0 for r in rec_rows)
+    rollup_rows = ledger.fetch_meter_rollup(since_iso=window_start_iso, until_iso=window_end_iso)
     rollup_apps = {r.get("app") for r in rollup_rows}
     rollup_req = sum(r.get("requests") or 0 for r in rollup_rows)
     rollup_bytes = sum(r.get("bytes") or 0 for r in rollup_rows)
@@ -1314,19 +1399,20 @@ def _supabase_tab() -> None:
     file_bytes = supabase_meter.read_bytes(str(path), since_ts=window_start_ts)
     # The dashboard appears in BOTH sources once its writer posts to the
     # rollup table -- count its file only while it's absent there.
-    metered_req = rollup_req + (0 if supabase_meter.APP in rollup_apps
-                                else sum(file_counts.values()))
-    metered_bytes = rollup_bytes + (0 if supabase_meter.APP in rollup_apps
-                                    else sum(file_bytes.values()))
+    _rec_has_self = supabase_meter.APP in {r.get("app") for r in rec_rows}
+    metered_req = rec_req + (0 if _rec_has_self else sum(file_counts.values()))
+    metered_bytes = rec_bytes + (0 if _rec_has_self else sum(file_bytes.values()))
     if reported:
         coverage = metered_req / reported if reported else 0
-        est = f"~{_fmt_bytes(int(metered_bytes / coverage))}" if coverage > 0 else "—"
-        ui.label(f"Supabase reports {reported:,} requests/{window_label} ({note}). "
+        est = f"~{_fmt_bytes(int(metered_bytes / coverage))}" if coverage > 0 else "-"
+        span = ("" if rec_start <= _start_dt else
+                f" -- Supabase's API only covers the last {days_back if days_back <= 7 else 7}d, "
+                f"so reconciled over {ledger.to_hkt(rec_start):%Y-%m-%d} onward")
+        ui.label(f"Supabase reports {reported:,} requests/{window_label} ({note}){span}. "
                  f"Self-meters see {metered_req:,} ({coverage:.0%} coverage). "
                  f"Metered payload: {_fmt_bytes(metered_bytes)} -> estimated true "
                  f"egress {est} (assumes unmetered traffic has the same "
-                 f"bytes/request; headers/TLS/compression all live in the gap).") \
-            .classes("text-sm mt-1").mark("reconciliation-line")
+                 f"bytes/request; headers/TLS/compression all live in the gap).")             .classes("text-sm mt-1").mark("reconciliation-line")
     else:
         ui.label(f"Supabase-reported total unavailable: {note}. Metered traffic "
                  f"below is this ecosystem's own count only.") \
@@ -1403,48 +1489,54 @@ def _supabase_tab() -> None:
                  "AND the sibling apps redeployed with their meter writers "
                  "(each posts ~1 row/min/endpoint).").classes("text-sm text-grey-6")
 
-    # ---- 3. this dashboard's own detail --------------------------------------
-    ui.label("Supabase requests by endpoint").classes("text-sm font-bold mt-4")
-    ui.label("Every Supabase REST call this dashboard makes, counted with its "
-             "response size. Types = METHOD + table; sizes = response payload "
-             "bytes (what counts toward egress).").classes("text-xs text-grey-6")
-    counts_window = file_counts
-    bytes_window = file_bytes
-    counts_all = supabase_meter.read_totals(str(path))
-    bytes_all = supabase_meter.read_bytes(str(path))
-    keys = sorted(set(counts_window) | set(bytes_window) | set(counts_all) | set(bytes_all),
-                  key=lambda k: -(bytes_window.get(k, 0)))
-    cols = [
-        {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
-        {"name": "reqwin", "label": f"Requests ({window_label})", "field": "reqwin", "sortable": True},
-        {"name": "byteswin", "label": f"Bytes ({window_label})", "field": "byteswin"},
-        {"name": "avg", "label": "Avg / request", "field": "avg"},
-        {"name": "reqall", "label": "Requests (all)", "field": "reqall", "sortable": True},
-        {"name": "bytesall", "label": "Bytes (all)", "field": "bytesall"},
-    ]
-    rows = [{
-        "endpoint": k,
-        "reqwin": counts_window.get(k, 0),
-        "byteswin": _fmt_bytes(bytes_window.get(k, 0)),
-        "avg": _fmt_bytes(bytes_window.get(k, 0) // max(counts_window.get(k, 0), 1))
-               if counts_window.get(k) else "—",
-        "reqall": counts_all.get(k, 0),
-        "bytesall": _fmt_bytes(bytes_all.get(k, 0)),
-        "_key": k,
-    } for k in keys]
-    # Byte columns show pre-formatted strings ("1.2 MB") so they stay display-
-    # only; the request-count columns (raw ints) carry the sorting instead.
-    ui.table(columns=cols, rows=rows, row_key="_key").classes("w-full").props("dense") \
-        .mark("supabase-meter-table")
-    total_window = sum(bytes_window.values())
-    total_all = sum(bytes_all.values())
-    ui.label(f"{window_label}: {sum(counts_window.values())} requests, {_fmt_bytes(total_window)} · "
-             f"all-time: {sum(counts_all.values())} requests, {_fmt_bytes(total_all)} · "
-             f"source: state/supabase_meter.jsonl").classes("text-xs text-grey-6 mt-2")
-    if not keys:
-        ui.label("No meter data yet -- collection started 2026-09-13 and flushes "
-                 "~1/min while the dashboard runs. Check back after some traffic.") \
-            .classes("text-sm text-grey-6 mt-2")
+    # ---- 3. per-endpoint, all apps -------------------------------------------
+    # Was this dashboard's OWN local file only (a handful of endpoints), which
+    # read as if Supabase traffic were 5 tables while section 2 showed every
+    # app's. Now the same window's rollup rows, regrouped by endpoint alone,
+    # with the apps behind each one.
+    ui.label(f"Supabase requests by endpoint, all apps ({window_label})").classes("text-sm font-bold mt-4")
+    ui.label("Same data as the table above, summed per endpoint (METHOD + table) across every "
+             "app. Sizes = response payload bytes (what counts toward egress).")         .classes("text-xs text-grey-6")
+    by_ep: dict[str, dict] = {}
+    for r in rollup_rows:
+        e = by_ep.setdefault(r.get("endpoint") or "?", {"n": 0, "b": 0, "apps": {}})
+        e["n"] += r.get("requests") or 0
+        e["b"] += r.get("bytes") or 0
+        e["apps"][r.get("app") or "?"] = e["apps"].get(r.get("app") or "?", 0) + (r.get("requests") or 0)
+    if by_ep:
+        cols = [
+            {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
+            {"name": "req", "label": f"Requests ({window_label})", "field": "req", "sortable": True},
+            {"name": "bytes", "label": f"Bytes ({window_label})", "field": "bytes", "sortable": True},
+            {"name": "avg", "label": "Avg / request", "field": "avg"},
+            {"name": "apps", "label": "Apps", "field": "apps"},
+        ]
+        rows = [{
+            "endpoint": k, "req": v["n"], "bytes": v["b"], "avg": _fmt_bytes(v["b"] // max(v["n"], 1)),
+            "apps": ", ".join(f"{a} ({n:,})" for a, n in sorted(v["apps"].items(), key=lambda kv: -kv[1])),
+            "_key": k,
+        } for k, v in sorted(by_ep.items(), key=lambda kv: -kv[1]["b"])]
+        ui.table(columns=cols, rows=rows, row_key="_key").classes("w-full").props("dense")             .mark("supabase-meter-table")
+        ui.label(f"{window_label}: {sum(v['n'] for v in by_ep.values()):,} requests, "
+                 f"{_fmt_bytes(sum(v['b'] for v in by_ep.values()))} across {len(by_ep)} endpoints "
+                 f"· source: meter_rollup")             .classes("text-xs text-grey-6 mt-2")
+    else:
+        ui.label("No meter data in this window yet.").classes("text-sm text-grey-6 mt-2")
+
+
+_TAB_BUILDERS = {"Overview": _overview_tab, "Cost & Usage": _cost_tab,
+                 "Reliability & Incidents": _reliability_tab, "Supabase": _supabase_tab}
+
+
+def _prewarm_supabase() -> None:
+    """Run the Supabase tab's network reads (rollup store, Management API) in
+    a worker thread so the synchronous render that follows hits warm caches
+    and doesn't block the event loop."""
+    import supabase_usage
+    start, end = _supabase_window()[:2]
+    days_back = max(math.ceil((dt.datetime.now(dt.timezone.utc) - start).total_seconds() / 86400), 1)
+    supabase_usage.fetch_reported_usage(interval=supabase_usage.best_interval_for_days(days_back))
+    ledger.fetch_meter_rollup(since_iso=start.isoformat(), until_iso=end.isoformat())
 
 
 def refresh_all() -> None:
@@ -1465,10 +1557,13 @@ def refresh_all() -> None:
     project_filter_chip.refresh()
     _incident_log_table.refresh()
     _data_status.refresh()
-    _overview_tab.refresh()
-    _cost_tab.refresh()
-    _reliability_tab.refresh()
-    _supabase_tab.refresh()
+    active = STATE.get("active_tab")
+    for name, fn in _TAB_BUILDERS.items():
+        if name == active:
+            STATE["dirty"].discard(name)
+            fn.refresh()
+        else:
+            STATE["dirty"].add(name)
     last_refreshed_label.refresh()
 
 
@@ -1498,7 +1593,7 @@ async def _alert_check_loop() -> None:
     fetch_stats are sync, so run them off the event loop thread."""
     while True:
         await asyncio.sleep(_ALERT_CHECK_INTERVAL_SEC)
-        await asyncio.to_thread(fetch_stats)  # re-fetches the active window
+        await asyncio.to_thread(_check_alerts_light)
         _refresh_safely(alert_banner)
 
 
@@ -1538,8 +1633,9 @@ async def _compliance_loop() -> None:
     (governance.refresh_cache) is populated at startup -- the tab renders
     from that cache, never from network calls."""
     while True:
-        await asyncio.to_thread(governance.check_pending_rules)
-        await asyncio.sleep(_COMPLIANCE_INTERVAL_SEC)
+        result = await asyncio.to_thread(governance.check_pending_rules)
+        await asyncio.sleep(_COMPLIANCE_RETRY_SEC if result.get("transient")
+                            else _COMPLIANCE_INTERVAL_SEC)
 
 
 @ui.page("/")
@@ -1605,13 +1701,17 @@ async def main_page() -> None:
         maintenance_banner()
 
         async def _set_range(e) -> None:
-            print(f"[DEBUG _set_range] e.value={e.value} BEFORE STATE days={STATE.get('days')}", file=sys.stderr)
             STATE["days"] = e.value
             STATE["preset_days"] = e.value
             STATE["custom"] = None
-            print(f"[DEBUG _set_range] AFTER STATE days={STATE.get('days')}", file=sys.stderr)
-            await asyncio.to_thread(fetch_stats, STATE["days"])
-            refresh_all()
+            STATE["loading"] = True
+            try:
+                await asyncio.to_thread(fetch_stats, STATE["days"])
+                if STATE.get("active_tab") == "Supabase":
+                    await asyncio.to_thread(_prewarm_supabase)
+                refresh_all()
+            finally:
+                STATE["loading"] = False
 
         async def _apply_custom() -> None:
             start, end = start_date.value, end_date.value
@@ -1622,16 +1722,28 @@ async def main_page() -> None:
                 ui.notify("Start date must be on or before the end date", type="negative")
                 return
             STATE["custom"] = (start, end)
-            await asyncio.to_thread(fetch_stats)
-            refresh_all()
+            STATE["loading"] = True
+            try:
+                await asyncio.to_thread(fetch_stats)
+                if STATE.get("active_tab") == "Supabase":
+                    await asyncio.to_thread(_prewarm_supabase)
+                refresh_all()
+            finally:
+                STATE["loading"] = False
 
         async def _clear_custom() -> None:
             start_date.set_value(None)
             end_date.set_value(None)
             STATE["custom"] = None
             STATE["days"] = STATE.get("preset_days", 7)
-            await asyncio.to_thread(fetch_stats, STATE["days"])
-            refresh_all()
+            STATE["loading"] = True
+            try:
+                await asyncio.to_thread(fetch_stats, STATE["days"])
+                if STATE.get("active_tab") == "Supabase":
+                    await asyncio.to_thread(_prewarm_supabase)
+                refresh_all()
+            finally:
+                STATE["loading"] = False
 
         def _save_settings() -> None:
             alerts.set_daily_threshold(threshold_input.value)
@@ -1655,6 +1767,8 @@ async def main_page() -> None:
                 ui.label("Range:").classes("text-sm shrink-0")
                 ui.toggle({1: "Today", 7: "7d", 30: "30d", 90: "90d"}, value=STATE["days"],
                           on_change=lambda e: (_set_range(e))).props("dense").classes("shrink-0")
+                with ui.element("span").classes("shrink-0").bind_visibility_from(STATE, "loading")                         .mark("range-spinner"):
+                    ui.spinner(size="sm", color="primary")
                 custom_btn = ui.button("Custom", icon="calendar_month").props("dense flat").classes("shrink-0").mark("custom-toggle")
 
             # Threshold / budget — compact 1-line by default, click to edit (stays 1 line even on mobile)
@@ -1752,6 +1866,7 @@ async def main_page() -> None:
                     custom_btn.props("icon=calendar_month")
 
             custom_btn.on_click(_toggle_custom)
+        ui.linear_progress(show_value=False).props("indeterminate size=3px")             .classes("w-full absolute bottom-0 left-0")             .bind_visibility_from(STATE, "loading").mark("range-progress")
 
     with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2 p-4 pt-2"):
         dashboard_body()  # stays centered, scrolls under the full-width sticky bar
@@ -1787,8 +1902,9 @@ async def main_page() -> None:
     # from this one pattern before the fix.
     async with _page_load_fetch_lock:
         last_fetch = STATE.get("last_fetch")
-        page_load_stale = last_fetch is None or \
-            (dt.datetime.now(dt.timezone.utc) - last_fetch).total_seconds() > _PAGE_LOAD_FETCH_TTL_SEC
+        page_load_stale = last_fetch is None or (
+            not _is_bot_request() and
+            (dt.datetime.now(dt.timezone.utc) - last_fetch).total_seconds() > _PAGE_LOAD_FETCH_TTL_SEC)
         if page_load_stale:
             await asyncio.to_thread(fetch_stats)
     refresh_all()
