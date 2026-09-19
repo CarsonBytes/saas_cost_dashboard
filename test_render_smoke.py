@@ -58,8 +58,8 @@ async def test_supabase_tab_renders_meter_table(user: User):
     deck.STATE["active_tab"] = "Supabase"
     try:
         await user.open("/")
-        await user.should_see("Supabase requests by endpoint")
-        await user.should_see("source: state/supabase_meter.jsonl")
+        await user.should_see("Supabase requests by endpoint, all apps")
+        await user.should_see("source: meter_rollup")
         await user.should_see("Reported vs metered")
         assert _one(user, "supabase-meter-table") is not None
         assert _one(user, "reconciliation-line") is not None
@@ -94,13 +94,18 @@ async def test_project_filter_chip_appears(user: User):
 
 @MAIN
 async def test_incident_log_filter_narrows_rows(user: User):
-    await user.open("/")
-    await user.should_see("Incident log")
-    box = _one(user, "incident-filter")
-    _set(user, box, "zzz-no-match-zzz")   # fires on_change -> refresh -> filtered render
-    await user.should_see("(no matching incidents)")
-    _set(user, box, "")                   # clearing restores the unfiltered log
-    await user.should_not_see("(no matching incidents)")
+    import app as deck
+    deck.STATE["active_tab"] = "Reliability & Incidents"  # tabs are lazy: only the selected one is built
+    try:
+        await user.open("/")
+        await user.should_see("Incident log")
+        box = _one(user, "incident-filter")
+        _set(user, box, "zzz-no-match-zzz")   # fires on_change -> refresh -> filtered render
+        await user.should_see("(no matching incidents)")
+        _set(user, box, "")                   # clearing restores the unfiltered log
+        await user.should_not_see("(no matching incidents)")
+    finally:
+        deck.STATE["active_tab"] = "Overview"
 
 
 @MAIN
