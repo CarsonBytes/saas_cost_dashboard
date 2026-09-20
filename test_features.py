@@ -427,6 +427,38 @@ def test_ledger_rollup_returns_empty_without_table(monkeypatch, tmp_path):
     ledger.fetch_meter_rollup()
 
 
+def test_canon_app_never_emits_question_mark():
+    """Regression (2026-09-20): _APP_ALIASES.get(app or '?') or '?' mapped
+    EVERY non-aliased app to '?', so a day's study+dashboard traffic folded
+    and charted as one '?' series. Canon is identity except for aliases and
+    falsy/legacy-'?' (which are 'unknown', the labeled bucket the UI knows)."""
+    import ledger
+    assert ledger._canon_app("study") == "study"
+    assert ledger._canon_app("dashboard") == "dashboard"
+    assert ledger._canon_app("quant-paper") == "quant-paper"
+    assert ledger._canon_app("unknown") == "unknown"
+    assert ledger._canon_app("study-native") == "study"
+    assert ledger._canon_app(None) == "unknown"
+    assert ledger._canon_app("") == "unknown"
+    assert ledger._canon_app("?") == "unknown"
+    store = {"hours": {}}
+    ledger._fold_rollup_rows(store, [
+        {"ts": "2026-09-20T10:15:00+00:00", "app": "study", "endpoint": "GET questions",
+         "requests": 3, "bytes": 30},
+        {"ts": "2026-09-20T10:15:00+00:00", "app": "study-native", "endpoint": "GET topics",
+         "requests": 2, "bytes": 20},
+        {"ts": "2026-09-20T10:15:00+00:00", "app": None, "endpoint": "GET x",
+         "requests": 1, "bytes": 10,
+         "detail": {"host": "h", "pid": 1, "argv0": "p"}},
+    ])
+    keys = sorted(store["hours"])
+    assert keys == ["2026-09-20T10|study|GET questions",
+                    "2026-09-20T10|study|GET topics",
+                    "2026-09-20T10|unknown|GET x"]
+    assert store["hours"]["2026-09-20T10|study|GET topics"] == [2, 20]
+    assert store["udetail"]["2026-09-20T10|GET x"] == [{"host": "h", "pid": 1, "argv0": "p"}]
+
+
 def test_meter_rollup_posts_and_disables_on_404(_meter_isolated):
     import urllib.error
     import urllib.request

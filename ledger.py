@@ -87,12 +87,16 @@ def _save_rollup_store() -> None:
 # Retired meter labels, mapped to their canonical successor on read AND on
 # fold (spec 2026-09-20: study-native merged into study). Legacy hourly
 # cells keep their old keys on disk; the mapping below makes history
-# continuous without rewriting the store file.
+# continuous without rewriting the store file. Anything falsy (or a legacy
+# "?" from early folds) is "unknown" -- never "?" (an unlabeled bucket the
+# UI can't color or explain; see the Unlabeled-traffic card).
 _APP_ALIASES = {"study-native": "study"}
 
 
 def _canon_app(app: str | None) -> str:
-    return _APP_ALIASES.get(app or "?") or "?"
+    if not app or app == "?":
+        return "unknown"
+    return _APP_ALIASES.get(app, app)
 
 
 # `detail` column availability (migration 005): None = unprobed (request it
