@@ -47,6 +47,34 @@ except ValueError:
 # is not an ordered dependency.
 _rollup_disabled = False
 
+# Rollup-table `detail` column availability (dashboard migration 005):
+# None = unprobed (include detail optimistically), True = confirmed,
+# False = server rejected it (pre-005) -- remembered per process, detail
+# then stays local-file-only. See _flush_rollup().
+_ROLLUP_DETAIL_OK: bool | None = None
+
+
+def _unknown_detail() -> dict:
+    """Self-identifying fingerprint for UNLABELED traffic only (spec
+    2026-09-20): when APP == "unknown", flush lines/rollup rows carry
+    {host, pid, argv0} so the dashboard's Unlabeled-traffic card can point
+    at the actual process instead of a dead end. Labeled traffic returns {}
+    (zero extra bytes, zero new cardinality). Never raises."""
+    if APP != "unknown":
+        return {}
+    try:
+        import socket
+        host = socket.gethostname()
+    except Exception:  # noqa: BLE001
+        host = "?"
+    try:
+        import os as _os
+        import sys as _sys
+        return {"host": host, "pid": _os.getpid(),
+                "argv0": (_sys.argv[0] if _sys.argv else "?")[-80:]}
+    except Exception:  # noqa: BLE001
+        return {"host": host}
+
 
 def _rollup_table() -> str:
     return os.environ.get("SUPABASE_METER_ROLLUP_TABLE", "meter_rollup")
@@ -175,7 +203,11 @@ def _maybe_flush() -> None:
     if not _counts:
         return
     counts, byts = dict(_counts), dict(_bytes)
-    line = json.dumps({"ts": now, "app": APP, "counts": counts, "bytes": byts})
+    line = {"ts": now, "app": APP, "counts": counts, "bytes": byts}
+    detail = _unknown_detail()
+    if detail:
+        line["detail"] = detail
+    line = json.dumps(line)
     took = False
     if FILE:
         took = True
@@ -218,8 +250,15 @@ def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> b
 
     stdlib urllib (NOT httpx) so this module stays dependency-free -- and so
     the write itself never passes through a metered code path (no self-
-    counting). Never raises."""
-    global _rollup_disabled, _rollup_last_post
+    counting). Never raises.
+
+    `detail` (host/pid/argv0 for unknown-app traffic) rides along only when
+    the server has the column (dashboard migration 005): inclusion is
+    probe-and-remember per process (_ROLLUP_DETAIL_OK). A rejection naming
+    `detail` disables it for the rest of the process lifetime (pending rows
+    are kept and retried without it next tick); every other failure keeps
+    the old retry semantics."""
+    global _rollup_disabled, _rollup_last_post, _ROLLUP_DETAIL_OK
     if _rollup_disabled or _rollup_force_off():
         return False
     for ep, n in counts.items():
@@ -235,9 +274,11 @@ def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> b
     if not url or not key:
         return False
     import urllib.request
+    detail = _unknown_detail() if _ROLLUP_DETAIL_OK is not False else {}
     rows = [{"ts": dt.datetime.fromtimestamp(now, dt.timezone.utc).isoformat(),
              "app": APP, "endpoint": ep,
-             "requests": n, "bytes": _rollup_pending_bytes.get(ep, 0)}
+             "requests": n, "bytes": _rollup_pending_bytes.get(ep, 0),
+             **({"detail": detail} if detail else {})}
             for ep, n in _rollup_pending_counts.items()]
     try:
         req = urllib.request.Request(
@@ -257,6 +298,8 @@ def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> b
                 _rollup_last_post = now
                 _rollup_pending_counts.clear()
                 _rollup_pending_bytes.clear()
+                if detail:
+                    _ROLLUP_DETAIL_OK = True
                 return True
             return False  # non-2xx, non-404: leave pending, retry next tick
     except Exception as e:  # noqa: BLE001 -- never break the caller; a 404
@@ -268,6 +311,15 @@ def _flush_rollup(now: float, counts: dict[str, int], byts: dict[str, int]) -> b
             _rollup_disabled = True
             _rollup_pending_counts.clear()
             _rollup_pending_bytes.clear()
+        elif detail:
+            try:
+                body = e.read().decode("utf-8", "replace") if hasattr(e, "read") else ""
+            except Exception:  # noqa: BLE001
+                body = ""
+            if "detail" in body or "detail" in str(e):
+                # Pre-005 server: unknown `detail` key rejected. Remember,
+                # keep pending (retried without detail next tick).
+                _ROLLUP_DETAIL_OK = False
         return False
 
 

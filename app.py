@@ -299,7 +299,8 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
 
 
 _APP_COLORS = {"dashboard": "#7c3aed", "study": "#2563eb", "study-demo": "#60a5fa",
-               "study-native": "#93c5fd", "event-radar": "#9333ea", "quant": "#16a34a",
+               "study-native": "#93c5fd", "event-radar": "#9333ea", "event-radar-demo": "#a78bfa",
+               "quant": "#16a34a", "quant-paper": "#16a34a", "quant-live": "#dc2626",
                "spendlens": "#0d9488", "unknown": "#6b7280"}
 _APP_FALLBACK = ["#f59e0b", "#dc2626", "#db2777", "#0891b2"]
 
@@ -1567,6 +1568,49 @@ def _supabase_tab() -> None:
             .mark("egress-compare-table")
     else:
         ui.label("(no metered traffic in this window)").classes("text-sm text-grey")
+
+    # ---- 1c. unlabeled traffic (spec 2026-09-20) ------------------------------
+    # Rendered only when `unknown`-app rows exist in-window. Totals always
+    # come from the rollup output; host/pid/argv0 attribution comes from
+    # `details` (writers attach them post-005; settled pre-005 rows have
+    # none and are tagged unattributable rather than dropped).
+    _unknown_rows = [r for r in rollup_rows if (r.get("app") or "?") == "unknown"]
+    if _unknown_rows:
+        _u_req = sum(r.get("requests") or 0 for r in _unknown_rows)
+        _u_bytes = sum(r.get("bytes") or 0 for r in _unknown_rows)
+        _u_eps: dict[str, list] = {}
+        _u_srcs: dict[tuple, list] = {}
+        for r in _unknown_rows:
+            _cell = _u_eps.setdefault(r.get("endpoint") or "?", [0, 0])
+            _cell[0] += r.get("requests") or 0
+            _cell[1] += r.get("bytes") or 0
+            for d in r.get("details") or []:
+                _s = _u_srcs.setdefault(
+                    (d.get("host") or "?", d.get("argv0") or "?", d.get("pid") or "?"), [0, 0])
+                _s[0] += r.get("requests") or 0
+                _s[1] += r.get("bytes") or 0
+        with ui.card().classes("w-full mt-4 border-amber-300").mark("unlabeled-card"):
+            ui.label(f"Unlabeled traffic: {_u_req:,} requests, {_fmt_bytes(_u_bytes)} "
+                     f"({window_label}) -- no SUPABASE_METER_APP on the sending process(es). "
+                     f"See docs/meter-labels.md for the registry and fix.").classes("text-sm font-bold")
+            ui.table(columns=[{"name": "ep", "label": "Endpoint", "field": "ep"},
+                              {"name": "req", "label": "Requests", "field": "req"},
+                              {"name": "mb", "label": "MB", "field": "mb"}],
+                     rows=[{"ep": e, "req": n, "mb": round(b / 1e6, 2)}
+                           for e, (n, b) in sorted(_u_eps.items(), key=lambda kv: -kv[1][0])],
+                     row_key="ep").classes("w-full").props("dense")
+            if _u_srcs:
+                ui.label("Self-identified senders (host / process / pid):").classes("text-xs mt-2")
+                ui.table(columns=[{"name": "host", "label": "Host", "field": "host"},
+                                  {"name": "proc", "label": "Process", "field": "proc"},
+                                  {"name": "pid", "label": "PID", "field": "pid"}],
+                         rows=[{"host": h, "proc": p, "pid": pid}
+                               for (h, p, pid) in sorted(_u_srcs)],
+                         row_key="pid").classes("w-full").props("dense")
+            else:
+                ui.label("Senders unattributable (pre-005 rows or settled history without "
+                         "fingerprints) -- run migrations/005_meter_rollup_detail.sql and "
+                         "re-emit to identify them.").classes("text-xs text-grey-6 mt-2")
 
     # ---- 2. cross-project rollup -------------------------------------------
     ui.label(f"Metered traffic by app x endpoint ({window_label})").classes("text-sm font-bold mt-4")

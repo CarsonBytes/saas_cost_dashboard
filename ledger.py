@@ -84,12 +84,45 @@ def _save_rollup_store() -> None:
         pass
 
 
+# Retired meter labels, mapped to their canonical successor on read AND on
+# fold (spec 2026-09-20: study-native merged into study). Legacy hourly
+# cells keep their old keys on disk; the mapping below makes history
+# continuous without rewriting the store file.
+_APP_ALIASES = {"study-native": "study"}
+
+
+def _canon_app(app: str | None) -> str:
+    return _APP_ALIASES.get(app or "?") or "?"
+
+
+# `detail` column availability (migration 005): None = unprobed (request it
+# optimistically), True = confirmed, False = pre-005 server (a 400 naming
+# `detail`), remembered per process.
+_ROLLUP_SELECT_WITH_DETAIL: bool | None = None
+
+
+def _rollup_select() -> str:
+    base = "ts,app,endpoint,requests,bytes"
+    return base + ",detail" if _ROLLUP_SELECT_WITH_DETAIL is not False else base
+
+
 def _fold_rollup_rows(store: dict, rows: list[dict]) -> None:
+    udetail = store.setdefault("udetail", {})
     for r in rows:
         hour = _hour_floor(_utc(r["ts"])).strftime("%Y-%m-%dT%H")
-        cell = store["hours"].setdefault(f"{hour}|{r.get('app') or '?'}|{r.get('endpoint') or '?'}", [0, 0])
+        cell = store["hours"].setdefault(
+            f"{hour}|{_canon_app(r.get('app'))}|{r.get('endpoint') or '?'}", [0, 0])
         cell[0] += r.get("requests") or 0
         cell[1] += r.get("bytes") or 0
+        detail = r.get("detail")
+        if isinstance(detail, dict) and _canon_app(r.get("app")) == "unknown":
+            # Attribution for unlabeled traffic must survive hour-settling
+            # (folded cells keep only totals). Bounded: last 5 fingerprints
+            # per hour x endpoint; unknown rows are rare by design.
+            bucket = udetail.setdefault(f"{hour}|{r.get('endpoint') or '?'}", [])
+            if detail not in bucket:
+                bucket.append(detail)
+                del bucket[:-5]
 
 
 def _fetch_rollup_range(start: dt.datetime, end: dt.datetime | None = None) -> list[dict] | None:
@@ -98,8 +131,10 @@ def _fetch_rollup_range(start: dt.datetime, end: dt.datetime | None = None) -> l
     this pages by offset over a total ordering. None = failed/table missing."""
     if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
         return None
+    global _ROLLUP_SELECT_WITH_DETAIL
+    select = _rollup_select()
     params_base: list[tuple[str, str]] = [
-        ("select", "ts,app,endpoint,requests,bytes"),
+        ("select", select),
         ("ts", f"gte.{start.isoformat()}"),
     ]
     if end is not None:
@@ -107,16 +142,43 @@ def _fetch_rollup_range(start: dt.datetime, end: dt.datetime | None = None) -> l
     params_base.append(("order", "ts.asc,app.asc,endpoint.asc,requests.asc,bytes.asc"))
     headers = {"apikey": SUPABASE_SERVICE_ROLE_KEY,
                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}
+
+    def _page(offset: int):
+        resp = httpx.get(f"{SUPABASE_URL}/rest/v1/meter_rollup",
+                         params=params_base + [("limit", "1000"), ("offset", str(offset))],
+                         headers=headers, timeout=15)
+        supabase_meter.record("GET", "meter_rollup", supabase_meter.response_bytes(resp))
+        return resp
+
     rows: list[dict] = []
     offset = 0
     try:
         while True:
-            resp = httpx.get(f"{SUPABASE_URL}/rest/v1/meter_rollup",
-                             params=params_base + [("limit", "1000"), ("offset", str(offset))],
-                             headers=headers, timeout=15)
-            supabase_meter.record("GET", "meter_rollup", supabase_meter.response_bytes(resp))
+            resp = _page(offset)
             if resp.status_code == 404:
                 return None
+            if resp.status_code == 400 and _ROLLUP_SELECT_WITH_DETAIL is None:
+                try:
+                    body = resp.json()
+                except Exception:  # noqa: BLE001
+                    body = None
+                if "detail" in str(body):
+                    # Pre-005 server has no `detail` column: remember, retry
+                    # this page without it, continue.
+                    _ROLLUP_SELECT_WITH_DETAIL = False
+                    params_base[0] = ("select", _rollup_select())
+                    resp = _page(offset)
+                    if resp.status_code == 404:
+                        return None
+                    resp.raise_for_status()
+                    batch = resp.json()
+                    rows.extend(batch)
+                    if len(batch) < 1000:
+                        return rows
+                    offset += len(batch)
+                    continue
+            elif _ROLLUP_SELECT_WITH_DETAIL is None and resp.status_code < 400:
+                _ROLLUP_SELECT_WITH_DETAIL = True
             resp.raise_for_status()
             batch = resp.json()
             rows.extend(batch)
@@ -179,16 +241,26 @@ def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = Non
         _save_rollup_store()
 
     out: list[dict] = []
+    udetail = store.get("udetail") or {}
     for key, (n, b) in store["hours"].items():
         hour, app, endpoint = key.split("|", 2)
         h = dt.datetime.strptime(hour, "%Y-%m-%dT%H").replace(tzinfo=dt.timezone.utc)
         if h >= since_h and (until is None or h < until):
+            # Legacy cells may predate _APP_ALIASES; map on read so history
+            # stays continuous without rewriting the store file.
+            app = _canon_app(app)
             out.append({"ts": h.isoformat(), "app": app, "endpoint": endpoint,
-                        "requests": n, "bytes": b})
+                        "requests": n, "bytes": b,
+                        "details": list(udetail.get(f"{hour}|{endpoint}", []))
+                        if app == "unknown" else []})
     for r in _ROLLUP_CACHE["rows"]:
         t = _utc(r["ts"])
         if t >= since and (until is None or t < until):
-            out.append(r)
+            detail = r.get("detail")
+            app = _canon_app(r.get("app"))
+            out.append({"ts": r["ts"], "app": app, "endpoint": r.get("endpoint"),
+                        "requests": r.get("requests"), "bytes": r.get("bytes"),
+                        "details": [detail] if isinstance(detail, dict) else []})
     return out
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
