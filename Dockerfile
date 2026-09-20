@@ -16,7 +16,12 @@ FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142
 # Official static uv binary (same pinned digest as quant/event-radar, for the
 # same shared-cache reason), not `pip install uv` or a curl installer -- avoids
 # needing network access mid-build just to fetch the installer.
-COPY --from=ghcr.io/astral-sh/uv@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc /uv /uvx /usr/local/bin/
+# CHANGED 2026-09-20: ghcr.io unreachable from WSL2 (TLS handshake timeout,
+# same outage that forced study-platform's identical workaround on 2026-09-15),
+# so the uv/uvx binaries are vendored in the build context (copied from
+# study-platform's own pinned copy; gitignored, rsync-synced to WSL like the
+# rest of the working copy) instead of COPY --from the registry image.
+COPY uv uvx /usr/local/bin/
 
 WORKDIR /app
 

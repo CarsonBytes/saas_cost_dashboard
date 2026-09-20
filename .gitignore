@@ -14,3 +14,9 @@ state/
 noc_state.json
 alert_state.json
 alert_settings.json
+
+# Vendored uv/uvx binaries for the Docker build (ghcr.io unreachable from
+# WSL2 -- same workaround as study-platform). Build-context-only: rsynced to
+# WSL by the deploy script, never committed (38 MB).
+uv
+uvx
