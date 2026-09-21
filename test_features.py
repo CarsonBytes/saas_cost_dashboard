@@ -743,3 +743,41 @@ def test_egress_series_buckets_by_app_and_fills_gaps():
     week = deck._egress_series(rows, start, start + dt.timedelta(days=7), now=start + dt.timedelta(days=7))
     assert len(week["labels"]) == 7 and week["labels"][0] == "09-17"      # daily beyond 2 days
     assert week["apps"]["a"]["req"][0] == 6
+
+
+# ---------------------------------------------------------------------------
+# Dockerfile completeness — prevent regressions like 2026-09-22 where a new
+# .py module (cache.py) was committed but omitted from the Dockerfile COPY,
+# causing ModuleNotFoundError on deploy.
+# ---------------------------------------------------------------------------
+def test_dockerfile_covers_all_top_level_py_files():
+    """Every runtime *.py file in the repo root must be listed in the
+    Dockerfile's COPY instruction so the Docker image has all imports
+    available. Test-only files (test_*, conftest, deck_test_main) are
+    excluded — they never run inside the container."""
+    from pathlib import Path
+    root = Path(__file__).parent
+    dockerfile = root / "Dockerfile"
+    if not dockerfile.exists():
+        pytest.skip("no Dockerfile")
+    copy_line = ""
+    for line in dockerfile.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("COPY") and stripped.endswith("./"):
+            copy_line = stripped
+            break
+    assert copy_line, "no COPY *.py ... ./ line found in Dockerfile"
+    copied = {
+        f for f in copy_line.removeprefix("COPY ").removesuffix(" ./").split()
+        if f.endswith(".py")
+    }
+    _SKIP_PREFIXES = ("test_", "conftest")
+    _SKIP_NAMES = {"deck_test_main.py"}
+    on_disk = {
+        f.name for f in root.iterdir()
+        if f.suffix == "py"
+        and not any(f.name.startswith(p) for p in _SKIP_PREFIXES)
+        and f.name not in _SKIP_NAMES
+    }
+    missing = on_disk - copied
+    assert not missing, f"files on disk but missing from Dockerfile COPY: {missing}"
