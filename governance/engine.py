@@ -36,7 +36,7 @@ import time
 import httpx
 
 import alerts
-import ledger  # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / to_hkt
+import ledger  # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / to_hkt / caches
 import services  # business_impact for the report's risk overview
 import supabase_meter  # per-endpoint REST call counts (flush target set by ledger)
 
@@ -251,28 +251,42 @@ def _parse_ts(value: str | None) -> dt.datetime | None:
         return None
 
 
+_GOV_RULES_SELECT = "id,rule_name,status,enforcement_deadline,agent_slug,auto_action,condition_json,action_type,created_at"
+_GOV_AUDIT_SELECT = "id,created_at,rule_id,action_taken,actor,metadata"
+
+
 def fetch_rules(statuses: tuple[str, ...] = ("PENDING", "OVERDUE")) -> list[dict]:
-    """Active rules (default: PENDING + OVERDUE), soonest deadline first."""
-    if statuses:
-        return _get("governance_rules",
-                    {"select": "*", "status": f"in.({','.join(statuses)})",
-                     "order": "enforcement_deadline.asc"}) or []
-    return _get("governance_rules", {"select": "*", "order": "enforcement_deadline.asc"}) or []
+    """Active rules (default: PENDING + OVERDUE), soonest deadline first.
+    Cached for 30 min via ledger._RULES_CACHE (rules change rarely)."""
+    cache_key = f"rules:{','.join(sorted(statuses)) if statuses else 'all'}"
+
+    def _load() -> list[dict]:
+        if statuses:
+            return _get("governance_rules",
+                        {"select": _GOV_RULES_SELECT, "status": f"in.({','.join(statuses)})",
+                         "order": "enforcement_deadline.asc"}) or []
+        return _get("governance_rules", {"select": _GOV_RULES_SELECT, "order": "enforcement_deadline.asc"}) or []
+
+    return ledger._RULES_CACHE.get(cache_key, _load)
 
 
 def get_audit_log(limit: int = 50, rules_by_id: dict | None = None) -> list[dict]:
     """Most recent audit rows first, with the rule name resolved (we resolve
     it in Python rather than embedding via PostgREST to avoid a 400 if the FK
-    relationship isn't exposed)."""
-    rows = _get("governance_audit_log",
-                {"select": "*", "order": "created_at.desc", "limit": str(limit)}) or []
-    if not rows:
+    relationship isn't exposed). Cached for 5 min via ledger._AUDIT_CACHE."""
+
+    def _load() -> list[dict]:
+        rows = _get("governance_audit_log",
+                     {"select": _GOV_AUDIT_SELECT, "order": "created_at.desc", "limit": str(limit)}) or []
+        if not rows:
+            return rows
+        rules = rules_by_id if rules_by_id is not None else {
+            r["id"]: r["rule_name"] for r in _get("governance_rules", {"select": "id,rule_name"}) or []}
+        for row in rows:
+            row["rule_name"] = rules.get(row.get("rule_id"), row.get("rule_id") or "—")
         return rows
-    rules = rules_by_id if rules_by_id is not None else {
-        r["id"]: r["rule_name"] for r in _get("governance_rules", {"select": "id,rule_name"}) or []}
-    for row in rows:
-        row["rule_name"] = rules.get(row.get("rule_id"), row.get("rule_id") or "—")
-    return rows
+
+    return ledger._AUDIT_CACHE.get(f"audit:{limit}", _load)
 
 
 def _audit(rule_id: str | None, action: str, actor: str, metadata: dict) -> bool:
@@ -456,7 +470,12 @@ def _check_pending_rules() -> dict:
             matched.append(rule["rule_name"])
     # Reuse this cycle's single rules read for the UI snapshot unless the
     # cycle itself changed rules (status flips / newly ingested rows).
-    refresh_cache(None if (flipped or ingested) else all_rules)
+    if flipped or ingested:
+        ledger._RULES_CACHE.clear()
+        ledger._AUDIT_CACHE.clear()
+        refresh_cache(None)
+    else:
+        refresh_cache(all_rules)
     return {"ok": True, "rules_checked": len(rules), "overdue": flipped,
             "matched": matched, "ingested": ingested}
 
@@ -466,6 +485,9 @@ def mark_complied(rule_id: str, actor: str = "dashboard") -> bool:
     ok = _patch("governance_rules", rule_id, {"status": "COMPLIED"})
     if ok:
         _audit(rule_id, "MANUAL_OVERRIDE", actor, {"to": "COMPLIED"})
+        # Invalidate caches so the tab reflects the change on next render
+        ledger._RULES_CACHE.clear()
+        ledger._AUDIT_CACHE.clear()
     refresh_cache()  # so the tab reflects the change on its next render
     return ok
 
@@ -486,8 +508,8 @@ def build_report() -> str:
         "## 1. Current risk overview",
     ]
     try:
-        active = fetch_rules()
-        all_rules = _get("governance_rules", {"select": "*"}) or []
+        all_rules = _get("governance_rules", {"select": _GOV_RULES_SELECT}) or []
+        active = [r for r in all_rules if r.get("status") in ("PENDING", "OVERDUE")]
         pending = sum(1 for r in all_rules if r.get("status") == "PENDING")
         overdue = sum(1 for r in all_rules if r.get("status") == "OVERDUE")
         complied = sum(1 for r in all_rules if r.get("status") == "COMPLIED")
@@ -501,10 +523,11 @@ def build_report() -> str:
         ]
     except Exception:                                    # noqa: BLE001
         log.exception("governance: report risk overview failed")
+        active = []
 
     lines += ["", "## 2. Compliance board"]
     try:
-        for r in fetch_rules():
+        for r in active:
             slug = r.get("agent_slug") or "(global)"
             lines.append(f"- **{r['rule_name']}** [{r['status']}] -- agent: {slug}")
     except Exception:                                    # noqa: BLE001
@@ -528,7 +551,8 @@ def build_report() -> str:
     lines += ["", "## 4. Audit trail (30 days)"]
     try:
         audit = _get("governance_audit_log",
-                     {"select": "*", "created_at": f"gte.{(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()}",
+                     {"select": "id,created_at,rule_id,action_taken,actor",
+                      "created_at": f"gte.{(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()}",
                       "order": "created_at.desc", "limit": "100"}) or []
         if audit:
             names = {r["id"]: r["rule_name"] for r in (_get("governance_rules", {"select": "id,rule_name"}) or [])}

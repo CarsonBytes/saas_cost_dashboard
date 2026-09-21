@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 
 import services  # business_impact / project_tag for the risk-ledger scan scope
 import supabase_meter
+from cache import ReadThroughCache
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -43,6 +44,12 @@ supabase_meter.configure(app="dashboard",
 def supabase_meter_snapshot() -> dict[str, int]:
     """This process's unflushed per-endpoint counts (Reliability-tab readout)."""
     return supabase_meter.snapshot()
+
+
+# Read-through caches: TTL in seconds. Callers never hit Supabase on cache hit.
+_SUMMARY_CACHE = ReadThroughCache(ttl=300)  # 5 min for today's cost
+_RULES_CACHE = ReadThroughCache(ttl=1800)  # 30 min for governance rules (rarely change)
+_AUDIT_CACHE = ReadThroughCache(ttl=300)  # 5 min for audit log
 
 
 _ROLLUP_CACHE: dict = {"ts": 0.0, "rows": [], "key": ""}
@@ -76,6 +83,13 @@ def _load_rollup_store() -> dict:
 
 
 def _save_rollup_store() -> None:
+    # Prune entries older than 30 days to keep the local file bounded
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).strftime("%Y-%m-%dT%H")
+    _rollup_store["hours"] = {k: v for k, v in _rollup_store["hours"].items()
+                              if k.split("|", 1)[0] >= cutoff}
+    udetail = _rollup_store.get("udetail") or {}
+    _rollup_store["udetail"] = {k: v for k, v in udetail.items()
+                                if k.split("|", 1)[0] >= cutoff}
     try:
         tmp = _ROLLUP_STORE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(_rollup_store), encoding="utf-8")
@@ -453,6 +467,35 @@ def _fetch_rows_window(start_utc: dt.datetime, end_utc: dt.datetime | None = Non
     return rows
 
 
+def today_cost_from_summary() -> float | None:
+    """Today's total cost from `llm_daily_summary` -- a single fixed-size row
+    read instead of paginating today's raw llm_calls. None if the table doesn't
+    exist or Supabase is unreachable. Cached for 5 min via _SUMMARY_CACHE."""
+    today_hkt = dt.datetime.now(_HKT).strftime("%Y-%m-%d")
+
+    def _load() -> float | None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            return None
+        try:
+            resp = httpx.get(
+                f"{SUPABASE_URL}/rest/v1/llm_daily_summary",
+                params={"select": "total_cost_usd", "day": f"eq.{today_hkt}", "limit": "1"},
+                headers={"apikey": SUPABASE_SERVICE_ROLE_KEY,
+                         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+                timeout=8,
+            )
+            supabase_meter.record("GET", "llm_daily_summary", supabase_meter.response_bytes(resp))
+            if resp.status_code == 200:
+                rows = resp.json()
+                if rows:
+                    return float(rows[0].get("total_cost_usd") or 0)
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    return _SUMMARY_CACHE.get(f"today_cost:{today_hkt}", _load)
+
+
 def fetch_today_rows() -> list[dict]:
     """Today's (HKT) calls with only the two columns the daily-threshold alert
     needs -- the background alert loop used to re-download the whole active
@@ -739,8 +782,11 @@ def _injection_flag(text: str) -> str | None:
 
 def _input_text_available() -> bool:
     """Feature-detect the `input_text` column once per process. It does not
-    exist today, so the scan stays dormant until agents start logging prompts."""
+    exist today, so the scan stays dormant until agents start logging prompts.
+    Once confirmed present, the probe is latched -- no more queries."""
     global _input_text_cache
+    if _input_text_cache is True:
+        return True
     if _input_text_cache is None:
         try:
             resp = httpx.get(f"{SUPABASE_URL}/rest/v1/llm_calls",

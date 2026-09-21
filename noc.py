@@ -551,9 +551,20 @@ def _auto_unlock_decision(meta: dict, now: dt.datetime, deps_stable: bool) -> st
                   re-evaluate next cycle; unlocking into a known-down
                   Supabase/LLM API would just manufacture another restart.
     Pure -- testable without state files."""
-    if not meta or meta.get("sticky") or not meta.get("locked_at"):
+    if not meta or meta.get("sticky"):
         return None
-    locked_at = dt.datetime.fromisoformat(meta["locked_at"])
+    locked_at_str = meta.get("locked_at")
+    if not locked_at_str:
+        # Legacy lock (pre-Phase-5): no locked_at timestamp -- can't schedule
+        # a supervised recovery. Bootstrap the metadata so the standard
+        # cooldown path takes over from next cycle onward instead of requiring
+        # manual operator intervention (FOUND LIVE 2026-08-26: the deployed
+        # state file held a pre-Phase-5 lock that was permanently stuck).
+        meta["locked_at"] = now.isoformat()
+        meta["strikes"] = 1
+        meta["sticky"] = False
+        return None  # will evaluate normally on the next cycle
+    locked_at = dt.datetime.fromisoformat(locked_at_str)
     if locked_at.tzinfo is None:
         locked_at = locked_at.replace(tzinfo=dt.timezone.utc)
     cooldown = _LOCK_BASE_COOLDOWN_SEC * (2 ** (meta.get("strikes", 1) - 1))

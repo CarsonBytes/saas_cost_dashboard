@@ -169,11 +169,14 @@ _FETCH_CACHE: dict = {}
 
 
 def _check_alerts_light() -> None:
-    """Daily-threshold check for the background loop: today's cost only
-    (2 columns, ~today's rows) instead of re-fetching the whole active window.
-    The threshold is a global today figure, so nothing else is needed."""
+    """Daily-threshold check for the background loop: tries the O(1)
+    llm_daily_summary first (single row read), falls back to raw today rows
+    (2 columns) if the summary table doesn't exist."""
     try:
-        STATE["alert"] = alerts.run_check(ledger.today_cost(ledger.fetch_today_rows()))
+        cost = ledger.today_cost_from_summary()
+        if cost is None:
+            cost = ledger.today_cost(ledger.fetch_today_rows())
+        STATE["alert"] = alerts.run_check(cost)
     except Exception:  # noqa: BLE001
         log.exception("alert check failed")
 
