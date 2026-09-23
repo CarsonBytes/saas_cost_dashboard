@@ -128,6 +128,7 @@ SERVICES = [
         "project_tag": "quant",
         "environment_tag": "paper",     # shares project_tag "quant" with Live -- split by environment
         "freshness_sec": 900,          # writes every ~1min during market hours
+        "freshness_ibkr_competing_sec": 7200,  # IBKR error 10197 blocks market data when Live has an active session; scan loop can't write fresh data. 2h tolerance avoids false-stale lock (ADDED 2026-09-23)
         "market_hours_only": True,     # no new scans expected outside the NYSE session
         "restart_on_staleness": True,  # enforced scan loop -- a stalled loop is a real fault
         "enforced_cadence": True,      # matches restart_on_staleness here -- display + restart agree

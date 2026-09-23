@@ -357,7 +357,15 @@ def _readiness(svc: dict, now: dt.datetime, last_restart: float | None,
     if last.tzinfo is None:
         last = last.replace(tzinfo=dt.timezone.utc)
     age_h = (now.astimezone(dt.timezone.utc) - last).total_seconds() / 3600
-    if age_h * 3600 > svc["freshness_sec"]:
+    # IBKR competing-session tolerance (ADDED 2026-09-23): Quant Paper's
+    # scan loop can't write fresh LLM data when IBKR error 10197 blocks
+    # market data (Live has an active session). The dashboard IS running
+    # (liveness OK) but the data is stale through no fault of its own.
+    # Use the longer of freshness_sec and freshness_ibkr_competing_sec
+    # to avoid a false-stale → restart → lock cycle.
+    effective_freshness = max(svc["freshness_sec"],
+                              svc.get("freshness_ibkr_competing_sec", 0))
+    if age_h * 3600 > effective_freshness:
         return "stale", f"last write {age_h:.1f}h ago"
     return "ok", ""
 
