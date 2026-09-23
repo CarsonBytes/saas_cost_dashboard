@@ -131,7 +131,8 @@ SERVICES = [
         "market_hours_only": True,     # no new scans expected outside the NYSE session
         "restart_on_staleness": True,  # enforced scan loop -- a stalled loop is a real fault
         "enforced_cadence": True,      # matches restart_on_staleness here -- display + restart agree
-        "restart_lock_count": 5,       # paper's IB Gateway sidecar creates occasional blips; 3 is too tight
+        "restart_lock_count": 3,       # 3 restarts within 1 hour = lock (was 5; lowered 2026-09-23: escalating grace already slows the cycle, so 3 is the right threshold for operator attention)
+        "liveness_streak_required": 3,  # sidecar restarts cause 1-2 cycle blips; 3 consecutive misses = genuine problem
         "container": "quant-dashboard-docker",
         "quarantinable": True,  # manual pause is an operator call, never automatic
     },

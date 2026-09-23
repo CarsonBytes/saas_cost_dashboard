@@ -277,11 +277,14 @@ def _update_dep_streak(dep: str, healthy: bool) -> int:
     return _DEPS_STREAK[dep]
 
 
-def _dep_confirmed_down(streak: int) -> bool:
+def _dep_confirmed_down(streak: int, threshold: int = 2) -> bool:
     """Blocked-by (and restart suppression) requires the dependency to be down
-    for >=2 consecutive cycles -- a single flaky probe read no longer flips
-    the badge on and off."""
-    return streak <= -2
+    for >=threshold consecutive cycles -- a single flaky probe read no longer
+    flips the badge on and off. `threshold` is per-agent via
+    `liveness_streak_required` (ADDED 2026-09-23): Quant Paper's IB Gateway
+    sidecar causes 1-2 cycle blips on routine 2FA restarts; the default of 2
+    is too tight for that agent."""
+    return streak <= -threshold
 
 
 def _dep_confirmed_healthy(streak: int) -> bool:
@@ -457,6 +460,19 @@ def _restart_count(state: dict, name: str, now: dt.datetime) -> int:
     return sum(1 for ts in state.get("restarts", {}).get(name, []) if ts >= window)
 
 
+def _restart_grace_sec(restarts: list[float]) -> float:
+    """Escalating cool-down after each restart: 5 min, 10 min, 20 min, etc.
+    Prevents rapid restart cycles (ADDED 2026-09-23): Quant Paper's IB
+    Gateway sidecar causes periodic blips; a static 5-min grace lets the
+    dashboard restart, recover, then immediately restart again when the
+    sidecar cycles. Escalating grace forces longer pauses between repeated
+    restarts, giving the sidecar time to stabilize."""
+    n = len(restarts)
+    if n <= 1:
+        return _RESTART_GRACE_SEC
+    return _RESTART_GRACE_SEC * (2 ** (n - 1))
+
+
 def _restart_eligible(svc: dict, now: dt.datetime, state: dict,
                       compliance: dict[str, list[str]] | None = None,
                       liveness_failure: bool = False) -> bool:
@@ -488,8 +504,10 @@ def _restart_eligible(svc: dict, now: dt.datetime, state: dict,
     if not liveness_failure and svc.get("market_hours_only") and not nyse_session_open(now):
         return False
     restarts = state.get("restarts", {}).get(svc["name"], [])
-    if restarts and now.timestamp() - restarts[-1] < _RESTART_GRACE_SEC:
-        return False
+    if restarts:
+        grace = _restart_grace_sec(restarts)
+        if now.timestamp() - restarts[-1] < grace:
+            return False
     return True
 
 
@@ -1022,11 +1040,16 @@ def _refresh_health() -> None:
         # Same flapping guard as the shared-dependency one below, applied per
         # agent to its own liveness probe (ADDED 2026-09-05, see
         # _LIVENESS_STREAK's docstring) -- a single missed probe no longer
-        # authorizes a restart on its own.
+        # authorizes a restart on its own. Per-agent threshold via
+        # liveness_streak_required (ADDED 2026-09-23): Quant Paper's
+        # sidecar causes 1-2 cycle blips; default 2 is too tight.
         liveness_streaks = {name: _update_liveness_streak(name, up)
                             for name, up in up_map.items()}
-        liveness_confirmed_down_map = {name: _dep_confirmed_down(s)
-                                       for name, s in liveness_streaks.items()}
+        _svc_by_name = {s["name"]: s for s in monitored}
+        liveness_confirmed_down_map = {
+            name: _dep_confirmed_down(s, _svc_by_name[name].get("liveness_streak_required", 2))
+            for name, s in liveness_streaks.items()
+        }
 
         dep_results = _dependency_probe_results()
         dep_streaks = {dep: _update_dep_streak(dep, ok) for dep, ok in dep_results.items()}
