@@ -58,7 +58,7 @@ async def test_supabase_tab_renders_meter_table(user: User):
     deck.STATE["active_tab"] = "Supabase"
     try:
         await user.open("/")
-        await user.should_see("Supabase requests by endpoint, all apps")
+        await user.should_see("Supabase HTTP requests by endpoint, all apps")
         await user.should_see("source: meter_rollup")
         await user.should_see("Reported vs metered")
         assert _one(user, "supabase-meter-table") is not None

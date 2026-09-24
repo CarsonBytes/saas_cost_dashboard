@@ -282,7 +282,8 @@ def _delta_sub(current: float, previous: float | None, *, lower_is_better: bool 
     return label, "text-grey-6"
 
 
-def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = None) -> None:
+def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = None,
+               y_name: str = "calls") -> None:
     if not rows:
         ui.label("(no data in this range)").classes("text-sm text-grey")
         return
@@ -294,7 +295,7 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
     ui.echart({
         "tooltip": {"trigger": "axis"},
         "xAxis": {"type": "category", "data": labels, "axisLabel": {"fontSize": 10, "rotate": 20}},
-        "yAxis": {"type": "value", "name": "calls"},
+        "yAxis": {"type": "value", "name": y_name},
         "series": [{"type": "bar", "data": [r["calls"] for r in rows],
                     "itemStyle": {"color": "#2563eb"}}],
         "grid": {"left": 50, "right": 20, "top": 20, "bottom": 60},
@@ -1154,7 +1155,7 @@ def dashboard_body() -> None:
     selected tab now has nothing destructive happening to it on refresh,
     rather than relying on state-restoration timing to survive one."""
     _data_status()
-    tab_names = ["Overview", "Cost & Usage", "Reliability & Incidents", "Governance", "Supabase"]
+    tab_names = ["Overview", "Supabase", "Cost & Usage", "Reliability & Incidents", "Governance"]
     with ui.tabs().classes("w-full") as tabs:
         tab_objs = {}
         for name in tab_names:
@@ -1256,7 +1257,7 @@ def _overview_tab() -> None:
         d_cost = _delta_sub(data["total_cost_usd"], prev and prev["cost_usd"], lower_is_better=True)
         d_ptok = _delta_sub(data["total_prompt_tokens"], prev and prev["prompt_tokens"])
         d_ctok = _delta_sub(data["total_completion_tokens"], prev and prev["completion_tokens"])
-        _kpi("Total calls", f"{data['total_calls']:,}", sub=d_calls and d_calls[0],
+        _kpi("LLM calls", f"{data['total_calls']:,}", sub=d_calls and d_calls[0],
              sub_cls=d_calls and d_calls[1], spark=calls_spark)
         _kpi("Total cost", f"${data['total_cost_usd']:.4f}", sub=d_cost and d_cost[0],
              sub_cls=d_cost and d_cost[1], spark=cost_spark)
@@ -1337,10 +1338,10 @@ def _overview_tab() -> None:
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("By project").classes("text-sm font-bold")
-            _bar_chart(data["by_project"], "project")
+            _bar_chart(data["by_project"], "project", y_name="LLM calls")
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("By provider (chatanywhere vs deepseek fallback in action)").classes("text-sm font-bold")
-            _bar_chart(data["by_provider"], "provider")
+            _bar_chart(data["by_provider"], "provider", y_name="LLM calls")
 
 
 @ui.refreshable
@@ -1351,21 +1352,21 @@ def _cost_tab() -> None:
         return
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
         with ui.column().classes("grow min-w-[300px]"):
-            ui.label("By model").classes("text-sm font-bold")
-            _bar_chart(data["by_model"], "model")
+            ui.label("LLM calls by model").classes("text-sm font-bold")
+            _bar_chart(data["by_model"], "model", y_name="LLM calls")
         with ui.column().classes("grow min-w-[300px]"):
-            ui.label("By project & environment").classes("text-sm font-bold")
-            _bar_chart(data["by_environment"], "project", ["environment"])
+            ui.label("LLM calls by project & environment").classes("text-sm font-bold")
+            _bar_chart(data["by_environment"], "project", ["environment"], y_name="LLM calls")
 
     with ui.row().classes("w-full items-center justify-between mt-4 flex-wrap gap-2"):
-        ui.label("Model usage by project & call type").classes("text-sm font-bold")
+        ui.label("LLM model usage by project & call type").classes("text-sm font-bold")
         ui.button("Download CSV", icon="download",
                   on_click=lambda: _download_model_usage_csv(data)).props("flat dense")
     model_cols = [
         {"name": "project", "label": "Project", "field": "project", "sortable": True},
         {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
         {"name": "model", "label": "Model", "field": "model", "sortable": True},
-        {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+        {"name": "calls", "label": "LLM calls", "field": "calls", "sortable": True},
         {"name": "cost_usd", "label": "Cost (USD)", "field": "cost_usd", "sortable": True},
     ]
     model_rows = [{**r, "cost_usd": f"{r['cost_usd']:.4f}",
@@ -1390,15 +1391,15 @@ def _cost_tab() -> None:
                 .classes("text-sm text-amber-900")
 
     with ui.row().classes("w-full items-center justify-between mt-4"):
-        ui.label("Call types by project").classes("text-sm font-bold")
+        ui.label("LLM call types by project").classes("text-sm font-bold")
         ui.button("Download CSV", icon="download", on_click=lambda: _download_call_types_csv(data)) \
             .props("flat dense")
     cols = [
         {"name": "project", "label": "Project", "field": "project", "sortable": True},
         {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
-        {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+        {"name": "calls", "label": "LLM calls", "field": "calls", "sortable": True},
         {"name": "cost_usd", "label": "Cost (USD)", "field": "cost_usd", "sortable": True},
-        {"name": "cost_per_call", "label": "$/call", "field": "cost_per_call", "sortable": True},
+        {"name": "cost_per_call", "label": "$/LLM call", "field": "cost_per_call", "sortable": True},
         {"name": "prompt_tokens", "label": "Prompt tok", "field": "prompt_tokens", "sortable": True},
         {"name": "completion_tokens", "label": "Completion tok", "field": "completion_tokens", "sortable": True},
     ]
@@ -1415,7 +1416,7 @@ def _reliability_tab() -> None:
         ui.label("Loading…").classes("text-sm text-grey")
         return
     with ui.row().classes("w-full items-center justify-between flex-wrap gap-2"):
-        ui.label("Slowest call types (avg latency)").classes("text-sm font-bold")
+        ui.label("Slowest LLM call types (avg latency)").classes("text-sm font-bold")
         if ledger.latency_ranking(data["by_call_type"]):
             ui.button("Download CSV", icon="download",
                       on_click=lambda: _download_latency_csv(data)).props("flat dense")
@@ -1425,7 +1426,7 @@ def _reliability_tab() -> None:
             {"name": "project", "label": "Project", "field": "project", "sortable": True},
             {"name": "call_type", "label": "Call type", "field": "call_type", "sortable": True},
             {"name": "avg_latency_ms", "label": "Avg latency (ms)", "field": "avg_latency_ms", "sortable": True},
-            {"name": "calls", "label": "Calls", "field": "calls", "sortable": True},
+            {"name": "calls", "label": "LLM calls", "field": "calls", "sortable": True},
         ]
         ui.table(columns=lat_cols, rows=latency_ranked[:10], row_key="call_type").classes("w-full").props("dense")
     else:
@@ -1543,7 +1544,7 @@ def _supabase_tab() -> None:
     if series["apps"]:
         with ui.row().classes("w-full gap-4 flex-wrap"):
             with ui.column().classes("grow min-w-[320px]"):
-                _egress_chart(series, "req", "Requests", "requests")
+                _egress_chart(series, "req", "HTTP requests", "requests")
             with ui.column().classes("grow min-w-[320px]"):
                 _egress_chart(series, "mb", "Metered egress (MB)", "MB")
         length = _end_dt - _start_dt
@@ -1554,7 +1555,7 @@ def _supabase_tab() -> None:
                  ).classes("text-sm font-bold mt-2")
         cmp_cols = [
             {"name": "app", "label": "App", "field": "app", "sortable": True},
-            {"name": "req", "label": "Requests", "field": "req", "sortable": True},
+            {"name": "req", "label": "HTTP req", "field": "req", "sortable": True},
             {"name": "preq", "label": "Prev", "field": "preq"},
             {"name": "dreq", "label": "Change", "field": "dreq"},
             {"name": "mb", "label": "MB", "field": "mb", "sortable": True},
@@ -1597,7 +1598,7 @@ def _supabase_tab() -> None:
                      f"({window_label}) -- no SUPABASE_METER_APP on the sending process(es). "
                      f"See docs/meter-labels.md for the registry and fix.").classes("text-sm font-bold")
             ui.table(columns=[{"name": "ep", "label": "Endpoint", "field": "ep"},
-                              {"name": "req", "label": "Requests", "field": "req"},
+                              {"name": "req", "label": "HTTP req", "field": "req"},
                               {"name": "mb", "label": "MB", "field": "mb"}],
                      rows=[{"ep": e, "req": n, "mb": round(b / 1e6, 2)}
                            for e, (n, b) in sorted(_u_eps.items(), key=lambda kv: -kv[1][0])],
@@ -1633,14 +1634,14 @@ def _supabase_tab() -> None:
         if app_agg:
             chart_rows = [{"app": a, "calls": n} for a, n in
                           sorted(app_agg.items(), key=lambda kv: -kv[1])]
-            _bar_chart(chart_rows, "app")
+            _bar_chart(chart_rows, "app", y_name="HTTP req")
         # --- detail table ---
         xcols = [
             {"name": "app", "label": "App", "field": "app", "sortable": True},
             {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
-            {"name": "req", "label": "Requests", "field": "req", "sortable": True},
+            {"name": "req", "label": "HTTP req", "field": "req", "sortable": True},
             {"name": "bytes", "label": "Bytes", "field": "bytes"},
-            {"name": "avg", "label": "Avg / request", "field": "avg"},
+            {"name": "avg", "label": "Avg / HTTP req", "field": "avg"},
         ]
         xrows = [{
             "app": a, "endpoint": e, "req": n,
@@ -1659,7 +1660,7 @@ def _supabase_tab() -> None:
     # read as if Supabase traffic were 5 tables while section 2 showed every
     # app's. Now the same window's rollup rows, regrouped by endpoint alone,
     # with the apps behind each one.
-    ui.label(f"Supabase requests by endpoint, all apps ({window_label})").classes("text-sm font-bold mt-4")
+    ui.label(f"Supabase HTTP requests by endpoint, all apps ({window_label})").classes("text-sm font-bold mt-4")
     ui.label("Same data as the table above, summed per endpoint (METHOD + table) across every "
              "app. Sizes = response payload bytes (what counts toward egress).")         .classes("text-xs text-grey-6")
     by_ep: dict[str, dict] = {}
@@ -1671,9 +1672,9 @@ def _supabase_tab() -> None:
     if by_ep:
         cols = [
             {"name": "endpoint", "label": "Endpoint", "field": "endpoint", "sortable": True},
-            {"name": "req", "label": f"Requests ({window_label})", "field": "req", "sortable": True},
+            {"name": "req", "label": f"HTTP req ({window_label})", "field": "req", "sortable": True},
             {"name": "bytes", "label": f"Bytes ({window_label})", "field": "bytes", "sortable": True},
-            {"name": "avg", "label": "Avg / request", "field": "avg"},
+            {"name": "avg", "label": "Avg / HTTP req", "field": "avg"},
             {"name": "apps", "label": "Apps", "field": "apps"},
         ]
         rows = [{
@@ -1682,7 +1683,7 @@ def _supabase_tab() -> None:
             "_key": k,
         } for k, v in sorted(by_ep.items(), key=lambda kv: -kv[1]["b"])]
         ui.table(columns=cols, rows=rows, row_key="_key").classes("w-full").props("dense")             .mark("supabase-meter-table")
-        ui.label(f"{window_label}: {sum(v['n'] for v in by_ep.values()):,} requests, "
+        ui.label(f"{window_label}: {sum(v['n'] for v in by_ep.values()):,} HTTP req, "
                  f"{_fmt_bytes(sum(v['b'] for v in by_ep.values()))} across {len(by_ep)} endpoints "
                  f"· source: meter_rollup")             .classes("text-xs text-grey-6 mt-2")
     else:
