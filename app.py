@@ -85,7 +85,7 @@ _COMPLIANCE_RETRY_SEC = 60  # after a transient Supabase failure (not a missing 
 # originally-reported ~5xxMB/day Supabase egress. Manual refresh paths
 # (_do_retry, the header Refresh button) call fetch_stats() directly, not
 # through main_page(), so they always get real data regardless of this TTL.
-_PAGE_LOAD_FETCH_TTL_SEC = int(os.environ.get("PAGE_LOAD_FETCH_TTL_SEC", "300"))
+_PAGE_LOAD_FETCH_TTL_SEC = int(os.environ.get("PAGE_LOAD_FETCH_TTL_SEC", "60"))
 # Self-identified crawlers/scripts never trigger a refetch (they get whatever
 # STATE holds; only a cold start with nothing cached fetches for them) -- the
 # page is public, and each bot hit past the TTL used to cost live Supabase reads.
@@ -841,8 +841,14 @@ def last_refreshed_label() -> None:
         return
     age = (dt.datetime.now(dt.timezone.utc) - STATE["last_fetch"]).total_seconds()
     stale = age > 2 * _ALERT_CHECK_INTERVAL_SEC
-    stamp = f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT)"
-    ui.label(stamp + (" -- stale, retrying…" if stale else "")).classes(
+    if age < 60:
+        age_str = "just now"
+    elif age < 3600:
+        age_str = f"{int(age / 60)}m ago"
+    else:
+        age_str = f"{int(age / 3600)}h {int((age % 3600) / 60)}m ago"
+    stamp = f"Last refreshed: {ledger.to_hkt(STATE['last_fetch']):%H:%M:%S} (HKT) \u2014 {age_str}"
+    ui.label(stamp + (" -- stale, retrying\u2026" if stale else "")).classes(
         "text-xs " + ("text-amber-600" if stale else "text-grey-6"))
 
 
@@ -1155,7 +1161,7 @@ def dashboard_body() -> None:
     selected tab now has nothing destructive happening to it on refresh,
     rather than relying on state-restoration timing to survive one."""
     _data_status()
-    tab_names = ["Overview", "Supabase", "Cost & Usage", "Reliability & Incidents", "Governance"]
+    tab_names = ["Overview", "Supabase", "Cost & Usage", "Reliability & Incidents", "Governance", "Access Log"]
     with ui.tabs().classes("w-full") as tabs:
         tab_objs = {}
         for name in tab_names:
@@ -1690,8 +1696,96 @@ def _supabase_tab() -> None:
         ui.label("No meter data in this window yet.").classes("text-sm text-grey-6 mt-2")
 
 
+@ui.refreshable
+def _access_log_tab() -> None:
+    """Access Log tab: shows who's visiting the dashboard with IP, region,
+    user agent, and timestamp data.  Reads from the access_log Supabase table
+    (see db/access_log.sql)."""
+    import access_log
+    try:
+        stats = access_log.fetch_access_stats(days=7)
+    except Exception:  # noqa: BLE001
+        ui.label("Failed to load access log data. Make sure the access_log "
+                 "table exists (run db/access_log.sql in Supabase SQL editor)."
+                 ).classes("text-sm text-red-600")
+        return
+
+    # KPI cards
+    with ui.row().classes("w-full gap-4 mt-2 flex-wrap"):
+        _kpi("Total visits (7d)", f"{stats['total']:,}")
+        _kpi("Unique IPs (7d)", f"{stats['unique_ips']:,}")
+        _kpi("Human visits (7d)", f"{stats['humans']:,}")
+        _kpi("Bot hits (7d)", f"{stats['bots']:,}")
+
+    # Hourly chart
+    hourly = stats.get("hourly", {})
+    if hourly:
+        ui.label("Visits over time (7d, hourly)").classes("text-sm font-bold mt-4")
+        hours = sorted(hourly.keys())
+        human_data = [hourly[h]["human"] for h in hours]
+        bot_data = [hourly[h]["bot"] for h in hours]
+        ui.echart({
+            "tooltip": {"trigger": "axis"},
+            "legend": {"data": ["Human", "Bot"]},
+            "xAxis": {"type": "category", "data": [h[11:13] + ":00" for h in hours],
+                      "axisLabel": {"fontSize": 10, "rotate": 45}},
+            "yAxis": {"type": "value", "name": "visits"},
+            "series": [
+                {"name": "Human", "type": "bar", "stack": "total",
+                 "data": human_data, "itemStyle": {"color": "#2563eb"}},
+                {"name": "Bot", "type": "bar", "stack": "total",
+                 "data": bot_data, "itemStyle": {"color": "#9ca3af"}},
+            ],
+            "grid": {"left": 50, "right": 20, "top": 30, "bottom": 60},
+        }).classes("w-full h-56")
+
+    # Region breakdown
+    regions = stats.get("regions", {})
+    if regions:
+        ui.label("Visits by region (human only)").classes("text-sm font-bold mt-4")
+        region_rows = [{"region": r, "count": c}
+                       for r, c in sorted(regions.items(), key=lambda kv: -kv[1])]
+        _bar_chart(region_rows, "region", y_name="visits")
+
+    # Recent entries
+    recent = stats.get("recent", [])
+    if recent:
+        ui.label(f"Recent access entries (last {len(recent)})").classes("text-sm font-bold mt-4")
+        cols = [
+            {"name": "ts", "label": "Time (HKT)", "field": "ts", "sortable": True},
+            {"name": "ip", "label": "IP", "field": "ip"},
+            {"name": "region", "label": "Region", "field": "region", "sortable": True},
+            {"name": "path", "label": "Path", "field": "path"},
+            {"name": "user_agent", "label": "User Agent", "field": "user_agent"},
+            {"name": "is_bot", "label": "Bot?", "field": "is_bot"},
+        ]
+        rows = []
+        for r in recent:
+            try:
+                ts_str = r.get("ts", "")
+                if ts_str:
+                    ts_dt = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    ts_hkt = ledger.to_hkt(ts_dt).strftime("%m-%d %H:%M:%S")
+                else:
+                    ts_hkt = "?"
+            except Exception:  # noqa: BLE001
+                ts_hkt = ts_str[:16] if ts_str else "?"
+            rows.append({
+                "ts": ts_hkt,
+                "ip": r.get("ip", "?"),
+                "region": r.get("region", "?"),
+                "path": r.get("path", "?"),
+                "user_agent": (r.get("user_agent") or "?")[:80],
+                "is_bot": "Yes" if r.get("is_bot") else "No",
+            })
+        ui.table(columns=cols, rows=rows, row_key="ts").classes("w-full").props("dense")
+    else:
+        ui.label("No access log entries yet.").classes("text-sm text-grey-6 mt-4")
+
+
 _TAB_BUILDERS = {"Overview": _overview_tab, "Cost & Usage": _cost_tab,
-                 "Reliability & Incidents": _reliability_tab, "Supabase": _supabase_tab}
+                 "Reliability & Incidents": _reliability_tab, "Supabase": _supabase_tab,
+                 "Access Log": _access_log_tab}
 
 
 def _prewarm_supabase() -> None:
@@ -1809,6 +1903,15 @@ async def _compliance_loop() -> None:
 
 @ui.page("/")
 async def main_page() -> None:
+    # Record access log (fire-and-forget, non-blocking)
+    try:
+        import access_log
+        from nicegui import context as _ctx
+        _req = _ctx.client.request
+        asyncio.get_event_loop().run_in_executor(None, access_log.record_access, _req)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Dark mode persists via app.storage.user (server-side, keyed to the
     # browser-id cookie NiceGUI already sets) -- previously the toggle reset
     # to light on every reload. storage.user works after the response is
