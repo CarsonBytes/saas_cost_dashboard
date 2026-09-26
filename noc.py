@@ -1239,7 +1239,8 @@ def _refresh_health() -> None:
                                     svc.get("restart_lock_count", RESTART_LOCK_COUNT_DEFAULT))
                         locked = True
             elif unhealthy and svc["restart"] == "alert_only" \
-                    and not prev.get(name, {}).get("alerted_unhealthy"):
+                    and not prev.get(name, {}).get("alerted_unhealthy") \
+                    and not state.get("alerted_unhealthy", {}).get(name):
                 if muted:
                     pass  # maintenance window: record, don't page (A3)
                 # ADDED 2026-08-17: this used to always say "liveness check
@@ -1284,8 +1285,19 @@ def _refresh_health() -> None:
                 "memory_mb": memory_mb,
                 "memory_limit_mb": memory_limit_mb,
                 "alerted_unhealthy": (prev.get(name, {}).get("alerted_unhealthy", False)
+                                       or state.get("alerted_unhealthy", {}).get(name, False)
                                        or unhealthy) if svc["restart"] == "alert_only" else False,
             }
+
+            # Persist alerted_unhealthy to file-backed state so it survives
+            # container restarts (FIXED: was only in _STATUS_CACHE which is
+            # wiped on every restart, causing repeated Telegram alerts).
+            if svc["restart"] == "alert_only" and unhealthy:
+                state.setdefault("alerted_unhealthy", {})[name] = True
+            elif svc["restart"] == "alert_only" and not unhealthy:
+                # Agent recovered — clear the flag so future staleness alerts
+                # can fire again if it goes unhealthy later.
+                state.get("alerted_unhealthy", {}).pop(name, None)
 
         _retry_pending_alerts(state)
         _save_state(state)
