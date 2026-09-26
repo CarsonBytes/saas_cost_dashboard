@@ -99,10 +99,10 @@ def record_access(request) -> None:
         region = _resolve_region(ip) if not is_bot else "Bot"
 
         # Debug: log what we see
-        log.debug("access_log: ip=%s cf=%s xff=%s ua=%s bot=%s region=%s",
-                  ip, request.headers.get("cf-connecting-ip", "-"),
-                  request.headers.get("x-forwarded-for", "-"),
-                  user_agent[:60], is_bot, region)
+        cf_ip = request.headers.get("cf-connecting-ip", "-")
+        xff = request.headers.get("x-forwarded-for", "-")
+        log.info("access_log: ip=%s cf=%s xff=%s ua=%s bot=%s region=%s",
+                 ip, cf_ip, xff, user_agent[:60], is_bot, region)
 
         row = {
             "path": path,
