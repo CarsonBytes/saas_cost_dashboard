@@ -1271,11 +1271,6 @@ def _overview_tab() -> None:
     if not data:
         ui.label("Loading…").classes("text-sm text-grey")
         return
-    avg_daily = data["total_cost_usd"] / max(data["range_days"], 1)
-    monthly_budget = alerts.effective_monthly_budget()
-    budget_is_implied = not alerts.MONTHLY_BUDGET_USD
-    projected_monthly = avg_daily * 30
-    attribution = ledger.attribution_quality(data)
     prev = STATE.get("prev")
 
     calls_spark = [d["calls"] for d in data.get("daily_series", [])]
@@ -1289,20 +1284,14 @@ def _overview_tab() -> None:
         d_cost = _delta_sub(data["total_cost_usd"], prev and prev["cost_usd"], lower_is_better=True)
         d_ptok = _delta_sub(data["total_prompt_tokens"], prev and prev["prompt_tokens"])
         d_ctok = _delta_sub(data["total_completion_tokens"], prev and prev["completion_tokens"])
-        _kpi("LLM calls", f"{data['total_calls']:,}", sub=d_calls and d_calls[0],
-             sub_cls=d_calls and d_calls[1], spark=calls_spark)
         _kpi("Total cost", f"${data['total_cost_usd']:.4f}", sub=d_cost and d_cost[0],
              sub_cls=d_cost and d_cost[1], spark=cost_spark)
+        _kpi("LLM calls", f"{data['total_calls']:,}", sub=d_calls and d_calls[0],
+             sub_cls=d_calls and d_calls[1], spark=calls_spark)
         _kpi("Prompt tokens", f"{data['total_prompt_tokens']:,}", sub=d_ptok and d_ptok[0],
              sub_cls=d_ptok and d_ptok[1], spark=ptok_spark)
         _kpi("Completion tokens", f"{data['total_completion_tokens']:,}",
              sub=d_ctok and d_ctok[0], sub_cls=d_ctok and d_ctok[1], spark=ctok_spark)
-        _kpi("Projected monthly cost",
-             f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget"
-             + (" (implied)" if budget_is_implied else ""),
-             warn=projected_monthly > monthly_budget, spark=cost_spark)
-        _kpi("Cost attribution quality", f"{attribution['cost_tagged_pct']:.0f}% tagged by provider",
-             warn=attribution["cost_tagged_pct"] < 50)
         if eg:
             _kpi("Supabase requests", f"{eg['req']:,}", sub=eg["d_req"] and eg["d_req"][0],
                  sub_cls=eg["d_req"] and eg["d_req"][1], spark=eg["spark_req"])
