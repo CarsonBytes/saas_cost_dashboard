@@ -1797,13 +1797,13 @@ def _access_log_tab() -> None:
                 ui.label("Visits by region (human only)").classes("text-sm font-bold")
                 region_rows = [{"region": r, "count": c}
                                for r, c in sorted(regions.items(), key=lambda kv: -kv[1])]
-                _bar_chart(region_rows, "region", y_name="visits")
+                _bar_chart(region_rows, "region", y_name="visits", value_field="count")
 
     # Top paths
     if top_paths:
         ui.label("Most visited paths (human only)").classes("text-sm font-bold mt-4")
         path_rows = [{"path": p, "visits": c} for p, c in top_paths]
-        _bar_chart(path_rows, "path", y_name="visits")
+        _bar_chart(path_rows, "path", y_name="visits", value_field="visits")
 
     # KPI cards
     with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
