@@ -98,11 +98,10 @@ def record_access(request) -> None:
         is_bot = _is_bot(user_agent)
         region = _resolve_region(ip) if not is_bot else "Bot"
 
-        # Debug: log what we see
+        # Debug: log what we see (print to ensure docker logs captures it)
         cf_ip = request.headers.get("cf-connecting-ip", "-")
         xff = request.headers.get("x-forwarded-for", "-")
-        log.info("access_log: ip=%s cf=%s xff=%s ua=%s bot=%s region=%s",
-                 ip, cf_ip, xff, user_agent[:60], is_bot, region)
+        print(f"access_log: ip={ip} cf={cf_ip} xff={xff} ua={user_agent[:60]} bot={is_bot} region={region}", flush=True)
 
         row = {
             "path": path,
