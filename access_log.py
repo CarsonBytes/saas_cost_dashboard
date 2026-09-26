@@ -47,7 +47,7 @@ def _resolve_region(ip: str | None) -> str:
         return cached[0]
     try:
         resp = httpx.get(
-            f"http://ip-api.com/json/{ip}?fields=country,regionName,city",
+            f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city",
             timeout=5,
         )
         if resp.status_code == 200:
