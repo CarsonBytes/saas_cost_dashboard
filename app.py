@@ -1755,50 +1755,55 @@ def _access_log_tab() -> None:
     ui.switch("Exclude localhost (127.0.0.1)", value=exclude_localhost,
               on_change=_on_toggle).classes("text-sm mt-2")
 
-    # KPI cards
-    with ui.row().classes("w-full gap-4 mt-2 flex-wrap"):
-        _kpi("Total visits (7d)", f"{stats['total']:,}")
-        _kpi("Unique IPs (7d)", f"{stats['unique_ips']:,}")
-        _kpi("Human visits (7d)", f"{stats['humans']:,}")
-        _kpi("Bot hits (7d)", f"{stats['bots']:,}")
-        _kpi("Avg visits / human IP", f"{stats['avg_visits_per_ip']:.1f}")
+    # Charts first — most meaningful at a glance
+    hourly = stats.get("hourly", {})
+    regions = stats.get("regions", {})
+    top_paths = stats.get("top_paths", [])
+
+    with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
+        # Hourly trend
+        if hourly:
+            with ui.column().classes("grow min-w-[400px]"):
+                ui.label("Visits over time (7d, hourly)").classes("text-sm font-bold")
+                hours = sorted(hourly.keys())
+                human_data = [hourly[h]["human"] for h in hours]
+                bot_data = [hourly[h]["bot"] for h in hours]
+                ui.echart({
+                    "tooltip": {"trigger": "axis"},
+                    "legend": {"data": ["Human", "Bot"]},
+                    "xAxis": {"type": "category", "data": [h[11:13] + ":00" for h in hours],
+                              "axisLabel": {"fontSize": 10, "rotate": 45}},
+                    "yAxis": {"type": "value", "name": "visits"},
+                    "series": [
+                        {"name": "Human", "type": "bar", "stack": "total",
+                         "data": human_data, "itemStyle": {"color": "#2563eb"}},
+                        {"name": "Bot", "type": "bar", "stack": "total",
+                         "data": bot_data, "itemStyle": {"color": "#9ca3af"}},
+                    ],
+                    "grid": {"left": 50, "right": 20, "top": 30, "bottom": 60},
+                }).classes("w-full h-56")
+
+        # Region breakdown
+        if regions:
+            with ui.column().classes("grow min-w-[300px]"):
+                ui.label("Visits by region (human only)").classes("text-sm font-bold")
+                region_rows = [{"region": r, "count": c}
+                               for r, c in sorted(regions.items(), key=lambda kv: -kv[1])]
+                _bar_chart(region_rows, "region", y_name="visits")
 
     # Top paths
-    top_paths = stats.get("top_paths", [])
     if top_paths:
         ui.label("Most visited paths (human only)").classes("text-sm font-bold mt-4")
         path_rows = [{"path": p, "visits": c} for p, c in top_paths]
         _bar_chart(path_rows, "path", y_name="visits")
 
-    # Hourly chart
-    hourly = stats.get("hourly", {})
-    if hourly:
-        ui.label("Visits over time (7d, hourly)").classes("text-sm font-bold mt-4")
-        hours = sorted(hourly.keys())
-        human_data = [hourly[h]["human"] for h in hours]
-        bot_data = [hourly[h]["bot"] for h in hours]
-        ui.echart({
-            "tooltip": {"trigger": "axis"},
-            "legend": {"data": ["Human", "Bot"]},
-            "xAxis": {"type": "category", "data": [h[11:13] + ":00" for h in hours],
-                      "axisLabel": {"fontSize": 10, "rotate": 45}},
-            "yAxis": {"type": "value", "name": "visits"},
-            "series": [
-                {"name": "Human", "type": "bar", "stack": "total",
-                 "data": human_data, "itemStyle": {"color": "#2563eb"}},
-                {"name": "Bot", "type": "bar", "stack": "total",
-                 "data": bot_data, "itemStyle": {"color": "#9ca3af"}},
-            ],
-            "grid": {"left": 50, "right": 20, "top": 30, "bottom": 60},
-        }).classes("w-full h-56")
-
-    # Region breakdown
-    regions = stats.get("regions", {})
-    if regions:
-        ui.label("Visits by region (human only)").classes("text-sm font-bold mt-4")
-        region_rows = [{"region": r, "count": c}
-                       for r, c in sorted(regions.items(), key=lambda kv: -kv[1])]
-        _bar_chart(region_rows, "region", y_name="visits")
+    # KPI cards
+    with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
+        _kpi("Total visits (7d)", f"{stats['total']:,}")
+        _kpi("Unique IPs (7d)", f"{stats['unique_ips']:,}")
+        _kpi("Human visits (7d)", f"{stats['humans']:,}")
+        _kpi("Bot hits (7d)", f"{stats['bots']:,}")
+        _kpi("Avg visits / human IP", f"{stats['avg_visits_per_ip']:.1f}")
 
     # Recent entries
     recent = stats.get("recent", [])
