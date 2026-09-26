@@ -261,6 +261,11 @@ _DEPS_STREAK: dict[str, int] = {}
 # this is agent-specific, not a shared-infra issue.
 _LIVENESS_STREAK: dict[str, int] = {}
 
+# TTL cache for _latest_write() freshness probes -- avoids per-cycle Supabase
+# REST calls.  600s (10 min) is fine for health-monitoring granularity.
+FRESHNESS_CACHE_TTL = 600
+_FRESHNESS_CACHE: dict[str, tuple[str | None, float]] = {}
+
 
 def _update_liveness_streak(name: str, up: bool) -> int:
     """Advance the consecutive-run counter for one agent's liveness probe."""
@@ -308,8 +313,20 @@ def _latest_write(svc: dict) -> str | None:
     without this, monitoring both at once would let each one's freshness leak
     into the other's (Paper reading "fresh" off Live's writes, or vice versa).
 
+    Cached per service for FRESHNESS_CACHE_TTL seconds (default 600 = 10 min)
+    to avoid per-cycle Supabase REST calls.  Freshness doesn't need
+    second-level precision -- 10 min granularity is fine for health monitoring.
+
     Raises on Supabase failure -- callers treat that as stale + let the
     dependency probe decide whether it's a blocked-by situation."""
+    import time as _time
+
+    cache_key = svc["name"]
+    now = _time.monotonic()
+    cached = _FRESHNESS_CACHE.get(cache_key)
+    if cached and now - cached[1] < FRESHNESS_CACHE_TTL:
+        return cached[0]
+
     table = svc.get("freshness_table", "llm_calls")
     params = {"select": "created_at", "order": "created_at.desc", "limit": "1"}
     tag = svc.get("project_tag")
@@ -327,7 +344,9 @@ def _latest_write(svc: dict) -> str | None:
     )
     resp.raise_for_status()
     rows = resp.json()
-    return rows[0]["created_at"] if rows else None
+    result = rows[0]["created_at"] if rows else None
+    _FRESHNESS_CACHE[cache_key] = (result, now)
+    return result
 
 
 def _latest_write_safe(svc: dict) -> str | None:
