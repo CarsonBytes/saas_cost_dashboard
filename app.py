@@ -1280,6 +1280,8 @@ def _overview_tab() -> None:
 
     calls_spark = [d["calls"] for d in data.get("daily_series", [])]
     cost_spark = [d["cost_usd"] for d in data.get("daily_series", [])]
+    ptok_spark = [d["prompt_tokens"] for d in data.get("daily_series", [])]
+    ctok_spark = [d["completion_tokens"] for d in data.get("daily_series", [])]
 
     eg = _overview_egress()
     with ui.grid().classes("w-full gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 mt-2"):
@@ -1292,9 +1294,9 @@ def _overview_tab() -> None:
         _kpi("Total cost", f"${data['total_cost_usd']:.4f}", sub=d_cost and d_cost[0],
              sub_cls=d_cost and d_cost[1], spark=cost_spark)
         _kpi("Prompt tokens", f"{data['total_prompt_tokens']:,}", sub=d_ptok and d_ptok[0],
-             sub_cls=d_ptok and d_ptok[1])
+             sub_cls=d_ptok and d_ptok[1], spark=ptok_spark)
         _kpi("Completion tokens", f"{data['total_completion_tokens']:,}",
-             sub=d_ctok and d_ctok[0], sub_cls=d_ctok and d_ctok[1])
+             sub=d_ctok and d_ctok[0], sub_cls=d_ctok and d_ctok[1], spark=ctok_spark)
         _kpi("Projected monthly cost",
              f"${projected_monthly:.2f} / ${monthly_budget:.2f} budget"
              + (" (implied)" if budget_is_implied else ""),

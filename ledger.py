@@ -633,14 +633,17 @@ def hourly_by_project(rows: list[dict]) -> dict:
 
 
 def build_stats(rows: list[dict], days: int) -> dict:
-    daily: dict[str, dict] = defaultdict(lambda: {"calls": 0, "cost_usd": 0.0})
+    daily: dict[str, dict] = defaultdict(lambda: {"calls": 0, "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0})
     for row in rows:
         day = _hkt_date_str(row["created_at"])
         d = daily[day]
         d["calls"] += 1
         d["cost_usd"] += row.get("cost_usd") or 0
-    daily_series = [{"date": d, "calls": v["calls"], "cost_usd": round(v["cost_usd"], 6)}
-                     for d, v in sorted(daily.items())]
+        d["prompt_tokens"] += row.get("prompt_tokens") or 0
+        d["completion_tokens"] += row.get("completion_tokens") or 0
+    daily_series = [{"date": d, "calls": v["calls"], "cost_usd": round(v["cost_usd"], 6),
+                     "prompt_tokens": v["prompt_tokens"], "completion_tokens": v["completion_tokens"]}
+                    for d, v in sorted(daily.items())]
 
     return {
         "range_days": days,
