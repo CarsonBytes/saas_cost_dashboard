@@ -296,7 +296,7 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
         "tooltip": {"trigger": "axis"},
         "xAxis": {"type": "category", "data": labels, "axisLabel": {"fontSize": 10, "rotate": 20}},
         "yAxis": {"type": "value", "name": y_name},
-        "series": [{"type": "bar", "data": [r.get(value_field, r["calls"]) for r in rows],
+        "series": [{"type": "bar", "data": [r.get(value_field, 0) for r in rows],
                     "itemStyle": {"color": "#2563eb"}}],
         "grid": {"left": 50, "right": 20, "top": 20, "bottom": 60},
     }).classes("w-full h-56")
