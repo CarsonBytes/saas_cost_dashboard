@@ -140,17 +140,19 @@ def fetch_access_log(since: str | None = None, until: str | None = None,
 _LOCALHOST_IPS = {"127.0.0.1", "::1", "localhost"}
 
 
-def fetch_access_stats(days: int = 7, exclude_localhost: bool = True) -> dict:
+def fetch_access_stats(days: int = 7, exclude_localhost: bool = True, exclude_bots: bool = True) -> dict:
     """Aggregate access log stats for the dashboard."""
     import datetime as _dt
     since = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)).isoformat()
-    rows = fetch_access_log(since=since, limit=10000)
+    all_rows = fetch_access_log(since=since, limit=10000)
     if exclude_localhost:
-        rows = [r for r in rows if (r.get("ip") or "") not in _LOCALHOST_IPS]
-    total = len(rows)
-    bots = sum(1 for r in rows if r.get("is_bot"))
-    humans = total - bots
-    unique_ips = len(set(r.get("ip") for r in rows if r.get("ip")))
+        all_rows = [r for r in all_rows if (r.get("ip") or "") not in _LOCALHOST_IPS]
+    # Always count from full set for KPI accuracy
+    total_all = len(all_rows)
+    bots = sum(1 for r in all_rows if r.get("is_bot"))
+    humans = total_all - bots
+    # Filter for charts/tables
+    rows = [r for r in all_rows if not r.get("is_bot")] if exclude_bots else all_rows
 
     # Hourly breakdown for chart
     hourly: dict[str, dict] = {}
@@ -173,19 +175,18 @@ def fetch_access_stats(days: int = 7, exclude_localhost: bool = True) -> dict:
     # Path popularity (human only)
     path_counts: dict[str, int] = {}
     for r in rows:
-        if not r.get("is_bot"):
-            p = r.get("path") or "/"
-            path_counts[p] = path_counts.get(p, 0) + 1
+        p = r.get("path") or "/"
+        path_counts[p] = path_counts.get(p, 0) + 1
 
-    # Visits per unique human IP
-    human_ips = set(r.get("ip") for r in rows if not r.get("is_bot") and r.get("ip"))
-    avg_visits = round(len([r for r in rows if not r.get("is_bot")]) / max(len(human_ips), 1), 1)
+    # Visits per unique human IP (from full set, not bot-filtered)
+    human_ips = set(r.get("ip") for r in all_rows if not r.get("is_bot") and r.get("ip"))
+    avg_visits = round(humans / max(len(human_ips), 1), 1)
 
     return {
-        "total": total,
+        "total": total_all,
         "bots": bots,
         "humans": humans,
-        "unique_ips": unique_ips,
+        "unique_ips": len(human_ips),
         "avg_visits_per_ip": avg_visits,
         "top_paths": sorted(path_counts.items(), key=lambda x: -x[1])[:10],
         "hourly": hourly,

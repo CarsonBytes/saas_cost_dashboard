@@ -1739,8 +1739,9 @@ def _access_log_tab() -> None:
     (see db/access_log.sql)."""
     import access_log
     exclude_localhost = STATE.get("access_log_exclude_localhost", True)
+    exclude_bots = STATE.get("access_log_exclude_bots", True)
     try:
-        stats = access_log.fetch_access_stats(days=7, exclude_localhost=exclude_localhost)
+        stats = access_log.fetch_access_stats(days=7, exclude_localhost=exclude_localhost, exclude_bots=exclude_bots)
     except Exception:  # noqa: BLE001
         ui.label("Failed to load access log data. Make sure the access_log "
                  "table exists (run db/access_log.sql in Supabase SQL editor)."
@@ -1752,8 +1753,15 @@ def _access_log_tab() -> None:
         STATE["access_log_exclude_localhost"] = e.value
         _access_log_tab.refresh()
 
-    ui.switch("Exclude localhost (127.0.0.1)", value=exclude_localhost,
-              on_change=_on_toggle).classes("text-sm mt-2")
+    def _on_bot_toggle(e):
+        STATE["access_log_exclude_bots"] = e.value
+        _access_log_tab.refresh()
+
+    with ui.row().classes("gap-4 mt-2"):
+        ui.switch("Exclude localhost (127.0.0.1)", value=exclude_localhost,
+                  on_change=_on_toggle).classes("text-sm")
+        ui.switch("Exclude bots", value=exclude_bots,
+                  on_change=_on_bot_toggle).classes("text-sm")
 
     # Charts first — most meaningful at a glance
     hourly = stats.get("hourly", {})
