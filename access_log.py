@@ -136,11 +136,16 @@ def fetch_access_log(since: str | None = None, until: str | None = None,
     return []
 
 
-def fetch_access_stats(days: int = 7) -> dict:
+_LOCALHOST_IPS = {"127.0.0.1", "::1", "localhost"}
+
+
+def fetch_access_stats(days: int = 7, exclude_localhost: bool = True) -> dict:
     """Aggregate access log stats for the dashboard."""
     import datetime as _dt
     since = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)).isoformat()
     rows = fetch_access_log(since=since, limit=10000)
+    if exclude_localhost:
+        rows = [r for r in rows if (r.get("ip") or "") not in _LOCALHOST_IPS]
     total = len(rows)
     bots = sum(1 for r in rows if r.get("is_bot"))
     humans = total - bots

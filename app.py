@@ -1732,18 +1732,28 @@ def _supabase_tab() -> None:
 
 
 @ui.refreshable
+@ui.refreshable
 def _access_log_tab() -> None:
-    """Access Log tab: shows who's visiting the dashboard with IP, region,
-    user agent, and timestamp data.  Reads from the access_log Supabase table
+    """Access log tab: shows page-load tracking data from the access_log
+    table (IP, region, user agent, and timestamp data).  Reads from the access_log Supabase table
     (see db/access_log.sql)."""
     import access_log
+    exclude_localhost = STATE.get("access_log_exclude_localhost", True)
     try:
-        stats = access_log.fetch_access_stats(days=7)
+        stats = access_log.fetch_access_stats(days=7, exclude_localhost=exclude_localhost)
     except Exception:  # noqa: BLE001
         ui.label("Failed to load access log data. Make sure the access_log "
                  "table exists (run db/access_log.sql in Supabase SQL editor)."
                  ).classes("text-sm text-red-600")
         return
+
+    # Toggle for excluding localhost
+    def _on_toggle(e):
+        STATE["access_log_exclude_localhost"] = e.value
+        _access_log_tab.refresh()
+
+    ui.switch("Exclude localhost (127.0.0.1)", value=exclude_localhost,
+              on_change=_on_toggle).classes("text-sm mt-2")
 
     # KPI cards
     with ui.row().classes("w-full gap-4 mt-2 flex-wrap"):
