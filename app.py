@@ -283,7 +283,7 @@ def _delta_sub(current: float, previous: float | None, *, lower_is_better: bool 
 
 
 def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = None,
-               y_name: str = "calls") -> None:
+               y_name: str = "calls", value_field: str = "calls") -> None:
     if not rows:
         ui.label("(no data in this range)").classes("text-sm text-grey")
         return
@@ -296,7 +296,7 @@ def _bar_chart(rows: list[dict], label_field: str, extra_fields: list[str] = Non
         "tooltip": {"trigger": "axis"},
         "xAxis": {"type": "category", "data": labels, "axisLabel": {"fontSize": 10, "rotate": 20}},
         "yAxis": {"type": "value", "name": y_name},
-        "series": [{"type": "bar", "data": [r["calls"] for r in rows],
+        "series": [{"type": "bar", "data": [r.get(value_field, r["calls"]) for r in rows],
                     "itemStyle": {"color": "#2563eb"}}],
         "grid": {"left": 50, "right": 20, "top": 20, "bottom": 60},
     }).classes("w-full h-56")
@@ -374,6 +374,30 @@ def _egress_chart(series: dict, field: str, title: str, unit: str, *, height: st
 
 def _pct_delta(cur: float, prev: float) -> str:
     return f"{(cur - prev) / prev:+.0%}" if prev else "-"
+
+
+def _derived_prompt_stats(by_project: list[dict]) -> list[dict]:
+    """Compute per-project derived prompt token stats from by_project aggregate.
+
+    Returns a list of dicts with:
+      - project: project name
+      - prompt_per_call: avg prompt tokens per LLM call
+      - prompt_completion_ratio: prompt_tokens / completion_tokens (>1 = input-heavy)
+      - prompt_pct: prompt tokens as % of total tokens
+    """
+    stats = []
+    for r in by_project:
+        calls = r.get("calls") or 0
+        pt = r.get("prompt_tokens") or 0
+        ct = r.get("completion_tokens") or 0
+        total = pt + ct
+        stats.append({
+            "project": r.get("project", "?"),
+            "prompt_per_call": round(pt / calls) if calls else 0,
+            "prompt_completion_ratio": round(pt / ct, 2) if ct else 0,
+            "prompt_pct": round(100 * pt / total, 1) if total else 0,
+        })
+    return stats
 
 
 def _efficiency_table(ranked: list[dict], label_field: str) -> None:
@@ -1346,8 +1370,8 @@ def _overview_tab() -> None:
             ui.label("By project").classes("text-sm font-bold")
             _bar_chart(data["by_project"], "project", y_name="LLM calls")
         with ui.column().classes("grow min-w-[300px]"):
-            ui.label("By provider (chatanywhere vs deepseek fallback in action)").classes("text-sm font-bold")
-            _bar_chart(data["by_provider"], "provider", y_name="LLM calls")
+            ui.label("Prompt tokens by project").classes("text-sm font-bold")
+            _bar_chart(data["by_project"], "project", y_name="Prompt tokens", value_field="prompt_tokens")
 
 
 @ui.refreshable
@@ -1363,6 +1387,26 @@ def _cost_tab() -> None:
         with ui.column().classes("grow min-w-[300px]"):
             ui.label("LLM calls by project & environment").classes("text-sm font-bold")
             _bar_chart(data["by_environment"], "project", ["environment"], y_name="LLM calls")
+
+    with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Prompt tokens by project").classes("text-sm font-bold")
+            _bar_chart(data["by_project"], "project", y_name="Prompt tokens", value_field="prompt_tokens")
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Completion tokens by project").classes("text-sm font-bold")
+            _bar_chart(data["by_project"], "project", y_name="Completion tokens", value_field="completion_tokens")
+
+    prompt_stats = _derived_prompt_stats(data["by_project"])
+    with ui.row().classes("w-full gap-4 mt-4 flex-wrap"):
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Prompt tokens per LLM call (by project)").classes("text-sm font-bold")
+            _bar_chart(prompt_stats, "project", y_name="Avg prompt tokens/call", value_field="prompt_per_call")
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Prompt-to-completion ratio (by project)").classes("text-sm font-bold")
+            _bar_chart(prompt_stats, "project", y_name="Ratio (>1 = input-heavy)", value_field="prompt_completion_ratio")
+        with ui.column().classes("grow min-w-[300px]"):
+            ui.label("Prompt tokens as % of total (by project)").classes("text-sm font-bold")
+            _bar_chart(prompt_stats, "project", y_name="% prompt tokens", value_field="prompt_pct")
 
     with ui.row().classes("w-full items-center justify-between mt-4 flex-wrap gap-2"):
         ui.label("LLM model usage by project & call type").classes("text-sm font-bold")
