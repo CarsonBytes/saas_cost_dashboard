@@ -64,7 +64,13 @@ def _resolve_region(ip: str | None) -> str:
 
 
 def _get_client_ip(request) -> str | None:
-    """Extract client IP from a FastAPI/Starlette request object."""
+    """Extract client IP from a FastAPI/Starlette request object.
+    Checks Cloudflare-specific headers first (CF-Connecting-IP), then
+    standard X-Forwarded-For, X-Real-IP, and direct connection."""
+    # Cloudflare sets CF-Connecting-IP to the real client IP
+    cfc = request.headers.get("cf-connecting-ip")
+    if cfc:
+        return cfc.strip()
     # Check X-Forwarded-For first (behind reverse proxy)
     xff = request.headers.get("x-forwarded-for")
     if xff:
@@ -91,6 +97,12 @@ def record_access(request) -> None:
         method = request.method if hasattr(request, "method") else "GET"
         is_bot = _is_bot(user_agent)
         region = _resolve_region(ip) if not is_bot else "Bot"
+
+        # Debug: log what we see
+        log.debug("access_log: ip=%s cf=%s xff=%s ua=%s bot=%s region=%s",
+                  ip, request.headers.get("cf-connecting-ip", "-"),
+                  request.headers.get("x-forwarded-for", "-"),
+                  user_agent[:60], is_bot, region)
 
         row = {
             "path": path,
