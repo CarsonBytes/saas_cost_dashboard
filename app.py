@@ -1761,6 +1761,14 @@ def _access_log_tab() -> None:
         _kpi("Unique IPs (7d)", f"{stats['unique_ips']:,}")
         _kpi("Human visits (7d)", f"{stats['humans']:,}")
         _kpi("Bot hits (7d)", f"{stats['bots']:,}")
+        _kpi("Avg visits / human IP", f"{stats['avg_visits_per_ip']:.1f}")
+
+    # Top paths
+    top_paths = stats.get("top_paths", [])
+    if top_paths:
+        ui.label("Most visited paths (human only)").classes("text-sm font-bold mt-4")
+        path_rows = [{"path": p, "visits": c} for p, c in top_paths]
+        _bar_chart(path_rows, "path", y_name="visits")
 
     # Hourly chart
     hourly = stats.get("hourly", {})

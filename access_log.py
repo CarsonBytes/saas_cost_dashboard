@@ -37,17 +37,18 @@ def _is_bot(user_agent: str | None) -> bool:
 
 
 def _resolve_region(ip: str | None) -> str:
-    """Resolve IP to region via ip-api.com.  Returns 'Unknown' on failure."""
+    """Resolve IP to region via ip-api.com.  Returns 'Unknown' on failure.
+    Does NOT cache 'Unknown' so transient failures can retry on next request."""
     if not ip or ip in ("127.0.0.1", "::1", "localhost"):
         return "Local"
     now = time.monotonic()
     cached = _geo_cache.get(ip)
-    if cached and now - cached[1] < _GEO_CACHE_TTL:
+    if cached and cached[0] != "Unknown" and now - cached[1] < _GEO_CACHE_TTL:
         return cached[0]
     try:
         resp = httpx.get(
             f"http://ip-api.com/json/{ip}?fields=country,regionName,city",
-            timeout=3,
+            timeout=5,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -58,7 +59,7 @@ def _resolve_region(ip: str | None) -> str:
                 return region
     except Exception:  # noqa: BLE001
         pass
-    _geo_cache[ip] = ("Unknown", now)
+    # Don't cache Unknown -- next page load will retry
     return "Unknown"
 
 
@@ -169,11 +170,24 @@ def fetch_access_stats(days: int = 7, exclude_localhost: bool = True) -> dict:
             reg = r.get("region") or "Unknown"
             regions[reg] = regions.get(reg, 0) + 1
 
+    # Path popularity (human only)
+    path_counts: dict[str, int] = {}
+    for r in rows:
+        if not r.get("is_bot"):
+            p = r.get("path") or "/"
+            path_counts[p] = path_counts.get(p, 0) + 1
+
+    # Visits per unique human IP
+    human_ips = set(r.get("ip") for r in rows if not r.get("is_bot") and r.get("ip"))
+    avg_visits = round(len([r for r in rows if not r.get("is_bot")]) / max(len(human_ips), 1), 1)
+
     return {
         "total": total,
         "bots": bots,
         "humans": humans,
         "unique_ips": unique_ips,
+        "avg_visits_per_ip": avg_visits,
+        "top_paths": sorted(path_counts.items(), key=lambda x: -x[1])[:10],
         "hourly": hourly,
         "regions": regions,
         "recent": rows[:50],
