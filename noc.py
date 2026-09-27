@@ -132,6 +132,27 @@ _STATE_LOCK = threading.Lock()
 
 _STATUS_CACHE: dict[str, dict] = {}
 
+_ALERT_DIR = Path(r"D:\claude\alerts\pending")
+_ALERT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _write_alert_file(service: str, message: str, alert_type: str = "unknown") -> None:
+    """Write an alert to a JSON file for the auto-debug listener to pick up."""
+    import uuid
+    ts = time.time()
+    filename = f"{alert_type}_{service.replace(' ', '_').lower()}_{int(ts)}.json"
+    alert_data = {
+        "service": service,
+        "message": message,
+        "type": alert_type,
+        "timestamp": ts,
+        "id": str(uuid.uuid4())[:8],
+    }
+    try:
+        (_ALERT_DIR / filename).write_text(json.dumps(alert_data, indent=2))
+    except Exception:
+        log.warning("failed to write alert file for %s", service, exc_info=True)
+
 _LLM_API_BASE_URL = os.environ.get(
     "LLM_API_BASE_URL", "https://api.chatanywhere.tech/v1"
 ).rstrip("/")
@@ -625,6 +646,7 @@ def _send_lock_alert(name: str, lock_count: int = RESTART_LOCK_COUNT_DEFAULT) ->
     msg = (f"{name} locked: {lock_count} restarts within the last hour "
            f"-- auto-unlock will be attempted after a cooldown, or clear it from "
            f"the dashboard / reply /unlock")
+    _write_alert_file(name, msg, "locked")
     if alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8"):
         return True
     time.sleep(5)
@@ -1275,6 +1297,7 @@ def _refresh_health() -> None:
                 ok = alerts.send_telegram(
                     f"{name} is unhealthy ({reason})", tag="NOC",
                     emoji="\U0001f6a8")
+                _write_alert_file(name, f"{name} is unhealthy ({reason})", incident_detail)
                 _add_incident(state, name, "alert sent",
                               outcome="telegram" if ok else "telegram failed",
                               detail=incident_detail)
