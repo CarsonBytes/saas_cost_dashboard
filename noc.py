@@ -132,7 +132,15 @@ _STATE_LOCK = threading.Lock()
 
 _STATUS_CACHE: dict[str, dict] = {}
 
-_ALERT_DIR = Path(r"D:\claude\alerts\pending")
+# FIXED 2026-09-29: this was a bare relative-ish absolute Windows path that,
+# on Linux inside the container, resolved to the literal directory
+# "/app/D:\claude\alerts\pending" -- alert files never reached the host
+# directory the listener watches, which is why the 2026-09-28 04:31 router-
+# restart outage produced 4 down alerts with zero auto-debug (retro finding).
+# The container now gets ALERT_PENDING_DIR=/app/pending_alerts bound to the
+# host's D:\claude\alerts\pending (see docker-compose.yml); the env default
+# keeps local (non-Docker) runs working.
+_ALERT_DIR = Path(os.environ.get("ALERT_PENDING_DIR", r"D:\claude\alerts\pending"))
 _ALERT_DIR.mkdir(parents=True, exist_ok=True)
 
 

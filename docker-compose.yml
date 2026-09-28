@@ -11,6 +11,14 @@ services:
       # noc-state volume's state/ dir, so it survives redeploys with the
       # other state files).
       - SUPABASE_METER_APP=dashboard
+      # ADDED 2026-09-29: alert files for the auto-debug listener
+      # (noc.py _write_alert_file). Without this, noc.py's Windows-path
+      # default resolved inside the Linux container to the literal dir
+      # "/app/D:\claude\alerts\pending" and the files never reached the
+      # host dir D:\claude\alerts\pending that telegram_listener.py polls
+      # -- all 4 down alerts of the 2026-09-28 04:31 outage were lost
+      # that way (retro investigation).
+      - ALERT_PENDING_DIR=/app/pending_alerts
     ports:
       # Cut over 2026-08-13: was 18095:8095 during parallel testing (native
       # Windows launcher still serving 8095). Native launcher decommissioned,
@@ -27,6 +35,14 @@ services:
       # intentionally-paused container. A named volume survives `docker
       # compose up --build` recreating the container; only `down -v` removes it.
       - noc-state:/app/state
+      # ADDED 2026-09-29: NOC -> auto-debug listener handoff. noc.py writes
+      # alert JSON here (ALERT_PENDING_DIR above); telegram_listener.py on the
+      # host polls this same directory every 30s. Relative to this compose
+      # file: D:\llm-usage-dashboard\..\claude\alerts\pending =
+      # D:\claude\alerts\pending. Bind mount, not a named volume -- the
+      # listener runs on the Windows host, so the files must land on the
+      # host filesystem.
+      - ../claude/alerts/pending:/app/pending_alerts
     dns:
       - 8.8.8.8
       - 1.1.1.1
