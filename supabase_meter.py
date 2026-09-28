@@ -194,6 +194,64 @@ def response_bytes(response) -> int:
         return 0
 
 
+# ---- meter v1 -> wire-bytes correction (READ side only) ---------------------
+# Until the num_bytes_downloaded half of response_bytes() above was deployed,
+# this module recorded len(response.content) -- the DEcompressed JSON payload,
+# not the compressed bytes on the wire. The cutover is a single, sharp,
+# simultaneous step across every app this deploy touched, visible hour by hour
+# in this project's own meter_rollup data: at 2026-09-15T13 UTC avg
+# bytes/request falls from 53.3 to 4.3 (dashboard), 59.5 to 12.2 (study) and
+# 51.9 to 10.4 (study-demo), while quant/event-radar -- which never moved the
+# needle -- stay flat at ~0.1 KB/req. Every row written before that hour
+# overstates real egress by that factor, which is what made the Supabase tab
+# report "GET llm_calls: 441 MB" for a table whose entire cached history is
+# 1.4 MB of JSON (~4,809 rows, ~300 B/row): the real figure is ~102 MB.
+#
+# V1_RATIO is that measured factor, per app (stored bytes / wire bytes), from
+# the 12 hours either side of the cutover -- the same traffic pattern metered
+# both ways, so it's a measurement, not an assumption:
+#   dashboard    12.3   llm_calls 72.9->5.9, meter_rollup 118.3->9.7 KB/req
+#   study         4.9   answer_log 156.5->32.4, mastery_scores 80.9->15.2
+#   study-demo    5.0   answer_log 156.4->33.2, mastery_scores 78.5->13.8
+# (quant/event-radar: 0.8-1.0, i.e. already wire bytes -- left alone, as are
+# unknown apps.) The ratio tracks payload compressibility, not the app, so
+# small barely-compressible rows absorbed by these buckets are mis-scaled by
+# at most ~2x on ~0.1 KB/req -- noise next to the 10x error being fixed.
+#
+# The correction is applied on READ only (read_bytes() below and ledger's
+# fetch_meter_rollup), never in record()/_flush_rollup(), so raw values stay
+# raw on disk/POST and a row can never be corrected twice. Request counts were
+# always accurate -- only bytes are scaled.
+WIRE_FIX_ISO = "2026-09-15T13:10:00+00:00"
+WIRE_FIX_DT = dt.datetime.fromisoformat(WIRE_FIX_ISO)
+V1_RATIO = {"dashboard": 12.3, "study": 4.9, "study-native": 4.9, "study-demo": 5.0}
+
+
+def v1_scale(app: str | None, ts) -> float:
+    """Multiplier that converts a meter-v1 byte count into wire bytes: 1.0 for
+    anything metered after WIRE_FIX_DT (or with an unknown app/unparseable
+    timestamp), 1/V1_RATIO[app] otherwise -- i.e. stored bytes * v1_scale()
+    is wire bytes. Duck-typed `ts` (epoch seconds, ISO-8601 string or datetime
+    -- JSONL lines carry epoch, rollup rows carry ISO), never raises."""
+    if ts is None:
+        return 1.0
+    try:
+        if isinstance(ts, dt.datetime):
+            t = ts
+        elif isinstance(ts, (int, float)):
+            t = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
+        else:
+            t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+    except Exception:  # noqa: BLE001 -- unreadable ts: report the raw bytes
+        return 1.0
+    if t >= WIRE_FIX_DT:
+        return 1.0
+    ratio = V1_RATIO.get(app or "", 0.0)
+    return 1.0 / ratio if ratio > 1 else 1.0
+
+
 def _maybe_flush() -> None:
     global _last_flush
     now = time.time()
@@ -349,7 +407,11 @@ def _read_lines(path: str, field: str, since_ts: float = 0.0,
                 app: str | None = None) -> dict[str, int]:
     """Aggregate one field ("counts" | "bytes") of flushed JSONL lines.
     `app` filters to one writer (several services can share a file -- e.g.
-    study + study-demo). Malformed lines are skipped, never raised."""
+    study + study-demo). Malformed lines are skipped, never raised.
+
+    "bytes" is corrected for meter v1 (see WIRE_FIX_DT above): lines written
+    before the num_bytes_downloaded fix hold decompressed payload size, so
+    they're scaled to wire bytes here. Counts are never scaled."""
     totals: dict[str, int] = {}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -362,8 +424,9 @@ def _read_lines(path: str, field: str, since_ts: float = 0.0,
                     continue
                 if app is not None and entry.get("app") != app:
                     continue
+                scale = v1_scale(entry.get("app"), entry.get("ts")) if field == "bytes" else 1.0
                 for key, n in (entry.get(field) or {}).items():
-                    totals[key] = totals.get(key, 0) + int(n)
+                    totals[key] = totals.get(key, 0) + int(round(n * scale))
     except FileNotFoundError:
         pass
     except Exception:  # noqa: BLE001

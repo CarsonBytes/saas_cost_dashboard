@@ -332,6 +332,42 @@ def test_meter_tracks_bytes_and_filters_by_app(_meter_isolated):
         {"GET questions": 2}
 
 
+def test_meter_v1_bytes_scaled_on_read_only(tmp_path):
+    """Meter v1 (before WIRE_FIX_DT) stored the DEcompressed payload: reads
+    must scale bytes back to wire bytes per app, while request counts and the
+    raw file stay untouched -- the retro for "GET llm_calls: 441 MB" on a
+    1.4 MB table."""
+    import time
+    import supabase_meter
+    pre = supabase_meter.WIRE_FIX_DT.timestamp() - 3600
+    post = time.time()
+    path = str(tmp_path / "v1.jsonl")
+    lines = [
+        {"ts": pre, "app": "dashboard", "counts": {"GET llm_calls": 3},
+         "bytes": {"GET llm_calls": 12200}},
+        {"ts": pre, "app": "study", "counts": {"GET llm_calls": 2},
+         "bytes": {"GET llm_calls": 4700}},
+        {"ts": pre, "app": "quant", "counts": {"GET llm_calls": 1},
+         "bytes": {"GET llm_calls": 500}},   # ~1x measured: left alone
+        {"ts": post, "app": "dashboard", "counts": {"GET llm_calls": 4},
+         "bytes": {"GET llm_calls": 400}},   # post-fix: already wire bytes
+    ]
+    with open(path, "w", encoding="utf-8") as fh:
+        for line in lines:
+            fh.write(json.dumps(line) + "\n")
+    assert supabase_meter.read_bytes(path) == {
+        "GET llm_calls": round(12200 / 12.3) + round(4700 / 4.9) + 500 + 400}
+    assert supabase_meter.read_bytes(path, app="dashboard") == {
+        "GET llm_calls": round(12200 / 12.3) + 400}
+    assert supabase_meter.read_totals(path) == {"GET llm_calls": 10}  # never scaled
+    raw = [json.loads(l) for l in open(path, encoding="utf-8")]
+    assert raw[0]["bytes"]["GET llm_calls"] == 12200  # write path stays raw
+    assert supabase_meter.v1_scale("dashboard", "2026-09-14T05:00:00+00:00") == pytest.approx(1 / 12.3)
+    assert supabase_meter.v1_scale("dashboard", "2026-09-16T05:00:00+00:00") == 1.0
+    assert supabase_meter.v1_scale("quant", "2026-09-14T05:00:00+00:00") == 1.0  # ~1x: alone
+    assert supabase_meter.v1_scale(None, pre) == 1.0  # unknown app/ts: report raw
+
+
 def test_meter_response_bytes_prefers_content_length(_meter_isolated):
     supabase_meter = _meter_isolated
     from types import SimpleNamespace
@@ -634,6 +670,47 @@ def test_meter_rollup_pages_past_1000_rows_and_settles_history(monkeypatch, tmp_
     bounded = ledger.fetch_meter_rollup(
         since_iso=since, until_iso=(settled_h - _dt.timedelta(hours=1)).isoformat())
     assert sum(r["requests"] for r in bounded) == 2500 and calls == []
+
+
+def test_fetch_meter_rollup_scales_meter_v1_bytes(monkeypatch, tmp_path):
+    """Folded hourly cells keep raw meter-v1 bytes on disk; every row
+    fetch_meter_rollup RETURNS is divided back to wire bytes (pre-fix
+    dashboard /12.3) and requests are never touched."""
+    import time
+    import supabase_meter
+    _isolated_rollup_store(monkeypatch, tmp_path)
+    monkeypatch.setattr(ledger, "SUPABASE_URL", "")  # no network: tail stays empty
+    ledger._fold_rollup_rows(ledger._load_rollup_store(), [
+        {"ts": "2026-09-14T05:20:00+00:00", "app": "dashboard", "endpoint": "GET llm_calls",
+         "requests": 10, "bytes": 12200},
+        {"ts": "2026-09-20T05:20:00+00:00", "app": "dashboard", "endpoint": "GET llm_calls",
+         "requests": 5, "bytes": 500},          # post-fix: already wire bytes
+        {"ts": "2026-09-14T05:20:00+00:00", "app": "quant", "endpoint": "GET llm_calls",
+         "requests": 7, "bytes": 700},          # measured ~1x: left alone
+    ])
+    ledger._save_rollup_store()
+    rows = ledger.fetch_meter_rollup(since_iso="2026-09-01T00:00:00+00:00",
+                                     until_iso="2026-09-30T00:00:00+00:00")
+    by = {(r["ts"][:13], r["app"]): r for r in rows}
+    assert by[("2026-09-14T05", "dashboard")]["bytes"] == round(12200 / 12.3)
+    assert by[("2026-09-14T05", "quant")]["bytes"] == 700
+    assert by[("2026-09-20T05", "dashboard")]["bytes"] == 500
+    assert by[("2026-09-14T05", "dashboard")]["requests"] == 10
+    raw = json.loads((tmp_path / "hourly.json").read_text(encoding="utf-8"))
+    assert raw["hours"]["2026-09-14T05|dashboard|GET llm_calls"] == [10, 12200]
+    assert supabase_meter.v1_scale("dashboard", "2026-09-14T05") == pytest.approx(1 / 12.3)
+    # the unsettled tail (minute rows) can only be post-fix, so it passes
+    # through raw -- no double-scaling when the hour later settles and folds
+    ledger._ROLLUP_CACHE.update({"ts": 0.0, "rows": []})
+    recent = dt.datetime.now(dt.timezone.utc).isoformat()
+    monkeypatch.setattr(ledger, "_fetch_rollup_range", lambda start, end=None: [
+        {"ts": recent, "app": "study", "endpoint": "GET answer_log",
+         "requests": 3, "bytes": 300}])
+    tail = ledger.fetch_meter_rollup(since_iso="2026-09-01T00:00:00+00:00",
+                                     until_iso="2026-09-30T00:00:00+00:00")
+    assert [r for r in tail if r["app"] == "study" and r["requests"] == 3] == [
+        {"ts": recent, "app": "study", "endpoint": "GET answer_log",
+         "requests": 3, "bytes": 300, "details": []}]
 
 
 def test_reported_requests_filters_buckets_to_window():

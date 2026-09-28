@@ -1578,6 +1578,17 @@ def _supabase_tab() -> None:
         ui.label(f"Supabase-reported total unavailable: {note}. Metered traffic "
                  f"below is this ecosystem's own count only.") \
             .classes("text-sm text-grey-6 mt-1").mark("reconciliation-line")
+    if _start_dt < supabase_meter.WIRE_FIX_DT:
+        # Meter v1 recorded decompressed payload, not wire bytes (see
+        # supabase_meter.V1_RATIO) -- without this note a 30d window would
+        # silently show "GET llm_calls: 441 MB", which is the retro in one
+        # line: 77% of that never left the socket as egress.
+        ui.label(f"Note: bytes metered before {ledger.to_hkt(supabase_meter.WIRE_FIX_DT):%Y-%m-%d %H:%M} "
+                 f"HKT came from meter v1 (decompressed JSON payload, not wire bytes) and are divided "
+                 f"back out on read here -- dashboard ÷12.3, study ÷4.9, study-demo ÷5.0, each measured "
+                 f"per app from that deploy's own 12h-before/12h-after cutover (quant/event-radar ~1, "
+                 f"unchanged). Request counts were always accurate.") \
+            .classes("text-xs text-grey-6 mt-1").mark("meter-v1-note")
 
     # ---- 1b. egress over time by app, with change vs the previous window -----
     ui.label(f"Egress over time by app ({window_label})").classes("text-sm font-bold mt-4")

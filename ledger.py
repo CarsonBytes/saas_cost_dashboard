@@ -207,6 +207,17 @@ def _fetch_rollup_range(start: dt.datetime, end: dt.datetime | None = None) -> l
         return None
 
 
+def _wire_bytes(ts, app: str | None, nbytes) -> int:
+    """Read-side meter-v1 correction: fold/snapshotted cells store raw values
+    (see supabase_meter.WIRE_FIX_DT), so every row this module RETURNS is
+    scaled to wire bytes here. Never writes -- the store file keeps the raw
+    number, which is why scaling can be tuned later without a data migration.
+    Requests are untouched; 0/None passes through."""
+    if not nbytes:
+        return int(nbytes or 0)
+    return int(round((nbytes or 0) * supabase_meter.v1_scale(app, ts)))
+
+
 def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = None) -> list[dict]:
     """Rows of the cross-project meter_rollup table for [since, until) --
     hour-granularity for settled history, raw minute rows for the unsettled
@@ -223,7 +234,12 @@ def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = Non
     Paginated because PostgREST caps each response at 1,000 rows regardless
     of any client `limit` (a 24h window matched 4,523 rows but returned only
     the newest 1,000 -- every range button collapsed to the same trailing
-    slice)."""
+    slice).
+
+    Bytes for rows metered before 2026-09-15 13:10 UTC are scaled back to
+    wire bytes by _wire_bytes() (meter v1 recorded decompressed payload --
+    see supabase_meter.WIRE_FIX_DT for the measured per-app ratios); the raw
+    values stay in the store file. Requests were always accurate."""
     now = time.time()
     now_dt = dt.datetime.fromtimestamp(now, dt.timezone.utc)
     since = _utc(since_iso) if since_iso else now_dt - dt.timedelta(hours=24)
@@ -268,7 +284,7 @@ def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = Non
             # stays continuous without rewriting the store file.
             app = _canon_app(app)
             out.append({"ts": h.isoformat(), "app": app, "endpoint": endpoint,
-                        "requests": n, "bytes": b,
+                        "requests": n, "bytes": _wire_bytes(f"{hour}:00:00+00:00", app, b),
                         "details": list(udetail.get(f"{hour}|{endpoint}", []))
                         if app == "unknown" else []})
     for r in _ROLLUP_CACHE["rows"]:
@@ -277,7 +293,8 @@ def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = Non
             detail = r.get("detail")
             app = _canon_app(r.get("app"))
             out.append({"ts": r["ts"], "app": app, "endpoint": r.get("endpoint"),
-                        "requests": r.get("requests"), "bytes": r.get("bytes"),
+                        "requests": r.get("requests"),
+                        "bytes": _wire_bytes(r["ts"], app, r.get("bytes")),
                         "details": [detail] if isinstance(detail, dict) else []})
     return out
 
