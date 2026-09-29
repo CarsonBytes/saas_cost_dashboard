@@ -4,7 +4,7 @@ setting (incl. the read-modify-write regression), and noc's 6-hour uptime
 slots. UI-level coverage lives in test_render_smoke.py."""
 import datetime as dt
 import json
-
+import time
 import pytest
 
 import alerts
@@ -227,6 +227,96 @@ def test_maintenance_window_lifecycle(tmp_path, monkeypatch):
     finally:
         if state_file.exists():
             state_file.unlink()
+
+
+# ---- cold-start grace / page suppression (added 2026-09-29) -------------------
+
+def _offline_cycle(monkeypatch, sent, files, state):
+    """Wire noc._refresh_health to ONE fake alert_only agent with every
+    network/Supabase/docker side effect stubbed, so a whole monitoring cycle
+    runs offline and only the paging behaviour under test stays real.
+    conftest neuters the public refresh_health() wrapper, hence _refresh_health."""
+    fake = {
+        "name": "SpendLens",
+        "business_impact": "medium",
+        "desc": "test double", "icon": "savings", "links": [],
+        "monitor": True,
+        "restart": "alert_only",
+        "project_tag": None,
+        "freshness_sec": None,
+        "container": None,
+    }
+    monkeypatch.setattr(noc.services, "SERVICES", [fake])
+    monkeypatch.setattr(noc, "_load_state", lambda: state)
+    monkeypatch.setattr(noc, "_save_state", lambda s: None)
+    monkeypatch.setattr(noc, "_liveness", lambda svc: False)  # agent is DOWN
+    monkeypatch.setattr(noc, "_dependency_probe_results", lambda: {})
+    monkeypatch.setattr(noc, "_latest_write_safe", lambda svc: None)
+    monkeypatch.setattr(noc, "_container_stats_map", lambda: {})
+    monkeypatch.setattr(noc.governance, "compliance_health", lambda: {})
+    monkeypatch.setattr(noc.governance, "auto_quarantine_targets", lambda: {})
+    monkeypatch.setattr(noc, "_retry_pending_alerts", lambda s: None)
+    monkeypatch.setattr(noc, "_STATUS_CACHE", {})
+    monkeypatch.setattr(noc.alerts, "send_telegram",
+                        lambda text, **kw: sent.append(text) or True)
+    monkeypatch.setattr(noc, "_write_alert_file",
+                        lambda service, message, alert_type="unknown":
+                        files.append((service, message, alert_type)))
+
+
+def test_cold_start_grace_suppresses_page_then_pages_for_real(monkeypatch):
+    """Live regression: the 05:30 Docker Daily Restart does `wsl --shutdown`,
+    which restarts NOC with the fleet -- its first probe cycle then landed
+    53s in and paged 4 agents (05:31 HKT, 2026-09-29) that were merely still
+    booting. Inside the grace nothing goes out; anything still down once it
+    expires pages exactly once."""
+    sent, files, state = [], [], {}
+    _offline_cycle(monkeypatch, sent, files, state)
+
+    # Cycle 1: NOC just booted, agent is down but mid-warmup.
+    monkeypatch.setattr(noc, "_PROCESS_START", time.time())
+    noc._refresh_health()
+    assert sent == [] and files == []
+    assert not state.get("alerted_unhealthy")   # not recorded as "already told"
+
+    # Cycle 2: grace expired and it is still down -> one page, one alert file.
+    monkeypatch.setattr(noc, "_PROCESS_START", time.time() - 400)
+    noc._refresh_health()
+    assert len(sent) == 1 and len(files) == 1
+    assert "liveness check failed" in sent[0]
+    assert state.get("alerted_unhealthy") == {"SpendLens": True}
+
+    # Cycle 3: still down -> the flag dedups, no repeat page.
+    noc._refresh_health()
+    assert len(sent) == 1
+
+    # Cycle 4: recovered -> flag clears so a later outage can page again.
+    monkeypatch.setattr(noc, "_liveness", lambda svc: True)
+    noc._refresh_health()
+    assert not state.get("alerted_unhealthy")
+
+
+def test_maintenance_window_suppresses_page_until_it_ends(monkeypatch):
+    """A3 says a maintenance window records but never pages. The send block
+    used to sit at the SAME indent as `if muted:`, so the page went out anyway
+    (and `reason` was unbound -> NameError -> aborted cycle)."""
+    sent, files, state = [], [], {"maintenance": {
+        "until": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)).isoformat(),
+        "scope": "all"}}
+    _offline_cycle(monkeypatch, sent, files, state)
+    monkeypatch.setattr(noc, "_PROCESS_START", time.time() - 400)  # NOT cold-starting
+
+    # Down inside the window: observed, never paged, flag left clear.
+    noc._refresh_health()
+    assert sent == [] and files == []
+    assert not state.get("alerted_unhealthy")
+
+    # Window over and it is still down -> pages once, then dedups.
+    state.pop("maintenance")
+    noc._refresh_health()
+    assert len(sent) == 1 and state.get("alerted_unhealthy") == {"SpendLens": True}
+    noc._refresh_health()
+    assert len(sent) == 1
 
 
 # ---- A2: Telegram command handlers -------------------------------------------------

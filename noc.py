@@ -97,6 +97,21 @@ RESTART_LOCK_COUNT_DEFAULT = 3     # restarts within the window that trigger a l
 _UPTIME_DAYS = 7
 _INCIDENT_LIMIT = 50
 
+# Cold-start grace (ADDED 2026-09-29): a NOC process start almost always means
+# the WHOLE fleet just came back -- the 05:30 Docker Daily Restart runs
+# `wsl --shutdown`, which kills this container alongside everything else.
+# Containers then boot together, the router has just rebooted and cloudflared/
+# DNS are still re-establishing, so NOC's first probe cycle lands about a
+# minute in, mid-warmup. Live 2026-09-29: fleet booted 05:30:19 HKT and the
+# first cycle paged 4 agents as down at 05:31:12-18, all healthy moments
+# later. _RESTART_GRACE_SEC cannot cover this -- it only applies to restarts
+# NOC itself recorded in state["restarts"], and a WSL shutdown records none.
+# Until this grace expires: never auto-bounce (a probe miss means "not up
+# YET"), never page an alert_only agent, and don't record the outage as an
+# alert -- whatever is STILL down once the grace expires pages normally.
+_COLD_START_GRACE_SEC = 300
+_PROCESS_START = time.time()
+
 # Uptime-strip buckets (ADDED 2026-08-26): the daily ok/fail buckets behind
 # _uptime_7d can't draw a status-page strip -- a day is too coarse to show
 # WHEN in the week an agent was down. The health cycle additionally folds each
@@ -1127,6 +1142,10 @@ def _refresh_health() -> None:
         compliance = governance.compliance_health()  # agent -> OVERDUE rule names
         auto_targets = governance.auto_quarantine_targets()  # agent -> {rule, rule_id}
         stats_map = _container_stats_map()  # container name -> {usage_bytes, limit_bytes}
+        # Recomputed every cycle (not just at import): a long-lived NOC leaves
+        # the window; a container that just booted is inside it. See
+        # _COLD_START_GRACE_SEC for why process age == fleet age here.
+        cold_start = (time.time() - _PROCESS_START) < _COLD_START_GRACE_SEC
 
         for svc in monitored:
             name = svc["name"]
@@ -1268,6 +1287,12 @@ def _refresh_health() -> None:
                     and svc["restart"] == "auto_heal":
                 if muted:
                     pass  # maintenance window: observe, don't act (A3)
+                elif cold_start:
+                    # Fleet still warming from a mass restart: this probe miss
+                    # means "not up YET", not "crashed". Bouncing it now would
+                    # restart a container mid-boot and stretch the very outage
+                    # the warmup already creates.
+                    pass
                 elif blocked_by:
                     pass  # circuit breaker: dependency confirmed down
                 elif locked:
@@ -1290,25 +1315,39 @@ def _refresh_health() -> None:
             elif unhealthy and svc["restart"] == "alert_only" \
                     and not prev.get(name, {}).get("alerted_unhealthy") \
                     and not state.get("alerted_unhealthy", {}).get(name):
-                if muted:
-                    pass  # maintenance window: record, don't page (A3)
                 # ADDED 2026-08-17: this used to always say "liveness check
                 # failed" -- fine while every alert_only agent was liveness-
                 # only, wrong the moment one (Quant Live) can also go
                 # unhealthy purely from staleness while still reachable.
-                elif not up:
-                    reason = "liveness check failed"
-                    incident_detail = "down alert"
+                # FIXED 2026-09-29: the send/incident block below used to sit
+                # at the SAME indent as `if muted:`, so a maintenance window
+                # never actually suppressed the page -- and it reached an
+                # unbound `reason` (NameError -> aborted cycle) whenever no
+                # earlier agent in the loop had set one. A suppressed cycle now
+                # skips the whole block, and deliberately does NOT record
+                # alerted_unhealthy: that flag means "the operator was already
+                # told", so if we stayed quiet, whatever is still down once the
+                # window or cold-start grace ends pages then.
+                if muted:
+                    pass  # maintenance window: record, don't page (A3)
+                elif cold_start:
+                    pass  # fleet still warming from a mass restart
                 else:
-                    reason = f"stale -- {detail or 'no recent data'}"
-                    incident_detail = "staleness alert"
-                ok = alerts.send_telegram(
-                    f"{name} is unhealthy ({reason})", tag="NOC",
-                    emoji="\U0001f6a8")
-                _write_alert_file(name, f"{name} is unhealthy ({reason})", incident_detail)
-                _add_incident(state, name, "alert sent",
-                              outcome="telegram" if ok else "telegram failed",
-                              detail=incident_detail)
+                    if not up:
+                        reason = "liveness check failed"
+                        incident_detail = "down alert"
+                    else:
+                        reason = f"stale -- {detail or 'no recent data'}"
+                        incident_detail = "staleness alert"
+                    ok = alerts.send_telegram(
+                        f"{name} is unhealthy ({reason})", tag="NOC",
+                        emoji="\U0001f6a8")
+                    _write_alert_file(name, f"{name} is unhealthy ({reason})",
+                                      incident_detail)
+                    _add_incident(state, name, "alert sent",
+                                  outcome="telegram" if ok else "telegram failed",
+                                  detail=incident_detail)
+                    state.setdefault("alerted_unhealthy", {})[name] = True
 
             # uptime: "healthy" = liveness ok AND readiness not a real fault.
             # Idle (stale but not enforced_cadence, e.g. Study Platform
@@ -1334,19 +1373,22 @@ def _refresh_health() -> None:
                 "uptime_7d": _uptime_7d(state, name, now),
                 "memory_mb": memory_mb,
                 "memory_limit_mb": memory_limit_mb,
+                # "operator already paged for this outage" -- the in-memory prev
+                # OR the file-backed flag (which the alert_only branch above
+                # sets in the same cycle a page actually goes out). The
+                # `or unhealthy` this used to carry made prev True on ANY
+                # unhealthy cycle, which would have swallowed the page due
+                # after a suppressed (maintenance / cold-start) cycle.
                 "alerted_unhealthy": (prev.get(name, {}).get("alerted_unhealthy", False)
                                        or state.get("alerted_unhealthy", {}).get(name, False)
-                                       or unhealthy) if svc["restart"] == "alert_only" else False,
+                                       ) if svc["restart"] == "alert_only" else False,
             }
 
-            # Persist alerted_unhealthy to file-backed state so it survives
-            # container restarts (FIXED: was only in _STATUS_CACHE which is
-            # wiped on every restart, causing repeated Telegram alerts).
-            if svc["restart"] == "alert_only" and unhealthy:
-                state.setdefault("alerted_unhealthy", {})[name] = True
-            elif svc["restart"] == "alert_only" and not unhealthy:
-                # Agent recovered — clear the flag so future staleness alerts
-                # can fire again if it goes unhealthy later.
+            # Clear on recovery so the next genuine outage pages again. The
+            # True side now lives with the send (was an unconditional
+            # `and unhealthy` here, which marked a suppressed cycle as already
+            # reported and hid real outages that started mid-window).
+            if svc["restart"] == "alert_only" and not unhealthy:
                 state.get("alerted_unhealthy", {}).pop(name, None)
 
         _retry_pending_alerts(state)
