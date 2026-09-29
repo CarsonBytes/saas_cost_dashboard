@@ -13,9 +13,26 @@ def _seed_caches_once():
     timing-sensitive render assertions start, so noc._STATUS_CACHE and
     governance's cache aren't empty for the handful of tests that read real
     data out of them (uptime strip, recent-incidents expander, audit trail).
-    Outside any per-test budget, so real network latency here is harmless."""
-    noc.refresh_health()
-    governance.check_pending_rules()
+    Outside any per-test budget, so real network latency here is harmless.
+
+    Only the probe/lookup half is real. FIXED 2026-09-29: this seed runs a
+    FULL cycle, so when a service happened to be unhealthy at the moment the
+    suite ran it emitted a production alert -- a real file into
+    D:\\claude\\alerts\\pending (the live listener picked it up 5s later and
+    dispatched a real 15-minute auto-debug session) plus a Telegram push. A
+    test must never notify; stub the two outbound calls and restore them in a
+    finally, since session scope has no monkeypatch fixture."""
+    import alerts  # local: patched only for the duration below
+
+    real_send, real_write = alerts.send_telegram, noc._write_alert_file
+    alerts.send_telegram = lambda *a, **k: True
+    noc._write_alert_file = lambda *a, **k: None
+    try:
+        noc.refresh_health()
+        governance.check_pending_rules()
+    finally:
+        alerts.send_telegram = real_send
+        noc._write_alert_file = real_write
 
 
 @pytest.fixture(autouse=True)
