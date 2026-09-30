@@ -73,6 +73,46 @@ def test_window_totals_sums_all_counts():
                       "prompt_tokens": 100, "completion_tokens": 60}
 
 
+# ---- S1/S2: prompt-token truth (migration 006) --------------------------------
+
+def test_trusted_prompt_tokens_prefers_estimate_over_provider():
+    # chatanywhere counts CJK up to ~5.8x reality; our own estimate (written by
+    # each service at POST time) is what the KPIs should add up
+    row = {"prompt_tokens": 9_404, "prompt_tokens_est": 1_626, "suspect": False}
+    assert ledger.trusted_prompt_tokens(row) == 1_626
+
+
+def test_trusted_prompt_tokens_drops_suspect_phantom():
+    # the four real rows that claimed 1,000,000 tokens in 200ms
+    row = {"prompt_tokens": 1_000_000, "prompt_tokens_est": None, "suspect": True}
+    assert ledger.trusted_prompt_tokens(row) == 0
+    # a flagged row that still has an estimate keeps the estimate, never the claim
+    row = {"prompt_tokens": 1_000_000, "prompt_tokens_est": 612, "suspect": True}
+    assert ledger.trusted_prompt_tokens(row) == 612
+
+
+def test_trusted_prompt_tokens_falls_back_for_pre_006_rows():
+    # NULL estimate + not suspect: written before migration 006, provider number
+    # is the only figure they have
+    assert ledger.trusted_prompt_tokens({"prompt_tokens": 3_378}) == 3_378
+    assert ledger.trusted_prompt_tokens({"prompt_tokens": None}) == 0
+    assert ledger.trusted_prompt_tokens({}) == 0
+
+
+def test_totals_and_breakdowns_use_trusted_tokens():
+    rows = [
+        {"cost_usd": 0.1, "prompt_tokens": 9_404, "prompt_tokens_est": 1_626, "suspect": False,
+         "created_at": "2026-09-30T01:00:00Z"},
+        {"cost_usd": 0.1, "prompt_tokens": 1_000_000, "prompt_tokens_est": None, "suspect": True,
+         "created_at": "2026-09-30T02:00:00Z"},
+        {"cost_usd": 0.1, "prompt_tokens": 500, "created_at": "2026-09-30T03:00:00Z"},
+    ]  # the 3rd row is a pre-006 write: no estimate, not suspect
+    assert ledger.window_totals(rows)["prompt_tokens"] == 1_626 + 0 + 500
+    assert ledger.build_stats(rows, days=1)["total_prompt_tokens"] == 2_126
+    by_model = ledger.aggregate_by(rows, ["model"])
+    assert sum(b["prompt_tokens"] for b in by_model) == 2_126
+
+
 def test_delta_sub_directions_and_zero_baseline():
     import app
     app.STATE["days"] = 7

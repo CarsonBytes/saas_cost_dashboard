@@ -301,7 +301,33 @@ def fetch_meter_rollup(since_iso: str | None = None, until_iso: str | None = Non
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-_SELECT = "project,call_type,provider,environment,model,purpose,prompt_tokens,completion_tokens,cost_usd,latency_ms,created_at"
+_SELECT = ("project,call_type,provider,environment,model,purpose,"
+           "prompt_tokens,completion_tokens,cost_usd,latency_ms,created_at,"
+           # S1/S2 (2026-09-30 token-usage spec, migration 006): the writer's own
+           # CJK-aware count of the prompt it sent, plus a flag for provider usage
+           # that cannot be physically real. Both NULL for rows written before 006.
+           "prompt_tokens_est,suspect")
+
+
+def trusted_prompt_tokens(row: dict) -> int:
+    """S1/S2: the prompt-token count this dashboard should add up.
+
+    The provider's `prompt_tokens` is what chatanywhere enforces quota against,
+    but it is not trustworthy as a measurement -- measured 2026-09-30 it counted
+    CJK rerank batches up to ~5.8x reality (2.7 tok/char) and reported four
+    impossible "1,000,000 tokens in 200ms" embedding rows. So:
+      * `suspect` rows contribute only their estimate (usually 0) -- the
+        phantom claim never inflates a KPI;
+      * rows with an estimate contribute the estimate (same constants as the
+        writers: 6.0 chars/ASCII token, 4.8 chars/CJK token, rounded down);
+      * pre-006 rows (NULL estimate, not suspect) fall back to the provider
+        number -- it is the only figure they have.
+    Completion tokens are untouched: the proxy never over-reported them and no
+    writer produces an independent count."""
+    if row.get("suspect"):
+        return int(row.get("prompt_tokens_est") or 0)
+    est = row.get("prompt_tokens_est")
+    return int(est) if est is not None else int(row.get("prompt_tokens") or 0)
 
 # HKT has no DST, always UTC+8, so no zoneinfo/tzdata dependency needed. Mirrors
 # quant's analyst/usage_log.py::_hkt_today_start_utc() and event_radar's
@@ -562,7 +588,7 @@ def window_totals(rows: list[dict]) -> dict:
     return {
         "calls": len(rows),
         "cost_usd": round(sum(r.get("cost_usd") or 0 for r in rows), 6),
-        "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in rows),
+        "prompt_tokens": sum(trusted_prompt_tokens(r) for r in rows),
         "completion_tokens": sum(r.get("completion_tokens") or 0 for r in rows),
     }
 
@@ -607,7 +633,7 @@ def aggregate_by(rows: list[dict], fields: list[str]) -> list[dict]:
             {"calls": 0, "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0, "latency_ms": 0})
         b["calls"] += 1
         b["cost_usd"] += row.get("cost_usd") or 0
-        b["prompt_tokens"] += row.get("prompt_tokens") or 0
+        b["prompt_tokens"] += trusted_prompt_tokens(row)
         b["completion_tokens"] += row.get("completion_tokens") or 0
         b["latency_ms"] += row.get("latency_ms") or 0
     out = list(buckets.values())
@@ -656,7 +682,7 @@ def build_stats(rows: list[dict], days: int) -> dict:
         d = daily[day]
         d["calls"] += 1
         d["cost_usd"] += row.get("cost_usd") or 0
-        d["prompt_tokens"] += row.get("prompt_tokens") or 0
+        d["prompt_tokens"] += trusted_prompt_tokens(row)
         d["completion_tokens"] += row.get("completion_tokens") or 0
     daily_series = [{"date": d, "calls": v["calls"], "cost_usd": round(v["cost_usd"], 6),
                      "prompt_tokens": v["prompt_tokens"], "completion_tokens": v["completion_tokens"]}
@@ -666,7 +692,7 @@ def build_stats(rows: list[dict], days: int) -> dict:
         "range_days": days,
         "total_calls": len(rows),
         "total_cost_usd": round(sum(r.get("cost_usd") or 0 for r in rows), 6),
-        "total_prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in rows),
+        "total_prompt_tokens": sum(trusted_prompt_tokens(r) for r in rows),
         "total_completion_tokens": sum(r.get("completion_tokens") or 0 for r in rows),
         "by_project": aggregate_by(rows, ["project"]),
         "by_call_type": aggregate_by(rows, ["project", "call_type"]),
