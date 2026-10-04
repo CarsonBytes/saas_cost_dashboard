@@ -110,6 +110,20 @@ D:\claude\alerts\audit\alerts.jsonl          (host path, written by WSL cron)
 `outcome ∈ sent | failed | not-configured | suppressed-level |
 suppressed-cooldown-key | suppressed-cooldown-text | suppressed-cap`.
 
+Two details that each cost a real debugging session on 2026-10-04:
+
+- **The compose mount must be absolute.** The deployed compose runs from
+  `/home/cap/llm-usage-dashboard`, so the `../claude/alerts/audit` form
+  resolves to `/home/cap/claude/alerts/audit` — a *different* directory from
+  `/mnt/d/claude/alerts/audit` where the WSL-side cron writers append (they
+  were separate inodes; the container saw an empty dir while the watchdog had
+  already written four records). Absolute path, no `..`, no ambiguity.
+- **`http_status` must be valid JSON.** `curl -w '%{http_code}'` reports `000`
+  when it cannot connect at all, and raw interpolation produces
+  `"http_status":000` — a leading-zero number, which JSON rejects. The line
+  then fails to parse, silently dropping the one record that says a *critical*
+  push failed. Both bash writers normalise `000`/empty to `null`.
+
 The digest (§3) is **derived from this file**, not from a parallel counter —
 that is what makes it a true accounting of what did NOT page, and what lets
 the host-side bash producers (`infra-watchdog.sh`, `gateway-push.sh`) feed the
@@ -132,3 +146,6 @@ fact — that ambiguity cost a full debugging session on 2026-10-04.
 - A 20-hour storm (2026-09-26 scale) produces ≤ 3 messages, not 2,367.
 - The 2FA prompt still arrives for every **new** incident.
 - Every send attempt appears in `alerts.jsonl` with a non-empty `outcome`.
+- Every line of `alerts.jsonl` parses as JSON (`json.loads` on all of it).
+- The dashboard container and the WSL cron writers append to the *same* file
+  (`docker exec <noc> cat /app/alerts_audit/alerts.jsonl` shows watchdog rows).

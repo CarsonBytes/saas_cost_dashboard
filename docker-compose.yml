@@ -52,11 +52,17 @@ services:
       # ADDED 2026-10-04 (docs/NOTIFICATION_SPEC.md 6): the delivery audit
       # trail. alerts.py appends every push attempt -- sent, suppressed by
       # level/cooldown/cap, or failed -- and so does the host-side
-      # infra-watchdog, so ONE alerts.jsonl answers "was this actually
-      # delivered?" for every sender. A directory bind mount (not a file) so
-      # Docker creates the host side on first `up` instead of creating a
-      # directory where a file was expected.
-      - ../claude/alerts/audit:/app/alerts_audit
+      # infra-watchdog + gateway-push.sh, so ONE alerts.jsonl answers "was
+      # this actually delivered?" for every sender.
+      # ABSOLUTE, deliberately: the deployed compose runs from
+      # /home/cap/llm-usage-dashboard, so the `../claude/...` form used by
+      # pending_alerts above resolves to /home/cap/claude/alerts/audit --
+      # a DIFFERENT directory from the /mnt/d/claude/alerts/audit that the
+      # WSL-side cron writers use (verified: separate inodes, and the
+      # container saw an empty dir while the watchdog wrote 4 records).
+      # A directory bind (not a file) so Docker creates the host side on
+      # first `up` instead of creating a directory where a file was expected.
+      - /mnt/d/claude/alerts/audit:/app/alerts_audit
     dns:
       - 8.8.8.8
       - 1.1.1.1

@@ -100,6 +100,13 @@ key_slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_' ; }
 audit_alert() {
     local level="$1" outcome="$2" digest="$3" key="$4" text="$5" http="${6:-}"
     [ -n "$ALERT_AUDIT_FILE" ] || return 0
+    # curl reports `000` when it could not connect at all. Raw that becomes
+    # `http_status:000`, which is NOT valid JSON (leading zeros are forbidden),
+    # so the line would fail to parse and drop the record saying a CRITICAL
+    # push failed -- exactly the record section 6 exists to keep.
+    case "$http" in
+        ''|*[!0-9]*|000|0) http="null" ;;
+    esac
     mkdir -p "$(dirname "$ALERT_AUDIT_FILE")" 2>/dev/null || true
     printf '{"ts":"%s","level":"%s","source":"infra-watchdog","key":"%s","outcome":"%s","http_status":%s,"digest_eligible":%s,"text":"%s"}\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$(json_escape "$key")" "$outcome" \
