@@ -1,0 +1,16 @@
+# LF is mandatory for these, not a preference.
+#
+# The files below are executed by bash under WSL2 -- the deploy pipeline
+# (scripts/*.sh), the git hooks that trigger it (.githooks/*), and the
+# Dockerfile that docker parses. They are also copied straight out of the
+# working tree and executed (scripts/infra-watchdog.sh runs every minute from
+# cron as /home/cap/infra-watchdog.sh), so whatever is on disk is what runs.
+#
+# core.autocrlf=true is set for the Windows git on this machine, with no
+# attributes file overriding it. On the next checkout that touches one of these
+# files, git would write CRLF and bash would then fail on every line with
+# `$'\r': command not found` -- silently, from a deploy that looks like it ran.
+# Pinning eol=lf makes git write LF regardless of autocrlf.
+*.sh        text eol=lf
+.githooks/* text eol=lf
+Dockerfile  text eol=lf
