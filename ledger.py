@@ -903,9 +903,14 @@ def _scan_high_impact_calls() -> dict:
             key = (svc["name"], kind)
             now = time.time()
             if now - _FLAG_ALERT_CACHE.get(key, 0) >= _FLAG_ALERT_COOLDOWN_SEC:
+                # NOTIFICATION_SPEC: level="error" -- a real risk signal worth
+                # seeing every day, but not something needing a human in the next
+                # 12 minutes. It already has its own per-(service,kind) cooldown
+                # above, and it now also rolls into the daily digest.
                 alerts.send_telegram(
                     f"risk flag on {svc['name']}: possible {kind} in a logged call",
-                    tag="RISK", emoji="\U0001f6a8")
+                    tag="RISK", emoji="\U0001f6a8", level="error",
+                    key=f"risk:{svc['name']}:{kind}")
                 _FLAG_ALERT_CACHE[key] = now
             wstart, count = _ANOMALY_COUNTS.get(svc["name"], (now, 0))
             if now - wstart >= _ANOMALY_WINDOW_SEC:

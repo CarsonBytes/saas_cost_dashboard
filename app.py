@@ -577,8 +577,12 @@ async def _quarantine(svc: dict) -> None:
     failed = [c for c in containers if not await _proxy_action("pause", c)]
     if not failed:
         noc.quarantine_agent(svc["name"], reason="manual")
+        # NOTIFICATION_SPEC: level="info" -- the operator just clicked this
+        # button; telling them so over Telegram is pure echo.
         alerts.send_telegram(f"\U0001f6d1 {svc['name']} quarantined (operator pause): "
-                             f"{', '.join(containers)}", tag="NOC", emoji="\U0001f6d1")
+                             f"{', '.join(containers)}", tag="NOC",
+                             emoji="\U0001f6d1", level="info",
+                             key=f"app:quarantine:{svc['name']}")
         ui.notify(f"{svc['name']} paused + quarantined", type="warning")
     else:
         ui.notify(f"Pause failed for: {', '.join(failed)} (proxy unreachable?)", type="negative")

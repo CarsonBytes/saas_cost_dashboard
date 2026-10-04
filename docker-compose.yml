@@ -19,6 +19,12 @@ services:
       # -- all 4 down alerts of the 2026-09-28 04:31 outage were lost
       # that way (retro investigation).
       - ALERT_PENDING_DIR=/app/pending_alerts
+      # ADDED 2026-10-04 (docs/NOTIFICATION_SPEC.md 6): shared delivery audit
+      # trail, bound below as ../claude/alerts/audit. Set outside the named
+      # noc-state volume so the host-side infra-watchdog appends to the SAME
+      # file the container reads -- one alerts.jsonl answers "was this
+      # actually delivered?" for every sender.
+      - ALERT_AUDIT_DIR=/app/alerts_audit
     ports:
       # Cut over 2026-08-13: was 18095:8095 during parallel testing (native
       # Windows launcher still serving 8095). Native launcher decommissioned,
@@ -43,6 +49,14 @@ services:
       # listener runs on the Windows host, so the files must land on the
       # host filesystem.
       - ../claude/alerts/pending:/app/pending_alerts
+      # ADDED 2026-10-04 (docs/NOTIFICATION_SPEC.md 6): the delivery audit
+      # trail. alerts.py appends every push attempt -- sent, suppressed by
+      # level/cooldown/cap, or failed -- and so does the host-side
+      # infra-watchdog, so ONE alerts.jsonl answers "was this actually
+      # delivered?" for every sender. A directory bind mount (not a file) so
+      # Docker creates the host side on first `up` instead of creating a
+      # directory where a file was expected.
+      - ../claude/alerts/audit:/app/alerts_audit
     dns:
       - 8.8.8.8
       - 1.1.1.1

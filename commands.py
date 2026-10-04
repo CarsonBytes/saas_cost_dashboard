@@ -180,7 +180,12 @@ def poll_updates() -> int:
             continue  # not the operator's chat -- ignore silently
         reply = handle_text(msg.get("text", ""))
         if reply:
-            alerts.send_telegram(reply, tag="CMD", emoji="\U0001f916")
+            # NOTIFICATION_SPEC: force=True -- this is the answer to a message
+            # the operator just sent us, not an alert. Filtering it by severity
+            # would silently swallow every command reply.
+            alerts.send_telegram(reply, tag="CMD", emoji="\U0001f916",
+                                 level="info", force=True,
+                                 key=f"cmd:{msg.get('message_id')}")
             handled += 1
     _OFFSET_FILE.write_text(json.dumps({"offset": offset}))
     return handled

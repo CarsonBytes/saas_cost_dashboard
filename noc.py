@@ -670,10 +670,12 @@ def _send_lock_alert(name: str, lock_count: int = RESTART_LOCK_COUNT_DEFAULT) ->
            f"-- auto-unlock will be attempted after a cooldown, or clear it from "
            f"the dashboard / reply /unlock")
     _write_alert_file(name, msg, "locked")
-    if alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8"):
+    if alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8",
+                            level="critical", key=f"noc:lock:{name}"):
         return True
     time.sleep(5)
-    return alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8")
+    return alerts.send_telegram(msg, tag="NOC", emoji="\U0001f6a8",
+                                level="critical", key=f"noc:lock:{name}")
 
 
 def _retry_pending_alerts(state: dict) -> None:
@@ -685,7 +687,8 @@ def _retry_pending_alerts(state: dict) -> None:
         if alerts.send_telegram(
                 f"{name} locked: {lock_count} restarts within the last hour "
                 f"-- clear the lock from the dashboard",
-                tag="NOC", emoji="\U0001f6a8"):
+                tag="NOC", emoji="\U0001f6a8",
+                level="critical", key=f"noc:lock:{name}"):
             del state["pending_alerts"][name]
             _add_incident(state, name, "alert sent", outcome="telegram (retry)",
                           detail="lock alert")
@@ -920,7 +923,8 @@ def _passcode_attempt(state: dict, name: str, entered: str, now: dt.datetime) ->
             f"\U0001f512 {name}: {_AUTH_FAIL_LIMIT} failed quarantine-passcode attempts "
             f"in {_AUTH_FAIL_WINDOW_SEC // 60} min -- manual actions locked, "
             f"clear from the dashboard if this was you",
-            tag="NOC", emoji="\U0001f512")
+            tag="NOC", emoji="\U0001f512",
+            level="critical", key=f"noc:authlock:{name}")
 
     return False, "wrong passcode"
 
@@ -1221,7 +1225,8 @@ def _refresh_health() -> None:
                     alerts.send_telegram(
                         f"\U0001f6d1 {name} auto-quarantined: '{auto_target['rule']}' "
                         f"is OVERDUE -- container paused by policy",
-                        tag="NOC", emoji="\U0001f6d1")
+                        tag="NOC", emoji="\U0001f6d1",
+                        level="critical", key=f"noc:quarantine:{name}")
                     quarantine = "compliance-auto"
                 else:
                     _add_incident(state, name, "auto-quarantine failed",
@@ -1270,9 +1275,14 @@ def _refresh_health() -> None:
                     _add_incident(state, name, "auto-unlocked",
                                   outcome=f"cooldown elapsed ({strikes} strike(s)), deps stable",
                                   detail="one supervised recovery restart follows")
+                    # NOTIFICATION_SPEC: level="info" -- a success message about
+                    # something the system already fixed itself. Pushing it was
+                    # ~40% of recent NOC traffic and carried nothing the operator
+                    # could act on.
                     alerts.send_telegram(
                         f"\u2705 {name} auto-unlocked after cooldown -- attempting "
-                        f"one supervised recovery restart", tag="NOC", emoji="\u2705")
+                        f"one supervised recovery restart", tag="NOC", emoji="\u2705",
+                        level="info", key=f"noc:unlock:{name}")
                     outcome = "ok" if _restart_container(svc["container"]) else "failed"
                     state.setdefault("restarts", {}).setdefault(name, []).append(now.timestamp())
                     window = now.timestamp() - _RESTART_WINDOW_SEC
@@ -1339,13 +1349,20 @@ def _refresh_health() -> None:
                     else:
                         reason = f"stale -- {detail or 'no recent data'}"
                         incident_detail = "staleness alert"
-                    ok = alerts.send_telegram(
+                    # NOTIFICATION_SPEC: level="error" -- broken but not
+                    # action-required-now: an alert_only agent has no auto-heal
+                    # to run, and the state either self-corrects or is still
+                    # there 12h from now. This call site was the single largest
+                    # source of steady-state Telegram traffic, so it rolls into
+                    # the daily digest instead of paging.
+                    alerts.send_telegram(
                         f"{name} is unhealthy ({reason})", tag="NOC",
-                        emoji="\U0001f6a8")
+                        emoji="🚨", level="error",
+                        key=f"noc:unhealthy:{name}")
                     _write_alert_file(name, f"{name} is unhealthy ({reason})",
                                       incident_detail)
                     _add_incident(state, name, "alert sent",
-                                  outcome="telegram" if ok else "telegram failed",
+                                  outcome="digest (not paged -- critical only)",
                                   detail=incident_detail)
                     state.setdefault("alerted_unhealthy", {})[name] = True
 

@@ -419,10 +419,14 @@ def ingest_regulatory_updates() -> list[str]:
                             "impact_hint": update.get("impact_hint")})
                     deadline_txt = ledger.to_hkt(update["deadline"]).strftime("%Y-%m-%d") \
                         if update.get("deadline") else "no deadline"
+                    # NOTIFICATION_SPEC: compliance moves on the scale of days
+                    # -- a new task is a `warning`, not something needing a
+                    # human within minutes. Rolls into the daily digest.
                     alerts.send_telegram(
                         f"new compliance task: '{name}' (deadline {deadline_txt} HKT) "
                         f"-- created from regulatory update",
-                        tag="GOV", emoji="\U0001f4cb")
+                        tag="GOV", emoji="\U0001f4cb",
+                        level="warning", key=f"gov:create:{name}")
                     created.append(name)
             _patch("regulatory_updates", update["id"], {"consumed": True})
         return created
@@ -453,17 +457,22 @@ def _check_pending_rules() -> dict:
                        {"from": "PENDING", "to": "OVERDUE",
                         "deadline": rule.get("enforcement_deadline")})
                 deadline_txt = ledger.to_hkt(rule["enforcement_deadline"]).strftime("%Y-%m-%d %H:%M")
+                # NOTIFICATION_SPEC: an OVERDUE compliance rule is a slow-moving
+                # finding, not a minutes-scale emergency -- digest it.
                 alerts.send_telegram(
                     f"compliance rule '{rule['rule_name']}' is now OVERDUE "
                     f"(deadline {deadline_txt} HKT) -- review required",
-                    tag="GOV", emoji="\u26a0\ufe0f")
+                    tag="GOV", emoji="\u26a0\ufe0f",
+                    level="warning", key=f"gov:overdue:{rule['rule_name']}")
                 flipped.append(rule["rule_name"])
         # 2. deterministic matching (dormant until a snapshot source exists)
         if snapshot and _matches(rule, snapshot) \
                 and now.timestamp() - _MATCH_CACHE.get(rule["id"], 0) >= _MATCH_COOLDOWN_SEC:
+            # NOTIFICATION_SPEC: informational match -- digest, never page.
             alerts.send_telegram(
                 f"compliance rule '{rule['rule_name']}' matched current compliance state",
-                tag="GOV", emoji="\u26a0\ufe0f")
+                tag="GOV", emoji="\u26a0\ufe0f",
+                level="warning", key=f"gov:match:{rule['rule_name']}")
             _audit(rule["id"], "AUTO_ALERT_SENT", "system",
                    {"snapshot": snapshot})
             _MATCH_CACHE[rule["id"]] = now.timestamp()

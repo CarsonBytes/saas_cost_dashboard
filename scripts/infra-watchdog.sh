@@ -1,5 +1,5 @@
 #!/bin/bash
-# Unified container watchdog: checks all 9 monitored containers for health,
+# Unified container watchdog: checks all 13 monitored containers for health,
 # auto-restarts unhealthy ones, and alerts via Telegram if they fail to recover.
 # Replaces the quant-only docker-watchdog.sh with a single script covering
 # all stacks. Runs every 1 min via cron.
@@ -77,16 +77,100 @@ load_telegram() {
     fi
 }
 
+# --- NOTIFICATION_SPEC v1 (docs/NOTIFICATION_SPEC.md) -------------------------
+# Telegram is a PAGING channel, not a log sink: only `critical` reaches it.
+# Every other level is still written to the shared audit trail so the daily
+# digest can report what did NOT page -- a quiet channel that can't account
+# for its own silence is indistinguishable from a broken one.
+ALERT_AUDIT_FILE="${ALERT_AUDIT_FILE:-/mnt/d/claude/alerts/audit/alerts.jsonl}"
+CRITICAL_DAILY_CAP="${CRITICAL_DAILY_CAP:-10}"
+COOLDOWN_KEY_SEC="${COOLDOWN_KEY_SEC:-900}"
+
+# Strip characters that would break the JSONL record. Deliberately lossy --
+# the audit needs to be parseable, not pretty.
+json_escape() { printf '%s' "$1" | tr -d '"\\\r\n'; }
+
+# Sanitise an alert key into a filename-safe token (cooldown state is one
+# small file per key, so this must never contain a path separator).
+key_slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_' ; }
+
+# audit_alert <level> <outcome> <digest_eligible true|false> <key> <text> [http]
+# Appends one delivery attempt. Never fails the watchdog run -- a broken audit
+# trail must not be able to break the alert it describes.
+audit_alert() {
+    local level="$1" outcome="$2" digest="$3" key="$4" text="$5" http="${6:-}"
+    [ -n "$ALERT_AUDIT_FILE" ] || return 0
+    mkdir -p "$(dirname "$ALERT_AUDIT_FILE")" 2>/dev/null || true
+    printf '{"ts":"%s","level":"%s","source":"infra-watchdog","key":"%s","outcome":"%s","http_status":%s,"digest_eligible":%s,"text":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$(json_escape "$key")" "$outcome" \
+        "${http:-null}" "$digest" "$(json_escape "$text")" \
+        >> "$ALERT_AUDIT_FILE" 2>/dev/null || true
+}
+
+# record_alert <level> <key> <text> -- audit only, never pushes. This is the
+# path for the routine "restarting (attempt 1/3)" notices: on 2026-09-26 those
+# were 2,367 of the day's pushes.
+record_alert() {
+    audit_alert "$1" "suppressed-level" true "$2" "$3"
+}
+
+# send_telegram <key> <text> -- `critical` push with per-key cooldown and a
+# hard daily cap. Returns 0 if the message was actually accepted by Telegram.
 send_telegram() {
-    local msg="$1"
+    local key="$1" msg="$2" slug last now datef count status
     if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+        audit_alert critical not-configured false "$key" "$msg"
         return 0
     fi
-    curl -sf -X POST \
+
+    slug=$(key_slug "$key")
+    now=$(date +%s)
+
+    # Per-key cooldown: a retry loop must not re-page on every attempt.
+    last=$(count_get "tg_$slug")
+    if [ "$last" -gt 0 ] && [ $((now - last)) -lt "$COOLDOWN_KEY_SEC" ]; then
+        audit_alert critical "suppressed-cooldown-key" false "$key" "$msg"
+        return 0
+    fi
+
+    # Hard daily cap -- the structural guarantee that no single bug can flood
+    # the chat. The overflow is announced ONCE, never silently dropped.
+    datef=$(date +%Y%m%d)
+    if [ "$(count_get tg_cap_date)" != "$datef" ]; then
+        count_set tg_cap_date "$datef"; count_set tg_cap_count 0; count_set tg_cap_done 0
+    fi
+    count=$(count_get tg_cap_count)
+    if [ "$count" -ge "$CRITICAL_DAILY_CAP" ]; then
+        if [ "$(count_get tg_cap_done)" = "0" ]; then
+            count_set tg_cap_done 1
+            local collapse="+${CRITICAL_DAILY_CAP} more criticals suppressed today (cap reached) -- see the dashboard"
+            _st=$(_tg_post "$collapse")
+            audit_alert critical "${_st:+sent}" false "cap:collapse" "$collapse" "$_st"
+            return 0
+        fi
+        audit_alert critical suppressed-cap false "$key" "$msg"
+        return 0
+    fi
+
+    status=$(_tg_post "$msg")
+    count_set tg_cap_count "$((count + 1))"
+    count_set "tg_$slug" "$now"
+    if [ "$status" = "200" ]; then
+        audit_alert critical sent false "$key" "$msg" "$status"
+        return 0
+    fi
+    audit_alert critical failed false "$key" "$msg" "$status"
+    return 1
+}
+
+# _tg_post <text> -- one HTTP attempt; echoes the HTTP status ("" on transport
+# failure) so the caller can audit the real outcome instead of guessing.
+_tg_post() {
+    curl -s -o /dev/null -w '%{http_code}' -X POST \
         "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "text=🔴 [INFRA-WATCHDOG] ${msg}" \
-        --max-time 10 > /dev/null 2>&1
+        -d "text=🔴 [INFRA-WATCHDOG] $1" \
+        --max-time 10 2>/dev/null || true
 }
 
 # Read a counter. `tr -d -c '0-9'` is deliberate: it drops NUL bytes and any
@@ -125,12 +209,15 @@ may_restart() {
 
 # At most one alert per container per hour, so a container that is past its
 # restart budget still announces itself once without becoming a nuisance.
+# NOTIFICATION_SPEC: this is the only `critical` path in the script -- auto-
+# heal has given up and a human is required, which is exactly the decision
+# rule ("would ignoring this for 12 hours make it worse?").
 escalate_once() {
     local name="$1" msg="$2" hour
     hour=$(date +%Y%m%d%H)
     [ "$(count_get "esc_$name")" = "$hour" ] && return 0
     count_set "esc_$name" "$hour"
-    send_telegram "$msg"
+    send_telegram "escalate:$name" "$msg"
 }
 
 load_telegram
@@ -158,7 +245,11 @@ for entry in "${CONTAINERS[@]}"; do
         log_lines+="[$(ts)] $name status=$status (attempt $count)\n"
         if [ "$count" -ge 3 ]; then
             if may_restart "$name"; then
-                send_telegram "$name is $status for ${count}min — restarting (attempt $(count_get "rstc_$name")/$RESTART_LIMIT_PER_HOUR this hour)"
+                # NOTIFICATION_SPEC: `error`, not `critical` -- the restart
+                # itself succeeded, so there is nothing to act on. These three
+                # lines were 2,367 of 2026-09-26's pushes.
+                record_alert error "restart:status:$name" \
+                    "$name is $status for ${count}min — restarting (attempt $(count_get "rstc_$name")/$RESTART_LIMIT_PER_HOUR this hour)"
                 docker restart "$name" 2>/dev/null
                 count_set "$name" 0
             else
@@ -182,7 +273,8 @@ for entry in "${CONTAINERS[@]}"; do
             log_lines+="[$(ts)] $name unhealthy (attempt $count)\n"
             if [ "$count" -ge 2 ]; then
                 if may_restart "$name"; then
-                    send_telegram "$name unhealthy for ${count}min — restarting (attempt $(count_get "rstc_$name")/$RESTART_LIMIT_PER_HOUR this hour)"
+                    record_alert error "restart:health:$name" \
+                        "$name unhealthy for ${count}min — restarting (attempt $(count_get "rstc_$name")/$RESTART_LIMIT_PER_HOUR this hour)"
                     docker restart "$name" 2>/dev/null
                     count_set "$name" 0
                 else
@@ -218,7 +310,8 @@ for entry in "${CONTAINERS[@]}"; do
             log_lines+="[$(ts)] $name HTTP :$check not responding (attempt $count)\n"
             if [ "$count" -ge 3 ]; then
                 if may_restart "$name"; then
-                    send_telegram "$name HTTP :$check unreachable for ${count}min — restarting (attempt $(count_get "rstc_$name")/$RESTART_LIMIT_PER_HOUR this hour)"
+                    record_alert error "restart:http:$name" \
+                        "$name HTTP :$check unreachable for ${count}min — restarting (attempt $(count_get "rstc_$name")/$RESTART_LIMIT_PER_HOUR this hour)"
                     docker restart "$name" 2>/dev/null
                     count_set "$name" 0
                 else
