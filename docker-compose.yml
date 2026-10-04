@@ -20,10 +20,12 @@ services:
       # that way (retro investigation).
       - ALERT_PENDING_DIR=/app/pending_alerts
       # ADDED 2026-10-04 (docs/NOTIFICATION_SPEC.md 6): shared delivery audit
-      # trail, bound below as ../claude/alerts/audit. Set outside the named
-      # noc-state volume so the host-side infra-watchdog appends to the SAME
-      # file the container reads -- one alerts.jsonl answers "was this
-      # actually delivered?" for every sender.
+      # trail, bound ABSOLUTELY below as /mnt/d/claude/alerts/audit (a
+      # relative `../claude/...` would resolve against the deployed checkout
+      # at /home/cap/llm-usage-dashboard and land somewhere else entirely).
+      # Set outside the named noc-state volume so the host-side
+      # infra-watchdog appends to the SAME file the container reads -- one
+      # alerts.jsonl answers "was this actually delivered?" for every sender.
       - ALERT_AUDIT_DIR=/app/alerts_audit
     ports:
       # Cut over 2026-08-13: was 18095:8095 during parallel testing (native
