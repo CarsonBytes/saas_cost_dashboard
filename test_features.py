@@ -832,12 +832,17 @@ def test_fetch_meter_rollup_scales_meter_v1_bytes(monkeypatch, tmp_path):
     # the unsettled tail (minute rows) can only be post-fix, so it passes
     # through raw -- no double-scaling when the hour later settles and folds
     ledger._ROLLUP_CACHE.update({"ts": 0.0, "rows": []})
-    recent = dt.datetime.now(dt.timezone.utc).isoformat()
+    recent_dt = dt.datetime.now(dt.timezone.utc)
+    recent = recent_dt.isoformat()
     monkeypatch.setattr(ledger, "_fetch_rollup_range", lambda start, end=None: [
         {"ts": recent, "app": "study", "endpoint": "GET answer_log",
          "requests": 3, "bytes": 300}])
+    # The window must reach past `recent` (which is always "now"): fetch_meter_rollup
+    # drops tail rows outside [since, until), so the previous hard-coded
+    # until_iso="2026-09-30T00:00:00+00:00" started filtering this row out on
+    # 2026-10-01 and the test went red without any code change.
     tail = ledger.fetch_meter_rollup(since_iso="2026-09-01T00:00:00+00:00",
-                                     until_iso="2026-09-30T00:00:00+00:00")
+                                     until_iso=(recent_dt + dt.timedelta(days=1)).isoformat())
     assert [r for r in tail if r["app"] == "study" and r["requests"] == 3] == [
         {"ts": recent, "app": "study", "endpoint": "GET answer_log",
          "requests": 3, "bytes": 300, "details": []}]
